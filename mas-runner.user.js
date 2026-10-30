@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.4
+// @version      0.4.5
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -303,7 +303,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.4',
+    RUNNER_VERSION: '0.4.5',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -893,7 +893,7 @@
       <div id="masr-head">
         <div class="h-row">
           <span class="brand">MAS <i>Runner</i></span>
-          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.4</span>
+          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.5</span>
           <span class="grow"></span>
           <span class="masr-upd" id="masr-update-out"></span>
           <button class="masr-mini" id="masr-check-update" title="检查解释器有没有新版本">检查更新</button>
@@ -1563,7 +1563,7 @@
   SVC.code = function () { return String(GM_getValue(SVC.C_KEY, '') || ''); };
   SVC.me = function () { try { return JSON.parse(GM_getValue(SVC.M_KEY, 'null')); } catch (e) { return null; } };
 
-  SVC.call = function (method, path, query, body) {
+  SVC.call = function (method, path, query, body, opts) {
     const base = SVC.base();
     if (!base) return Promise.reject(new Error('E_SVC 还没填服务地址'));
     let url = base + path;
@@ -1576,7 +1576,8 @@
         url: url,
         headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mas-code': SVC.code() },
         data: body ? JSON.stringify(body) : null,
-        timeout: 20000,
+        // 回写要等飞书返回（服务端自己还有 15s×2 的超时预算），所以按调用类型给不同上限
+        timeout: (opts && opts.timeout) || 20000,
         onload: function (r) {
           let j = {};
           try { j = JSON.parse(r.responseText || '{}'); } catch (e) { return reject(new Error('E_SVC_PARSE http=' + r.status)); }
@@ -1651,10 +1652,29 @@
     return SVC.mode() === 'svc' ? SVC.call('GET', '/spec', { script_id: id }) : FL.spec(id);
   };
   SVC.writeResult = function (payload) {
-    return SVC.mode() === 'svc' ? SVC.call('POST', '/result', null, payload) : FL.writeResult(payload);
+    // 45s：服务端对飞书是 15s 硬超时 + 重试一次，客户端预算必须比它大，否则会把"正在重试"误判成失败
+    return SVC.mode() === 'svc' ? SVC.call('POST', '/result', null, payload, { timeout: 45000 }) : FL.writeResult(payload);
   };
-  SVC.bindMeta = function () {
-    return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/meta') : Promise.resolve(FL.bindMeta());
+  /* 预热任务表：飞书侧对某张表的**第一次**访问很慢（实测 15~20s，热了 2s）。
+   * 流程跑一趟要十几秒，正好用来把表捂热，等真回写时就是热路径。
+   * 失败一律忽略——预热只是加速，不是依赖。 */
+  let _warming = false;
+  SVC.warm = function () {
+    if (!SVC.base() || _warming) return;
+    _warming = true;
+    SVC.call('GET', '/health', { warm: 1 }, null, { timeout: 25000 })
+      .catch(function () {})
+      .then(function () { _warming = false; });
+  };
+  SVC.warmStart = function (ms) {
+    if (SVC.mode() !== 'svc') return null;
+    SVC.warm();
+    const t = setInterval(function () { SVC.warm(); }, 6000);
+    setTimeout(function () { clearInterval(t); }, ms || 90000);
+    return t;
+  };
+
+  SVC.bindMeta = function () {    return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/meta') : Promise.resolve(FL.bindMeta());
   };
   SVC.bindPoll = function (q) {
     return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/poll', q || {}) : FL.bindPoll(q || {});
@@ -2154,6 +2174,7 @@
       }
       const scene = SVC.scriptFor(UI.currentTask);
       UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：账户 ' + (task.account_id || '') + '（' + task.record_id + '）· 场景 ' + scene });
+      SVC.warmStart(90000); // 跑流程的十几秒里顺手把任务表捂热，回写时就快了
       const s = await SVC.spec(scene);
       UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
@@ -2207,9 +2228,15 @@
     };
     if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
     else payload.error_type = (err && err.code) || 'E_UNKNOWN';
+    const t0 = Date.now();
+    UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
     try {
       await writeWithRetry(payload);
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') });
+      UI.appendLog({
+        t: Date.now(), level: 'ok',
+        msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') +
+          '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
+      });
       UI.renderTasks();
     } catch (e) {
       pwAdd(payload);
