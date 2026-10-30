@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.19
+// @version      0.1.20
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -292,7 +292,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.19',
+    RUNNER_VERSION: '0.1.20',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -526,7 +526,8 @@
     return /(^|\.)feishu\.cn$/i.test(h) || /(^|\.)larksuite\.com$/i.test(h);
   }
 
-  // 从 URL 里取 code：飞书可能把参数留在 search，也可能塞进 hash 的 query（hash 路由）
+  // 从 URL 里取 code：飞书可能把参数留在 search，也可能塞进 hash 的 query（hash 路由）；
+  // 极端情况下还会用第二个「?」硬拼在已有 query 后面，所以走正则而不是 URLSearchParams
   function fsUrlCode() {
     const raws = [];
     try { raws.push(location.href); } catch (e) {}
@@ -534,12 +535,11 @@
     for (let i = 0; i < raws.length; i++) {
       const u = raws[i];
       if (!u) continue;
-      const qi = u.indexOf('?');
-      if (qi < 0) continue;
-      const qs = u.slice(qi + 1).split('#')[0];
-      const p = new URLSearchParams(qs);
-      const c = p.get('code') || p.get('authorization_code');
-      if (c) return { code: c, state: p.get('state') || '', from: i === 0 ? 'live' : 'boot' };
+      const m = /[?&#]code=([^&#]+)/.exec(u) || /[?&#]authorization_code=([^&#]+)/.exec(u);
+      if (!m) continue;
+      const sm = /[?&#]state=([^&#]+)/.exec(u);
+      const dec = function (v) { try { return decodeURIComponent(v); } catch (e) { return v; } };
+      return { code: dec(m[1]), state: sm ? dec(sm[1]) : '', where: i === 0 ? 'live' : 'boot' };
     }
     return null;
   }
@@ -547,9 +547,9 @@
   // 换完就把 code 从地址栏抹掉（避免留在历史记录 / 被第三方资源 referer 带出去）
   function fsStripCode() {
     try {
-      const u = new URL(location.href);
-      ['code', 'state', 'authorization_code'].forEach(function (k) { u.searchParams.delete(k); });
-      history.replaceState(null, '', u.toString());
+      let h = location.href.replace(/([?&#])(?:code|state|authorization_code)=[^&#]*/g, '');
+      h = h.replace(/([?&])(?=#|$)/, '');
+      history.replaceState(null, '', h);
     } catch (e) {}
   }
 

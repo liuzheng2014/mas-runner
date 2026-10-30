@@ -1,13 +1,13 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "file": "mas-runner.user.js",
-  "sha256": "74c0fbe88fb2b1b87b6a39744167c429bef9f2d2ab407554f9b9e84a8b04f442",
-  "bytes": 91373,
-  "published_at": "2026-10-30T19:34:53+08:00",
+  "sha256": "5e38082972bb80ac61aa252b27a591fc7ce8957dc86a455bb0dfa4104398bdca",
+  "bytes": 91530,
+  "published_at": "2026-10-30T19:35:23+08:00",
   "install_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "runner v0.1.19: OAuth callback handled on the registered Feishu Base page (no GH Pages hop), @run-at document-start to keep code param, panel auto-refresh on external login"
+  "notes": "runner v0.1.20: robust code extraction (handles ?/?&/# forms), strip code from URL after exchange"
 }
