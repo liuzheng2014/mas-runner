@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.7
+// @version      0.4.8
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -310,7 +310,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.7',
+    RUNNER_VERSION: '0.4.8',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -2111,12 +2111,33 @@
           list.innerHTML = '<div style="font-size:11px;color:#8f959e">没有待处理的记录（需同时满足：创建人是你、状态为空、账户ID已填）</div>';
           return;
         }
-        list.innerHTML = '<div style="font-size:11px;color:#8f959e">共 ' + j.total + ' 条待办：点「执行」直接开跑（自动拉对应场景的 spec，账户ID 来自这行）</div>' +
+        const totalShown = j.items.length;
+        list.innerHTML =
+          '<div style="font-size:11px;color:#8f959e;margin-bottom:2px">共 ' + j.total + ' 条待办：点「执行」单条跑，或点「批量执行」一次性串行跑完（ADS 会话全局，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
+          '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
+            '<input id="masr-batch-n" type="number" min="1" max="' + totalShown + '" value="' + totalShown + '" style="width:58px">' +
+            '<button class="primary" id="masr-batch-run">批量执行（前 <span id="masr-batch-n-lab">' + totalShown + '</span> 条）</button>' +
+            '<button id="masr-batch-stop" style="display:none">停止</button>' +
+            '<span id="masr-batch-prog" style="font-size:11px;color:#1a7f45"></span>' +
+          '</div>' +
           '<table><tr><th>账户ID</th><th>名称</th><th>客户</th><th></th></tr>' +
           j.items.map(function (t, i) {
             return '<tr><td>' + (t.account_id || '-') + '</td><td>' + (t.account_name || '-') + '</td>' +
               '<td>' + (t.client || '-') + '</td><td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
           }).join('') + '</table>';
+        const nEl = document.getElementById('masr-batch-n');
+        const nLab = document.getElementById('masr-batch-n-lab');
+        const batchRun = document.getElementById('masr-batch-run');
+        const batchStop = document.getElementById('masr-batch-stop');
+        const prog = document.getElementById('masr-batch-prog');
+        if (nEl && nLab) nEl.addEventListener('input', function () { nLab.textContent = nEl.value; });
+        if (batchRun) batchRun.addEventListener('click', function () {
+          const n = Math.min(Math.max(Number(nEl ? nEl.value : totalShown) || totalShown, 1), totalShown);
+          UI.runBatch(j.items.slice(0, n), prog, batchRun, batchStop);
+        });
+        if (batchStop) batchStop.addEventListener('click', function () {
+          UI._batchStop = true; batchStop.disabled = true; batchStop.textContent = '正在停止…';
+        });
         list.querySelectorAll('button[data-idx]').forEach(function (b) {
           b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))], b); });
         });
@@ -2207,6 +2228,94 @@
     }
   };
 
+  // 批量执行：串行跑一整批待办（ADS 会话全局，必须串行；每条仍是完整 S1→S6 流程 + 多标签页握手）
+  UI.runBatch = async function (tasks, prog, runBtn, stopBtn) {
+    if (UI._running) return;
+    if (!tasks || !tasks.length) return;
+    UI._running = true;
+    UI._batchStop = false;
+    if (runBtn) runBtn.style.display = 'none';
+    if (stopBtn) { stopBtn.style.display = ''; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
+    const rows = Array.prototype.slice.call(document.querySelectorAll('#masr-task-list button[data-idx]'));
+    rows.forEach(function (b) { b.disabled = true; });
+    const total = tasks.length;
+    let okN = 0, failN = 0, skipN = 0, sessFail = 0, done = 0;
+    const setProg = function () {
+      if (prog) prog.textContent = '进度 ' + done + '/' + total + ' · 成功 ' + okN + ' / 失败 ' + failN + (skipN ? ' / 跳过 ' + skipN : '');
+    };
+    setProg();
+    UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
+    for (let i = 0; i < total; i++) {
+      if (UI._batchStop) { UI.appendLog({ t: Date.now(), level: 'warn', msg: '⏹ 用户中止，已处理 ' + done + '/' + total }); break; }
+      const task = tasks[i];
+      if (!task || !task.account_id) { skipN++; done++; setProg(); UI.appendLog({ t: Date.now(), level: 'warn', msg: '[' + (i + 1) + '/' + total + '] 跳过：无账户ID' }); continue; }
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '▶ [' + (i + 1) + '/' + total + '] ' + task.account_id + '（' + task.record_id + '）' });
+      let r = { ok: null, error: '' };
+      try { r = await runOneTask(task); }
+      catch (e) { r = { ok: false, error: 'E_BATCH', message: e.message }; UI.appendLog({ t: Date.now(), level: 'fatal', msg: '[' + (i + 1) + '/' + total + '] 异常：' + e.message }); }
+      if (r.ok === true) { okN++; sessFail = 0; }
+      else if (r.ok === false) {
+        failN++;
+        if (/E_SESSION|E_AUTH|NO_AGENCY_CSRF|101133/.test(r.error || '')) sessFail++; else sessFail = 0;
+      } else { sessFail = 0; } // 运行态提前清空，状态未知 → 不计入失败/连错
+      done++; setProg();
+      // 连续 2 条会话类失败 → 疑似登录态失效，硬停（避免把失败刷满、也避免反复触发登出）
+      if (sessFail >= 2) {
+        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⛔ 连续 2 条会话类失败，疑似登录态失效；已停止批量。请检查登录态后单独跑一条验证。' });
+        break;
+      }
+      await delay(1200); // 等辅助标签页收摊、运行态清空，再开下一条
+    }
+    UI._running = false;
+    UI._batchStop = false;
+    if (runBtn) runBtn.style.display = '';
+    if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
+    rows.forEach(function (b) { b.disabled = false; });
+    UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 批量执行结束：成功 ' + okN + ' / 失败 ' + failN + (skipN ? ' / 跳过 ' + skipN : '') + ' ===' });
+  };
+
+  function delay(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
+
+  // 跑单条任务（与 runTask 同流程，但可 await 完成，并回传结果），供批量串行复用
+  async function runOneTask(task) {
+    UI.currentTask = {
+      record_id: task.record_id, account_id: task.account_id,
+      table_id: task.table_id, script_id: task.script_id || '',
+      write_token: task.write_token || '',
+    };
+    if (SVC.mode() === 'svc') {
+      try { await SVC.ping(); }
+      catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），中止批量' }); throw e; }
+    }
+    const scene = SVC.scriptFor(UI.currentTask);
+    const s = await SVC.spec(scene);
+    UI.currentTask.spec_version = s.version;
+    UI.applySpec(JSON.stringify(s.spec), { persist: true });
+    UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '，账户ID 已从任务带入' });
+    await UI.doRun({ keepLog: true });
+    return await waitRunDone();
+  }
+
+  // 等待本轮流程结束：监听 RunState.final（发起页轮询消费后置位），超时返回 E_TIMEOUT
+  function waitRunDone(timeoutMs) {
+    timeoutMs = timeoutMs || 180000;
+    const start = Date.now();
+    return new Promise(function (resolve) {
+      const iv = setInterval(function () {
+        let s = null;
+        try { s = RunState.get(); } catch (e) { s = null; }
+        if (s && s.final) {
+          clearInterval(iv);
+          resolve({ ok: !!s.final.ok, error: s.final.error || '', message: s.final.message || '' });
+          return;
+        }
+        if (Date.now() - start > timeoutMs) { clearInterval(iv); resolve({ ok: false, error: 'E_TIMEOUT', message: '等待结果超时（' + (timeoutMs / 1000) + 's）' }); return; }
+        // RunState 已清空（最终态被发起页消费后清理）→ 视为本轮已结束，但状态未知
+        if (!s && Date.now() - start > 3000) { clearInterval(iv); resolve({ ok: null, error: '', message: '运行态已清空' }); return; }
+      }, 600);
+    });
+  }
+
   // 执行完成 → 回写飞书（按 record_id 更新，服务端二次校验归属）
   /* 回写失败不丢结果：落本地待办队列，服务恢复后一键重试（本机验证服务常被关掉） */
   const PENDW_KEY = 'masr_pending_writes_v1';
@@ -2258,7 +2367,7 @@
         msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') +
           '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
       });
-      UI.renderTasks();
+      if (!UI._running) UI.renderTasks();
     } catch (e) {
       pwAdd(payload);
       const msg = String((e && e.message) || e);
@@ -2274,7 +2383,7 @@
         msg: '⚠️ 回写飞书失败：' + msg + hint +
           ' —— 该结果已存本地待写队列，不会丢'
       });
-      UI.renderTasks();
+      if (!UI._running) UI.renderTasks();
       updResultWarn(pwList().length);
     }
   }
@@ -2337,8 +2446,13 @@
             '<code style="background:#f2f3f5;padding:1px 6px;border-radius:4px">' + esc(auto) + '</code>' +
             '<span style="font-size:10px;color:#8f959e;margin-left:6px">任务行</span></div>';
         }
-        return '<div class="row"><label>' + esc(p.label || p.name) + ' (' + p.name + ')：</label>' +
-          '<input id="masr-p-' + p.name + '" value="' + esc(last[p.name] || '') + '" placeholder="' + esc(p.description || '') + '"></div>';
+        // 数据源参数（如 子客ID）：不再提供人工输入框，只能由任务行带入 —— 抄错账户ID会跑到别人头上
+        if (p.source === 'manual') {
+          return '<div class="row"><label>' + esc(p.label || p.name) + ' (' + p.name + ')：</label>' +
+            '<input id="masr-p-' + p.name + '" value="' + esc(last[p.name] || '') + '" placeholder="' + esc(p.description || '') + '"></div>';
+        }
+        return '<div class="row"><label>' + esc(p.label || p.name) + '：</label>' +
+          '<span style="font-size:11px;color:#8f959e">由任务带入（从「任务」点待办的「执行」或「批量执行」时自动填充）</span></div>';
       }).join('');
   };
 
@@ -2671,10 +2785,19 @@
       for (const p of spec.params || []) {
         const auto = UI.taskParamValue(p.name);
         if (auto) { params[p.name] = auto; continue; }
-        const el = document.getElementById('masr-p-' + p.name);
-        const v = el ? el.value.trim() : '';
-        if (p.required && !v) { alert('必填参数: ' + (p.label || p.name)); return; }
-        if (v) params[p.name] = v;
+        if (p.source === 'manual') {
+          const el = document.getElementById('masr-p-' + p.name);
+          const v = el ? el.value.trim() : '';
+          if (p.required && !v) { alert('必填参数: ' + (p.label || p.name)); return; }
+          if (v) params[p.name] = v;
+          continue;
+        }
+        // 数据源参数（子客ID 等）：人工输入框已移除，必须由任务行带入。
+        // 没有任务上下文（standalone 粘贴 spec 直接点执行）时不再弹「必填参数」让人手填，而是提示走任务。
+        if (p.required) {
+          alert('「' + (p.label || p.name) + '」需从任务带入：请先在「任务」里点一条待办的「执行」或「批量执行」，不要直接 standalone 跑这个 spec。');
+          return;
+        }
       }
       UI.saveParams(spec.spec_id, params); // 记住这次填的值，下次自动回填
       // 角色标记：发起页（通常为代理页）永不自毁，负责展示最终结果
