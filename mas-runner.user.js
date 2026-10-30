@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.16
+// @version      0.1.17
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -17,6 +17,8 @@
 // @connect      svc-drcn.ads.huawei.com
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
+// @connect      open.feishu.cn
+// @connect      accounts.feishu.cn
 // @connect      self
 // @run-at       document-idle
 // ==/UserScript==
@@ -289,7 +291,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.16',
+    RUNNER_VERSION: '0.1.17',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -319,6 +321,203 @@
       GM_setValue(GV.CACHE_KEY, JSON.stringify(c));
     },
   };
+
+  /* ==================== FEISHU AUTH + API (v0.1.17) ====================
+   * 业务同学在悬浮球点一次「登录飞书」：OAuth 授权码 + PKCE
+   *   授权页(accounts.feishu.cn) → 回调页(liuzheng2014.github.io/mas-runner/oauth.html)
+   *   → postMessage 把 code 交还本页 → 换 user_access_token + refresh_token
+   * 之后每次写表前自动用 refresh_token 续期，连续使用不需要再登录。
+   *
+   * 已证实的边界（飞书官方文档）：
+   *   - refresh_token 有效期 7 天（示例 604800s），且「仅能被使用一次」——每次刷新返回新的一对，
+   *     所以连续使用会无限顺延；闲置超过 refresh 有效期才需要重新授权。
+   *   - 换 token 与调 API 全部走 GM_xhr（OpenAPI 无 CORS 头，页面内 fetch 会被拦）。
+   *   - 不内嵌 app_secret：优先 PKCE 公共客户端；仅当服务端返回 20002 时才提示填 secret（存本机）。
+   */
+  const FS = {
+    APP_ID: 'cli_a8ba8371b3f9d00b',
+    REDIRECT_URI: 'https://liuzheng2014.github.io/mas-runner/oauth.html',
+    SCOPE: 'offline_access bitable:app',
+    AUTH_URL: 'https://accounts.feishu.cn/open-apis/authen/v1/authorize',
+    TOKEN_URL: 'https://accounts.feishu.cn/oauth/v3/token',
+    API_BASE: 'https://open.feishu.cn/open-apis',
+    T_KEY: 'masr_feishu_token_v1',    // {access, exp_at, refresh, refresh_exp_at, name, open_id, scope}
+    P_KEY: 'masr_feishu_pending_v1',  // {verifier, state, at}
+    S_KEY: 'masr_feishu_secret_v1',   // 可选兜底：仅 PKCE 不被接受时才需要
+  };
+
+  function fsReadToken() {
+    try { return JSON.parse(GM_getValue(FS.T_KEY, 'null')); } catch (e) { return null; }
+  }
+  function fsWriteToken(t) { GM_setValue(FS.T_KEY, JSON.stringify(t)); }
+  function fsLogout() { GM_deleteValue(FS.T_KEY); GM_deleteValue(FS.P_KEY); }
+
+  function fsRandom(len) {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+    const buf = new Uint8Array(len);
+    crypto.getRandomValues(buf);
+    let s = '';
+    for (let i = 0; i < len; i++) s += chars[buf[i] % chars.length];
+    return s;
+  }
+  async function fsPkceChallenge(verifier) {
+    const data = new TextEncoder().encode(verifier);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    const bytes = new Uint8Array(digest);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // OpenAPI 无 CORS 头，必须走 GM_xhr
+  function fsHttp(method, url, opts) {
+    const o = opts || {};
+    return new Promise((resolve, reject) => {
+      const req = {
+        method,
+        url,
+        headers: o.headers || {},
+        timeout: o.timeout || 20000,
+        onload: (r) => resolve({ status: r.status, text: r.responseText || '' }),
+        onerror: () => reject(new Error('E_NETWORK ' + method + ' ' + url.replace(/\?.*/, ''))),
+        ontimeout: () => reject(new Error('E_TIMEOUT ' + method + ' ' + url.replace(/\?.*/, ''))),
+      };
+      if (o.body) req.data = o.body;
+      GM_xmlhttpRequest(req);
+    });
+  }
+
+  // 用 code 换 token；PKCE 先行，20002（缺 secret）时用本机 secret 重试一次
+  async function fsExchange(code, verifier) {
+    const base = {
+      grant_type: 'authorization_code',
+      client_id: FS.APP_ID,
+      code,
+      redirect_uri: FS.REDIRECT_URI,
+    };
+    if (verifier) base.code_verifier = verifier;
+    const attempt = async (payload) => {
+      const res = await fsHttp('POST', FS.TOKEN_URL, {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(payload),
+      });
+      let j;
+      try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FS_PARSE ' + res.text.slice(0, 120)); }
+      return j;
+    };
+    let j = await attempt(base);
+    if ((j.code === 20002 || j.error === 'invalid_client') && GM_getValue(FS.S_KEY, '')) {
+      j = await attempt(Object.assign({}, base, { client_secret: GM_getValue(FS.S_KEY, '') }));
+    }
+    if (j.code !== 0 || !j.access_token) {
+      const hint = j.code === 20002 ? '（该应用要求 client_secret，请在设置里填入一次）' : '';
+      throw new Error('E_AUTH ' + (j.code || '') + ' ' + (j.error_description || j.error || '换 token 失败') + hint);
+    }
+    const now = Date.now();
+    return {
+      access: j.access_token,
+      exp_at: now + (j.expires_in || 7200) * 1000,
+      refresh: j.refresh_token || '',
+      refresh_exp_at: j.refresh_token ? now + (j.refresh_token_expires_in || 604800) * 1000 : 0,
+      scope: j.scope || '',
+    };
+  }
+
+  async function fsRefresh(rt) {
+    const payload = { grant_type: 'refresh_token', client_id: FS.APP_ID, refresh_token: rt };
+    if (GM_getValue(FS.S_KEY, '')) payload.client_secret = GM_getValue(FS.S_KEY, '');
+    const res = await fsHttp('POST', FS.TOKEN_URL, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(payload),
+    });
+    let j;
+    try { j = JSON.parse(res.text); } catch (e) { return null; }
+    if (j.code !== 0 || !j.access_token) return null;
+    const now = Date.now();
+    const prev = fsReadToken() || {};
+    const next = {
+      access: j.access_token,
+      exp_at: now + (j.expires_in || 7200) * 1000,
+      refresh: j.refresh_token || prev.refresh || '',
+      refresh_exp_at: j.refresh_token ? now + (j.refresh_token_expires_in || 604800) * 1000 : (prev.refresh_exp_at || 0),
+      scope: j.scope || prev.scope || '',
+      name: prev.name || '',
+      open_id: prev.open_id || '',
+    };
+    fsWriteToken(next);
+    return next;
+  }
+
+  // 取可用 access_token：有效则直接用；过期则刷新；都不行抛 E_AUTH
+  async function fsToken() {
+    const t = fsReadToken();
+    const now = Date.now();
+    if (t && t.access && t.exp_at > now + 60000) return t.access;
+    if (t && t.refresh && t.refresh_exp_at > now + 60000) {
+      const n = await fsRefresh(t.refresh);
+      if (n) return n.access;
+    }
+    throw new Error('E_AUTH 未登录飞书或授权已过期，请点悬浮球「登录飞书」');
+  }
+
+  async function fsFetchMe(access) {
+    try {
+      const res = await fsHttp('GET', FS.API_BASE + '/authen/v1/user_info', {
+        headers: { Authorization: 'Bearer ' + access },
+      });
+      const j = JSON.parse(res.text);
+      if (j.code === 0 && j.data) return { name: j.data.name || j.data.en_name || '', open_id: j.data.open_id || '' };
+    } catch (e) { /* 昵称拿不到不影响主流程 */ }
+    return null;
+  }
+
+  // 发起授权：开授权页，等回调页 postMessage 送 code 回来
+  async function fsLogin() {
+    const verifier = fsRandom(64);
+    const challenge = await fsPkceChallenge(verifier);
+    const state = fsRandom(16);
+    GM_setValue(FS.P_KEY, JSON.stringify({ verifier, state, at: Date.now() }));
+    const q = [
+      'client_id=' + encodeURIComponent(FS.APP_ID),
+      'response_type=code',
+      'redirect_uri=' + encodeURIComponent(FS.REDIRECT_URI),
+      'scope=' + encodeURIComponent(FS.SCOPE),
+      'state=' + encodeURIComponent(state),
+      'code_challenge=' + encodeURIComponent(challenge),
+      'code_challenge_method=S256',
+    ].join('&');
+    const w = window.open(FS.AUTH_URL + '?' + q, '_blank');
+    if (!w) throw new Error('E_POPUP 授权窗口被拦截，请允许本站弹窗后重试');
+    return state;
+  }
+
+  // 接收授权码（来自回调页 postMessage 或用户手动粘贴）
+  async function fsCompleteLogin(code, state) {
+    const pending = (() => { try { return JSON.parse(GM_getValue(FS.P_KEY, 'null')); } catch (e) { return null; } })();
+    if (pending && state && pending.state !== state) {
+      throw new Error('E_AUTH state 不匹配，可能是过期或伪造的回调，请重新授权');
+    }
+    const verifier = pending ? pending.verifier : '';
+    const tok = await fsExchange(code, verifier);
+    const me = await fsFetchMe(tok.access);
+    if (me) { tok.name = me.name; tok.open_id = me.open_id; }
+    fsWriteToken(tok);
+    GM_deleteValue(FS.P_KEY);
+    return tok;
+  }
+
+  // 统一的 OpenAPI 调用（Bearer）
+  async function fsApi(method, path, body) {
+    const access = await fsToken();
+    const res = await fsHttp(method, FS.API_BASE + path, {
+      headers: { Authorization: 'Bearer ' + access, 'Content-Type': 'application/json; charset=utf-8' },
+      body: body ? JSON.stringify(body) : null,
+    });
+    let j;
+    try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FS_PARSE ' + res.text.slice(0, 120)); }
+    if (j.code !== 0) throw new Error('E_FS_API ' + j.code + ' ' + (j.msg || '') + ' path=' + path);
+    return j.data;
+  }
 
   // ---------- 风控限速器 ----------
   function makeLimiter(rateLimit) {
@@ -813,6 +1012,7 @@
         <span id="masr-spec-badge"></span>
       </h3>
       <div class="row" id="masr-selfcheck"></div>
+      <div class="row" id="masr-feishu" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
       <div class="row" id="masr-spec-box"><b>① 粘贴 spec.json（dev 模式）</b><br></div>
       <div class="row">
         <button class="primary" id="masr-load">加载 spec</button>
@@ -832,6 +1032,7 @@
     `;
     document.body.appendChild(ball); document.body.appendChild(panel);
     UI.makeSpecInput();
+    UI.renderFeishu();
     ball.addEventListener('click', () => { panel.style.display = panel.style.display === 'block' ? 'none' : 'block'; if (panel.style.display === 'block') UI.renderSelfCheck(); });
 
     document.getElementById('masr-load').addEventListener('click', () => {
@@ -918,6 +1119,84 @@
       return { spec, repaired: true };
     }
   };
+
+  /* ---------- 飞书登录区块（v0.1.17） ---------- */
+  UI.renderFeishu = function () {
+    const box = document.getElementById('masr-feishu');
+    if (!box) return;
+    const t = fsReadToken();
+    const now = Date.now();
+    let status;
+    let extra = '';
+    if (t && t.access && t.exp_at > now) {
+      status = '<span style="color:#1a7f45">已登录' + (t.name ? '：' + t.name : '') + '</span>';
+      if (t.refresh_exp_at) {
+        const days = Math.max(0, (t.refresh_exp_at - now) / 86400000).toFixed(1);
+        extra = '<span style="color:#8f959e;font-size:11px;margin-left:8px">免登续期剩余 ' + days + ' 天</span>';
+      }
+    } else if (t && t.refresh && t.refresh_exp_at > now) {
+      status = '<span style="color:#b26a00">凭证待续期（下次写表时自动续）</span>';
+    } else if (t) {
+      status = '<span style="color:#c02a2a">授权已过期，需重新登录</span>';
+    } else {
+      status = '<span style="color:#8f959e">未登录</span>';
+    }
+    box.innerHTML =
+      '<b>飞书</b> ' + status + extra + ' ' +
+      '<button id="masr-fs-login" class="primary">' + (t ? '重新登录' : '登录飞书') + '</button>' +
+      (t ? '<button id="masr-fs-logout">退出</button>' : '') +
+      '<div style="margin-top:6px">' +
+      '<input id="masr-fs-code" placeholder="授权码（回调页未自动回传时粘贴到这里）" style="width:280px"> ' +
+      '<button id="masr-fs-submit">提交</button></div>' +
+      '<div id="masr-fs-out" style="font-size:11px;color:#8f959e"></div>';
+
+    const out = document.getElementById('masr-fs-out');
+    document.getElementById('masr-fs-login').addEventListener('click', async () => {
+      try {
+        out.textContent = '正在打开飞书授权页…';
+        await fsLogin();
+        out.textContent = '已打开授权页，请在飞书页面点击授权；完成后本面板会自动更新。';
+      } catch (e) {
+        out.textContent = e.message;
+      }
+    });
+    const lo = document.getElementById('masr-fs-logout');
+    if (lo) lo.addEventListener('click', () => {
+      fsLogout();
+      UI.renderFeishu();
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '已退出飞书授权' });
+    });
+    document.getElementById('masr-fs-submit').addEventListener('click', async () => {
+      const code = (document.getElementById('masr-fs-code').value || '').trim();
+      if (!code) { out.textContent = '先粘贴授权码'; return; }
+      out.textContent = '正在换取凭证…';
+      try {
+        const tok = await fsCompleteLogin(code, '');
+        out.textContent = '登录成功' + (tok.name ? '：' + tok.name : '');
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: '飞书授权成功' + (tok.name ? '（' + tok.name + '）' : '') });
+        UI.renderFeishu();
+      } catch (e) {
+        out.textContent = e.message;
+      }
+    });
+  };
+
+  // 回调页 postMessage 送回的授权码
+  window.addEventListener('message', async (ev) => {
+    const d = ev.data;
+    if (!d || typeof d !== 'object' || d.source !== 'mas-runner-oauth' || !d.code) return;
+    const out = document.getElementById('masr-fs-out');
+    if (out) out.textContent = '收到授权码，正在换取凭证…';
+    try {
+      const tok = await fsCompleteLogin(d.code, d.state);
+      if (out) out.textContent = '登录成功' + (tok.name ? '：' + tok.name : '');
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '飞书授权成功' + (tok.name ? '（' + tok.name + '）' : '') });
+      UI.renderFeishu();
+    } catch (e) {
+      if (out) out.textContent = e.message;
+      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '飞书授权失败：' + e.message });
+    }
+  });
 
   UI.renderParams = function (spec) {
     const box = document.getElementById('masr-params');

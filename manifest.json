@@ -1,13 +1,13 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "file": "mas-runner.user.js",
-  "sha256": "c603fc3c6385f83b7fed08eb0c2fc4fc89a4c8291ada3f4123c7ee180f06aef2",
-  "bytes": 67279,
-  "published_at": "2026-10-30T18:49:21+08:00",
+  "sha256": "47a80e723399c94841d1aeff0c9ff73bc281b1b531aa59eb46a30980496b2fd8",
+  "bytes": 79901,
+  "published_at": "2026-10-30T19:28:55+08:00",
   "install_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "v0.1.16: silent background update check (6h) - red dot on floating ball instead of popup"
+  "notes": "runner v0.1.17: Feishu OAuth login (PKCE + offline_access refresh), GM_xhr OpenAPI client, panel login block"
 }
