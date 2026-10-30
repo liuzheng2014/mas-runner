@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.9
+// @version      0.4.10
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -310,7 +310,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.9',
+    RUNNER_VERSION: '0.4.10',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -2124,7 +2124,8 @@
           j.items.map(function (t, i) {
             return '<tr><td>' + (t.account_id || '-') + '</td><td>' + (t.account_name || '-') + '</td>' +
               '<td>' + (t.client || '-') + '</td><td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
-          }).join('') + '</table>';
+          }).join('') + '</table>' +
+          '<div id="masr-batch-report"></div>';
         const nEl = document.getElementById('masr-batch-n');
         const nLab = document.getElementById('masr-batch-n-lab');
         const batchRun = document.getElementById('masr-batch-run');
@@ -2193,6 +2194,7 @@
   UI.runTask = async function (task, btn) {
     if (UI._running) return;
     UI._running = true;
+    UI._batchHook = null; // 单条跑：清掉批量的回写钩子，避免残留串账
     const old = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
     try {
@@ -2239,26 +2241,63 @@
     const rows = Array.prototype.slice.call(document.querySelectorAll('#masr-task-list button[data-idx]'));
     rows.forEach(function (b) { b.disabled = true; });
     const total = tasks.length;
-    let okN = 0, failN = 0, skipN = 0, sessFail = 0, done = 0;
+    let okN = 0, failN = 0, skipN = 0, unknownN = 0, sessFail = 0, done = 0;
+    const recs = [];
+    const writeMap = {};
+    // 回写是异步的（不阻塞主流程），靠钩子把每条的回写结果收上来，批量收尾才能对账
+    UI._batchHook = function (rid, status, msg) { if (rid) writeMap[rid] = { status: status, msg: msg || '' }; };
     const setProg = function () {
       if (prog) prog.textContent = '进度 ' + done + '/' + total + ' · 成功 ' + okN + ' / 失败 ' + failN + (skipN ? ' / 跳过 ' + skipN : '');
     };
+    const batchStart = Date.now();
     setProg();
-    UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
+    UI.appendLog({ t: batchStart, level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
+
+    // 等某条回写定态：'written'（已落表）/ 'queued'（进待写队列）/ 'unknown'（没等到，需人工核对）
+    async function settleWrite(rid, timeoutMs) {
+      if (!rid) return 'norecord';
+      const st = Date.now();
+      while (Date.now() - st < timeoutMs) {
+        if (writeMap[rid]) return writeMap[rid].status;
+        await delay(200);
+      }
+      return 'unknown';
+    }
+
     for (let i = 0; i < total; i++) {
       if (UI._batchStop) { UI.appendLog({ t: Date.now(), level: 'warn', msg: '⏹ 用户中止，已处理 ' + done + '/' + total }); break; }
       const task = tasks[i];
-      if (!task || !task.account_id) { skipN++; done++; setProg(); UI.appendLog({ t: Date.now(), level: 'warn', msg: '[' + (i + 1) + '/' + total + '] 跳过：无账户ID' }); continue; }
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '▶ [' + (i + 1) + '/' + total + '] ' + task.account_id + '（' + task.record_id + '）' });
+      const rec = {
+        idx: i + 1, account_id: (task && task.account_id) || '', account_name: (task && task.account_name) || '',
+        record_id: (task && task.record_id) || '', ok: null, error: '', message: '', ms: 0, write: 'notrun', writeMsg: ''
+      };
+      recs.push(rec);
+      if (!task || !task.account_id) {
+        skipN++; done++; rec.ok = 'skip'; rec.write = 'skip'; setProg();
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '[' + rec.idx + '/' + total + '] 跳过：无账户ID（' + (rec.record_id || '无记录ID') + '）' });
+        continue;
+      }
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '▶ [' + rec.idx + '/' + total + '] ' + task.account_id + '（' + task.record_id + '）' });
+      const t0 = Date.now();
       let r = { ok: null, error: '' };
       try { r = await runOneTask(task); }
-      catch (e) { r = { ok: false, error: 'E_BATCH', message: e.message }; UI.appendLog({ t: Date.now(), level: 'fatal', msg: '[' + (i + 1) + '/' + total + '] 异常：' + e.message }); }
+      catch (e) { r = { ok: false, error: 'E_BATCH', message: e.message }; UI.appendLog({ t: Date.now(), level: 'fatal', msg: '[' + rec.idx + '/' + total + '] 异常：' + e.message }); }
+      rec.ms = Date.now() - t0;
+      rec.ok = r.ok; rec.error = r.error || ''; rec.message = r.message || '';
       if (r.ok === true) { okN++; sessFail = 0; }
       else if (r.ok === false) {
         failN++;
         if (/E_SESSION|E_AUTH|NO_AGENCY_CSRF|101133/.test(r.error || '')) sessFail++; else sessFail = 0;
-      } else { sessFail = 0; } // 运行态提前清空，状态未知 → 不计入失败/连错
+      } else { unknownN++; sessFail = 0; } // 运行态提前清空，状态未知 → 不计入失败/连错
       done++; setProg();
+      // 回写定态了再记账：不等就会漏掉「密钥取到了但没写进表」这种最危险的情况
+      rec.write = await settleWrite(task.record_id, 8000);
+      if (writeMap[task.record_id]) rec.writeMsg = writeMap[task.record_id].msg || '';
+      if (rec.write === 'queued') {
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ ' + task.account_id + ' 回写未成功，已入本地待写队列（收尾点「重试回写」）' });
+      } else if (rec.write === 'unknown') {
+        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '↳ ' + task.account_id + ' 未检测到回写结果，需人工核对是否已落表' });
+      }
       // 连续 2 条会话类失败 → 疑似登录态失效，硬停（避免把失败刷满、也避免反复触发登出）
       if (sessFail >= 2) {
         UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⛔ 连续 2 条会话类失败，疑似登录态失效；已停止批量。请检查登录态后单独跑一条验证。' });
@@ -2266,12 +2305,140 @@
       }
       await delay(1200); // 等辅助标签页收摊、运行态清空，再开下一条
     }
+
     UI._running = false;
     UI._batchStop = false;
+    UI._batchHook = null;
     if (runBtn) runBtn.style.display = '';
     if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
     rows.forEach(function (b) { b.disabled = false; });
-    UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 批量执行结束：成功 ' + okN + ' / 失败 ' + failN + (skipN ? ' / 跳过 ' + skipN : '') + ' ===' });
+    UI.renderBatchReport(recs, { total: total, skipN: skipN, okN: okN, failN: failN, unknownN: unknownN, batchStart: batchStart });
+  };
+
+  // 批次收尾报告：失败清单（可一键复制）+ 对账 + 耗时/错误码分布
+  UI.renderBatchReport = function (recs, s) {
+    const esc = function (x) { return String(x == null ? '' : x).replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); };
+    const fmtDur = function (ms) {
+      if (!ms || ms < 0) return '0s';
+      const sec = Math.round(ms / 1000);
+      if (sec < 60) return sec + 's';
+      const m = Math.floor(sec / 60), r = sec % 60;
+      return m + 'm' + (r ? r + 's' : '');
+    };
+    const execRecs = recs.filter(function (r) { return r.ok !== 'skip'; });
+    const failRecs = recs.filter(function (r) { return r.ok === false; });
+    const skipRecs = recs.filter(function (r) { return r.ok === 'skip'; });
+    const execN = execRecs.length;
+    // 中途停止/会话失效硬停时，后面的任务根本没进 recs —— 必须单独计数，否则会误报"全部落表"
+    const notYetN = Math.max(0, s.total - recs.length);
+    const writtenN = recs.filter(function (r) { return r.write === 'written'; }).length;
+    const queuedN = recs.filter(function (r) { return r.write === 'queued'; }).length;
+    // norecord = 有账户ID但没 record_id，物理上无法回写，同样算未落账（否则账目对不上）
+    const lostRecs = recs.filter(function (r) { return r.write === 'unknown' || r.write === 'notrun' || r.write === 'norecord'; });
+    const lostN = lostRecs.length;
+    const times = execRecs.filter(function (r) { return r.ms > 0; }).map(function (r) { return r.ms; });
+    const sumMs = times.reduce(function (a, b) { return a + b; }, 0);
+    const avgMs = times.length ? sumMs / times.length : 0;
+    const byErr = {};
+    failRecs.forEach(function (r) { const k = r.error || 'E_UNKNOWN'; byErr[k] = (byErr[k] || 0) + 1; });
+    const errLine = Object.keys(byErr).sort(function (a, b) { return byErr[b] - byErr[a]; })
+      .map(function (k) { return k + ' ×' + byErr[k]; }).join('、');
+    const totalMs = Date.now() - s.batchStart;
+
+    // 结论只看一件事：实跑的每条，结果有没有真进飞书表
+    let verdict, vColor;
+    if (notYetN > 0) {
+      verdict = '⏹ 批次未跑完：还有 ' + notYetN + ' 条没处理（已跑 ' + recs.length + '/' + s.total + '）' +
+        (lostN ? '，另有 ' + lostN + ' 条未落账' : '') + ' —— 未处理的那批不在本次结果里';
+      vColor = '#b8860b';
+    } else if (lostN > 0) { verdict = '🔴 有 ' + lostN + ' 条未落账 —— 结果可能取到了但没进表，必须人工核对（见下方明细）'; vColor = '#c02a2a'; }
+    else if (queuedN > 0) { verdict = '🟡 ' + queuedN + ' 条在本地待写队列 —— 点任务面板上方「重试回写」补写，补完才算完'; vColor = '#b8860b'; }
+    else if (execN === 0) { verdict = '本次没有可执行的任务（全部跳过）'; vColor = '#8f959e'; }
+    else { verdict = '✅ 全部已落表（' + writtenN + '/' + execN + '），账目清晰'; vColor = '#1a7f45'; }
+
+    const head = '批量结果 · ' + new Date().toLocaleString('zh-CN');
+    let html = '<div style="margin-top:8px;padding:8px;border:1px solid #d9dde3;border-radius:6px;background:#fafbfc;font-size:11px;line-height:1.7">' +
+      '<div style="font-weight:600;margin-bottom:4px">' + esc(head) + '</div>' +
+      '<div>对账：选中 <b>' + s.total + '</b> · 实跑 <b>' + execN + '</b> · 跳过 <b>' + skipRecs.length + '</b></div>' +
+      '<div>取密钥：成功 <b style="color:#1a7f45">' + s.okN + '</b> / 失败 <b style="color:#c02a2a">' + s.failN + '</b>' + (s.unknownN ? ' / 状态未知 <b>' + s.unknownN + '</b>' : '') + '</div>' +
+      '<div>回写飞书：已落表 <b>' + writtenN + '</b> / 待补写 <b>' + queuedN + '</b> / 未落账 <b style="color:' + (lostN ? '#c02a2a' : '#1a7f45') + '">' + lostN + '</b></div>' +
+      '<div style="color:' + vColor + ';font-weight:600;margin:3px 0">' + esc(verdict) + '</div>' +
+      '<div style="color:#5c6672">耗时：总 ' + fmtDur(totalMs) + ' · 平均 ' + (avgMs / 1000).toFixed(1) + 's/条' +
+        (times.length ? ' · 最快 ' + (Math.min.apply(null, times) / 1000).toFixed(1) + 's · 最慢 ' + (Math.max.apply(null, times) / 1000).toFixed(1) + 's' : '') + '</div>' +
+      (errLine ? '<div style="color:#5c6672">失败错误码：' + esc(errLine) + '</div>' : '');
+
+    // 失败清单（含未落账 —— 后者更要紧：跑了、也可能取到了，但没进表）
+    const needRows = failRecs.concat(lostRecs.filter(function (r) { return r.ok !== false && r.ok !== 'skip'; }));
+    if (needRows.length) {
+      html += '<div style="margin-top:6px"><b>需处理明细（' + needRows.length + ' 条）</b>' +
+        '<table style="margin-top:3px"><tr><th>#</th><th>账户ID</th><th>名称</th><th>结论</th><th>原因</th></tr>' +
+        needRows.map(function (r) {
+          const what = r.ok === false ? '取密钥失败' : '未落账';
+          const why = r.ok === false ? (r.error + (r.message ? '：' + r.message : ''))
+            : (r.write === 'norecord' ? '缺少 record_id，无法回写' : ('回写状态未确认' + (r.writeMsg ? '（' + r.writeMsg + '）' : '')));
+          return '<tr><td>' + r.idx + '</td><td>' + esc(r.account_id || '-') + '</td><td>' + esc((r.account_name || '-').slice(0, 18)) + '</td>' +
+            '<td style="color:' + (r.ok === false ? '#c02a2a' : '#b8860b') + '">' + what + '</td><td>' + esc(why.slice(0, 90)) + '</td></tr>';
+        }).join('') + '</table></div>';
+    }
+    if (skipRecs.length) {
+      html += '<div style="margin-top:4px;color:#8f959e">跳过 ' + skipRecs.length + ' 条（无账户ID）：' +
+        skipRecs.map(function (r) { return esc(r.record_id || '-'); }).join('、') + '</div>';
+    }
+    html += '<div style="margin-top:6px"><button id="masr-batch-copy">复制结果清单</button>' +
+      '<span id="masr-batch-copy-tip" style="margin-left:6px;color:#8f959e"></span></div></div>';
+
+    const box = document.getElementById('masr-batch-report');
+    if (box) box.innerHTML = html;
+
+    // 复制用纯文本：直接粘到群里/文档里就能交接
+    const buildText = function () {
+      const L = [];
+      L.push('华为ADS 取密钥 · 批量结果  ' + new Date().toLocaleString('zh-CN'));
+      L.push('对账：选中 ' + s.total + ' · 实跑 ' + execN + ' · 跳过 ' + skipRecs.length);
+      L.push('取密钥：成功 ' + s.okN + ' / 失败 ' + s.failN + (s.unknownN ? ' / 状态未知 ' + s.unknownN : ''));
+      L.push('回写飞书：已落表 ' + writtenN + ' / 待补写 ' + queuedN + ' / 未落账 ' + lostN);
+      if (notYetN > 0) L.push('未处理：' + notYetN + ' 条（批次中止，未执行）');
+      L.push('耗时：总 ' + fmtDur(totalMs) + ' · 平均 ' + (avgMs / 1000).toFixed(1) + 's/条');
+      if (errLine) L.push('失败错误码：' + errLine);
+      if (needRows.length) {
+        L.push('');
+        L.push('需处理明细（' + needRows.length + ' 条）：');
+        needRows.forEach(function (r) {
+          const why = r.ok === false ? (r.error + (r.message ? ' ' + r.message : ''))
+            : ('未落账 ' + (r.write === 'norecord' ? '缺 record_id' : (r.writeMsg || '')));
+          L.push(r.idx + '. ' + (r.account_id || '-') + '\t' + (r.account_name || '-') + '\t' + why);
+        });
+      }
+      if (skipRecs.length) L.push('跳过（无账户ID）：' + skipRecs.map(function (r) { return r.record_id || '-'; }).join('、'));
+      return L.join('\n');
+    };
+    const cp = document.getElementById('masr-batch-copy');
+    if (cp) cp.addEventListener('click', function () {
+      const txt = buildText();
+      const tip = document.getElementById('masr-batch-copy-tip');
+      const ok = function () { if (tip) { tip.textContent = '已复制 ✓'; setTimeout(function () { tip.textContent = ''; }, 2000); } };
+      const fb = function () {
+        const ta = document.createElement('textarea');
+        ta.value = txt; ta.style.position = 'fixed'; ta.style.left = '-9999px'; ta.style.top = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); ok(); } catch (e) { if (tip) tip.textContent = '复制失败，请手动选中下方文本'; }
+        document.body.removeChild(ta);
+      };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(ok, fb);
+        else fb();
+      } catch (e) { fb(); }
+    });
+
+    // 日志里也留一份摘要（跨页保留，事后能翻）
+    UI.appendLog({ t: Date.now(), level: lostN ? 'fatal' : (queuedN ? 'warn' : 'ok'),
+      msg: '=== 批量结束：实跑 ' + execN + '/' + s.total + ' · 成功 ' + s.okN + ' / 失败 ' + s.failN +
+        ' · 已落表 ' + writtenN + (queuedN ? ' / 待补写 ' + queuedN : '') + (lostN ? ' / 未落账 ' + lostN : '') +
+        ' · 总耗时 ' + fmtDur(totalMs) + ' ===' });
+    if (needRows.length) {
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ 需处理 ' + needRows.length + ' 条：' +
+        needRows.map(function (r) { return (r.account_id || '-') + '(' + (r.ok === false ? r.error : '未落账') + ')'; }).join('、') });
+    }
   };
 
   function delay(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
@@ -2320,7 +2487,7 @@
   /* 回写失败不丢结果：落本地待办队列，服务恢复后一键重试（本机验证服务常被关掉） */
   const PENDW_KEY = 'masr_pending_writes_v1';
   function pwList() { try { return JSON.parse(GM_getValue(PENDW_KEY, '[]')) || []; } catch (e) { return []; } }
-  function pwSave(arr) { try { GM_setValue(PENDW_KEY, JSON.stringify(arr.slice(-20))); } catch (e) {} }
+  function pwSave(arr) { try { GM_setValue(PENDW_KEY, JSON.stringify(arr.slice(-100))); } catch (e) {} } // 上限 100：批量一次 50 条，留 20 会丢掉最早的结果
   function pwAdd(payload) {
     const a = pwList();
     a.push(Object.assign({}, payload, { queued_at: Date.now() }));
@@ -2367,6 +2534,7 @@
         msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') +
           '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
       });
+      if (UI._batchHook) UI._batchHook(task.record_id, 'written');
       if (!UI._running) UI.renderTasks();
     } catch (e) {
       pwAdd(payload);
@@ -2383,6 +2551,7 @@
         msg: '⚠️ 回写飞书失败：' + msg + hint +
           ' —— 该结果已存本地待写队列，不会丢'
       });
+      if (UI._batchHook) UI._batchHook(task.record_id, 'queued', msg);
       if (!UI._running) UI.renderTasks();
       updResultWarn(pwList().length);
     }
