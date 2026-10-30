@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.3
+// @version      0.4.4
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -78,6 +78,10 @@
  *     不打断正在跑的任务；重载后日志/参数/续跑状态都从 GM 存储恢复，不丢东西）；
  *     ③「锁定」改名「锁定凭证」并加说明（只清本机口令钥匙，不解绑、不影响已回写结果）；
  *     ④回写失败落本地待写队列，任务行出现「重试回写 (N)」，服务恢复后一键补写
+ *
+ *   - v0.4.4：回写抗抖动——①客户端遇超时/断连自动再试一次（1 秒后），仍失败才进本地待写队列；
+ *     ②失败提示分清责任：`E_FS_TIMEOUT/E_FS_NET` 是「后端连飞书超时」而不是「本机服务没跑」
+ *     （0.4.3 那句提示会误导人，用户实测踩到）；③service 侧同步给出站请求 7s 硬超时 + 重试一次
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -299,7 +303,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.3',
+    RUNNER_VERSION: '0.4.4',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -889,7 +893,7 @@
       <div id="masr-head">
         <div class="h-row">
           <span class="brand">MAS <i>Runner</i></span>
-          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.3</span>
+          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.4</span>
           <span class="grow"></span>
           <span class="masr-upd" id="masr-update-out"></span>
           <button class="masr-mini" id="masr-check-update" title="检查解释器有没有新版本">检查更新</button>
@@ -2174,6 +2178,23 @@
     pwSave(a);
   }
 
+  /* 回写：超时/断连自动再试一次（这类失败九成是连接抖了一下，重试就过；见 service fsFetch 注释） */
+  async function writeWithRetry(payload, tries) {
+    tries = tries || 2;
+    let lastErr = null;
+    for (let i = 0; i < tries; i++) {
+      try { return await SVC.writeResult(payload); }
+      catch (e) {
+        lastErr = e;
+        const transient = /E_FS_TIMEOUT|E_FS_NET|E_SVC_TIMEOUT|E_SVC_NET/.test(String((e && e.message) || e));
+        if (i === tries - 1 || !transient) throw e;
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '回写超时/断连，1 秒后自动重试一次…' });
+        await new Promise(function (r) { setTimeout(r, 1000); });
+      }
+    }
+    throw lastErr;
+  }
+
   async function pushTaskResult(st, ok, outputs, err) {
     const task = st && st.task;
     if (!task || !task.record_id) return;
@@ -2187,16 +2208,22 @@
     if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
     else payload.error_type = (err && err.code) || 'E_UNKNOWN';
     try {
-      await SVC.writeResult(payload);
+      await writeWithRetry(payload);
       UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') });
       UI.renderTasks();
     } catch (e) {
       pwAdd(payload);
+      const msg = String((e && e.message) || e);
       const local = /127\.0\.0\.1|localhost/.test(SVC.base() || '');
+      // 分清是谁的问题：后端连不上飞书 ≠ 本机服务没跑 ≠ 结果本身有问题
+      let hint;
+      if (/E_FS_TIMEOUT|E_FS_NET/.test(msg)) hint = '（后端连飞书超时/被网络掐了，与结果本身无关）';
+      else if (/E_FS_TOKEN|E_FS_API|E_FS_PARSE/.test(msg)) hint = '（飞书接口报错，看括号里的错误码）';
+      else if (/E_SVC_NET|E_SVC_TIMEOUT/.test(msg)) hint = local ? '（本机验证服务没在跑？起来后点「重试回写」即可）' : '（连不上后端，恢复后点「重试回写」）';
+      else hint = '';
       UI.appendLog({
         t: Date.now(), level: 'fatal',
-        msg: '⚠️ 回写飞书失败：' + e.message +
-          (local ? '（本机验证服务没在跑？起来后点「重试回写」即可）' : '') +
+        msg: '⚠️ 回写飞书失败：' + msg + hint +
           ' —— 该结果已存本地待写队列，不会丢'
       });
       UI.renderTasks();
@@ -2222,7 +2249,7 @@
       const body = Object.assign({}, p);
       delete body.queued_at;
       try {
-        await SVC.writeResult(body);
+        await writeWithRetry(body, 2);
         okN++;
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
       } catch (e) {
