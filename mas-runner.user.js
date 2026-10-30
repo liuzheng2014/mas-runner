@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.18
+// @version      0.1.19
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -10,6 +10,7 @@
 // @downloadURL  https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
 // @match        https://ads.huawei.com/*
 // @match        https://*.ads.huawei.com/*
+// @match        https://*.feishu.cn/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -20,7 +21,7 @@
 // @connect      open.feishu.cn
 // @connect      accounts.feishu.cn
 // @connect      self
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 /*
@@ -291,7 +292,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.18',
+    RUNNER_VERSION: '0.1.19',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -324,8 +325,8 @@
 
   /* ==================== FEISHU AUTH + API (v0.1.17) ====================
    * 业务同学在悬浮球点一次「登录飞书」：OAuth 授权码 + PKCE
-   *   授权页(accounts.feishu.cn) → 回调页(liuzheng2014.github.io/mas-runner/oauth.html)
-   *   → postMessage 把 code 交还本页 → 换 user_access_token + refresh_token
+   *   授权页(accounts.feishu.cn) → 回调地址(飞书 Base 页面) → 本脚本在该页读 code
+   *   → 换 user_access_token + refresh_token → GM 存储共享回发起页
    * 之后每次写表前自动用 refresh_token 续期，连续使用不需要再登录。
    *
    * 已证实的边界（飞书官方文档）：
@@ -334,9 +335,15 @@
    *   - 换 token 与调 API 全部走 GM_xhr（OpenAPI 无 CORS 头，页面内 fetch 会被拦）。
    *   - 不内嵌 app_secret：优先 PKCE 公共客户端；仅当服务端返回 20002 时才提示填 secret（存本机）。
    */
+  // 脚本一落地就记下原始 URL：飞书是多页应用，路由初始化可能改写 query，
+  // 等 DOMContentLoaded 再读就把 code 丢了（v0.1.19 踩过）
+  const BOOT_HREF = (function () { try { return location.href; } catch (e) { return ''; } })();
+
   const FS = {
     APP_ID: 'cli_a8ba8371b3f9d00b',
-    REDIRECT_URI: 'https://liuzheng2014.github.io/mas-runner/oauth.html',
+    // 回调地址 = 飞书后台已登记的 Base 页面地址（用户指定）。code 会被拼在其后：
+    //   ...&view=vewpn9IjTf&code=xxx&state=yyy —— 由 @match 了 feishu.cn 的本脚本接住
+    REDIRECT_URI: 'https://scnzhojz10ln.feishu.cn/base/OC2LbUsiLaRyhcse8P2cZyXintf?table=tblfNglNBPCKqEjl&view=vewpn9IjTf',
     SCOPE: 'offline_access bitable:app',
     AUTH_URL: 'https://accounts.feishu.cn/open-apis/authen/v1/authorize',
     TOKEN_URL: 'https://accounts.feishu.cn/oauth/v3/token',
@@ -504,6 +511,105 @@
     fsWriteToken(tok);
     GM_deleteValue(FS.P_KEY);
     return tok;
+  }
+
+  /* ---------- 回调落地（v0.1.19：回调页 = 飞书 Base 页面本身） ----------
+   * 飞书把 code 拼在登记的回调地址后面，浏览器打开该 Base 页面；
+   * 本脚本因 @match *.feishu.cn 也在该页运行，读 URL 里的 code 就地换 token，
+   * 写进 GM 存储（跨域共享）→ 发起页轮询到就自动变成「已登录」。
+   * 该页只做这一件事：不挂悬浮球、不注入 UI，避免干扰日常使用。
+   */
+  const FS_KICK_KEY = 'masr_feishu_kick_v1';
+
+  function fsIsFeishuHost() {
+    const h = (function () { try { return location.hostname; } catch (e) { return ''; } })();
+    return /(^|\.)feishu\.cn$/i.test(h) || /(^|\.)larksuite\.com$/i.test(h);
+  }
+
+  // 从 URL 里取 code：飞书可能把参数留在 search，也可能塞进 hash 的 query（hash 路由）
+  function fsUrlCode() {
+    const raws = [];
+    try { raws.push(location.href); } catch (e) {}
+    if (BOOT_HREF && BOOT_HREF !== raws[0]) raws.push(BOOT_HREF);
+    for (let i = 0; i < raws.length; i++) {
+      const u = raws[i];
+      if (!u) continue;
+      const qi = u.indexOf('?');
+      if (qi < 0) continue;
+      const qs = u.slice(qi + 1).split('#')[0];
+      const p = new URLSearchParams(qs);
+      const c = p.get('code') || p.get('authorization_code');
+      if (c) return { code: c, state: p.get('state') || '', from: i === 0 ? 'live' : 'boot' };
+    }
+    return null;
+  }
+
+  // 换完就把 code 从地址栏抹掉（避免留在历史记录 / 被第三方资源 referer 带出去）
+  function fsStripCode() {
+    try {
+      const u = new URL(location.href);
+      ['code', 'state', 'authorization_code'].forEach(function (k) { u.searchParams.delete(k); });
+      history.replaceState(null, '', u.toString());
+    } catch (e) {}
+  }
+
+  function fsBanner(title, detail, tone) {
+    try {
+      if (!document.body) return null;
+      let el = document.getElementById('masr-fs-cb');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'masr-fs-cb';
+        el.style.cssText = 'position:fixed;z-index:2147483647;left:50%;top:16px;transform:translateX(-50%);' +
+          'max-width:520px;padding:14px 18px;border-radius:10px;background:#fff;color:#1f2329;' +
+          'box-shadow:0 8px 28px rgba(0,0,0,.18);font:13px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;' +
+          'border-left:4px solid #3370ff';
+        document.body.appendChild(el);
+      }
+      const colors = { ok: '#1a7f45', err: '#c02a2a', wait: '#3370ff' };
+      el.style.borderLeftColor = colors[tone] || colors.wait;
+      el.innerHTML = '<div style="font-weight:600;font-size:14px;margin-bottom:4px">' + title + '</div>' +
+        '<div style="color:#646a73;font-size:12.5px;word-break:break-all">' + detail + '</div>';
+      return el;
+    } catch (e) { return null; }
+  }
+
+  async function fsHandleCallback(code, state) {
+    fsBanner('正在用授权码换取凭证…', '请不要关闭此页面', 'wait');
+    try {
+      const tok = await fsCompleteLogin(code, state);
+      fsStripCode();
+      GM_setValue(FS_KICK_KEY, String(Date.now()));
+      fsBanner('✅ 飞书授权成功' + (tok.name ? '：' + tok.name : ''),
+        '可以关闭本页，回到华为代理页继续操作（面板会自动变成「已登录」）。<br>本页将在 2 秒后自动关闭。', 'ok');
+      setTimeout(function () { try { window.close(); } catch (e) {} }, 2000);
+      return true;
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      const retry = /redirect_uri|20001|invalid_request/i.test(msg)
+        ? '<br><b>回调地址校验失败</b>：请确认开发后台登记的重定向 URL 与本脚本 FS.REDIRECT_URI 完全一致（含全部 query 参数）。'
+        : (/20002|invalid_client/.test(msg)
+          ? '<br><b>该应用要求 client_secret</b>：在 Runner 面板填入一次即可（仅存本机）。'
+          : '');
+      fsBanner('❌ 飞书授权失败', '<b>' + msg + '</b>' + retry +
+        '<br>可把地址栏里的 <code>code=</code> 后面那段复制到 Runner 面板的「授权码」输入框手动完成。', 'err');
+      return false;
+    }
+  }
+
+  // 只在这一个页面做回调接收：轮询 30 秒，拿到 code 就办一次
+  function fsCallbackWatch() {
+    let done = false;
+    const tick = function () {
+      if (done) return;
+      const hit = fsUrlCode();
+      if (!hit) return;
+      done = true;
+      fsHandleCallback(hit.code, hit.state);
+    };
+    tick();
+    let n = 0;
+    const iv = setInterval(function () { n++; tick(); if (done || n > 150) clearInterval(iv); }, 200);
   }
 
   // 统一的 OpenAPI 调用（Bearer）
@@ -1220,7 +1326,7 @@
       '<button id="masr-fs-login" class="primary">' + (t ? '重新登录' : '登录飞书') + '</button>' +
       (t ? '<button id="masr-fs-logout">退出</button>' : '') +
       '<div style="margin-top:6px">' +
-      '<input id="masr-fs-code" placeholder="授权码（回调页未自动回传时粘贴到这里）" style="width:280px"> ' +
+      '<input id="masr-fs-code" placeholder="授权码（自动换取失败时，从回调页地址栏复制 code 粘贴）" style="width:280px"> ' +
       '<button id="masr-fs-submit">提交</button></div>' +
       '<div id="masr-fs-out" style="font-size:11px;color:#8f959e"></div>';
 
@@ -1229,7 +1335,7 @@
       try {
         out.textContent = '正在打开飞书授权页…';
         await fsLogin();
-        out.textContent = '已打开授权页，请在飞书页面点击授权；完成后本面板会自动更新。';
+        out.textContent = '已打开飞书授权页：点「授权」后会自动落到飞书 Base 页面完成换取，成功后本面板自动变成已登录。';
       } catch (e) {
         out.textContent = e.message;
       }
@@ -1586,6 +1692,8 @@
   /* ==================== 启动 ==================== */
 
   function boot() {
+    // 飞书域只做一件事：接住 OAuth 回调（code 在 URL 上）。不挂 UI、不动页面。
+    if (fsIsFeishuHost()) { fsCallbackWatch(); return; }
     UI.mount();
     UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
     // 自动恢复上次加载的 spec 与参数：刷新、跳转落地、新标签页都不用重新粘贴
@@ -1630,6 +1738,18 @@
         // 辅助页/中转页：结果已广播，安全关闭（仅对脚本打开的标签页有效）
         try { window.close(); } catch (e) {}
       }
+    }, 1500);
+
+    // 飞书登录态被别的标签页更新（在飞书 Base 页完成授权）→ 面板自动刷新
+    let fsSig = (function () { const t = fsReadToken(); return t ? (t.name || '') + '|' + (t.exp_at || 0) : 'none'; })();
+    setInterval(function () {
+      if (!document.getElementById('masr-feishu')) return;
+      const t = fsReadToken();
+      const sig = t ? (t.name || '') + '|' + (t.exp_at || 0) + '|' + (t.refresh_exp_at || 0) : 'none';
+      if (sig === fsSig) return;
+      fsSig = sig;
+      UI.renderFeishu();
+      if (t) UI.appendLog({ t: Date.now(), level: 'ok', msg: '飞书授权已生效' + (t.name ? '（' + t.name + '）' : '') });
     }, 1500);
 
     // 静默自检更新（6 小时一次）：不弹窗、不打断，发现新版只在悬浮球点一颗红点
