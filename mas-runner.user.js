@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.17
+// @version      0.1.18
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -291,7 +291,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.17',
+    RUNNER_VERSION: '0.1.18',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -517,6 +517,55 @@
     try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FS_PARSE ' + res.text.slice(0, 120)); }
     if (j.code !== 0) throw new Error('E_FS_API ' + j.code + ' ' + (j.msg || '') + ' path=' + path);
     return j.data;
+  }
+
+  /* ---------- 业务表读写（复用既有 Base，只写约定字段，不改表结构） ---------- */
+  const FS_BIZ = {
+    APP: 'OC2LbUsiLaRyhcse8P2cZyXintf',   // 🚀【客服&媒介】业务提效系统
+    SPEC_TABLE: 'tblKAlQwYgLT3fys',       // MAS_脚本配置表（已升级为 spec 登记表）
+    TASK_TABLE: 'tblvQkpB9o2ovRiR',       // 【华为ADS】秘钥获取（任务+结果台账）
+  };
+
+  async function fsSearchRecords(tableId, payload) {
+    const d = await fsApi('POST', '/bitable/v1/apps/' + FS_BIZ.APP + '/tables/' + tableId + '/records/search',
+      Object.assign({ page_size: 100 }, payload || {}));
+    return (d && d.items) || [];
+  }
+
+  // 按 script_id 找最新的、带 spec_json 的登记行
+  async function fsFindSpec(scriptId) {
+    const rows = await fsSearchRecords(FS_BIZ.SPEC_TABLE);
+    const hit = rows
+      .filter(r => r.fields && r.fields.script_id === scriptId && r.fields.spec_json)
+      .sort((a, b) => String(b.fields.version || '').localeCompare(String(a.fields.version || ''), 'zh-CN', { numeric: true }));
+    return hit[0] || null;
+  }
+
+  // 结果 upsert：按「账户ID」查，有则更新，无则新增（只碰这几个字段）
+  async function fsUpsertResult(r) {
+    const fields = {
+      '账户ID': String(r.accountId || ''),
+      '账户名称': r.accountName || '',
+      '秘钥': r.secret || '',
+      '状态': r.status || '获取失败',
+      '耗时ms': Number(r.ms || 0),
+      'runner版本': GV.RUNNER_VERSION,
+      'spec版本': r.specVersion || '',
+    };
+    if (r.errorType) fields['错误类型'] = r.errorType;
+
+    let existing = [];
+    if (r.accountId) {
+      existing = await fsSearchRecords(FS_BIZ.TASK_TABLE, {
+        filter: { conjunction: 'and', conditions: [{ field_name: '账户ID', operator: 'is', value: [String(r.accountId)] }] },
+        page_size: 5,
+      });
+    }
+    const path = '/bitable/v1/apps/' + FS_BIZ.APP + '/tables/' + FS_BIZ.TASK_TABLE + '/records';
+    if (existing.length) {
+      return fsApi('PUT', path + '/' + existing[0].record_id, { fields });
+    }
+    return fsApi('POST', path, { fields });
   }
 
   // ---------- 风控限速器 ----------
@@ -1016,6 +1065,7 @@
       <div class="row" id="masr-spec-box"><b>① 粘贴 spec.json（dev 模式）</b><br></div>
       <div class="row">
         <button class="primary" id="masr-load">加载 spec</button>
+        <button id="masr-fs-pull">从飞书拉 spec</button>
         <button id="masr-hash">计算 SHA-256</button>
         <span id="masr-hash-out"></span>
       </div>
@@ -1037,6 +1087,30 @@
 
     document.getElementById('masr-load').addEventListener('click', () => {
       UI.applySpec(UI.getSpecText(), {});
+    });
+    document.getElementById('masr-fs-pull').addEventListener('click', async () => {
+      const btn = document.getElementById('masr-fs-pull');
+      const old = btn.textContent;
+      btn.textContent = '拉取中…'; btn.disabled = true;
+      try {
+        const rows = await fsSearchRecords(FS_BIZ.SPEC_TABLE);
+        const cands = rows.filter(r => r.fields && r.fields.spec_json);
+        if (!cands.length) throw new Error('飞书表里没有带 spec_json 的登记行');
+        const isActive = (v) => (Array.isArray(v) ? v.indexOf('active') >= 0 : v === 'active');
+        const actives = cands.filter(r => isActive(r.fields.spec_status));
+        const pick = (actives.length ? actives : cands).sort((a, b) =>
+          String(b.fields.version || '').localeCompare(String(a.fields.version || ''), 'zh-CN', { numeric: true }))[0];
+        UI.applySpec(pick.fields.spec_json, {});
+        UI.appendLog({
+          t: Date.now(), level: 'ok',
+          msg: '已从飞书拉取 spec：' + (pick.fields.name || pick.fields.script_id) + ' v' + (pick.fields.version || '?') +
+            '（' + cands.length + ' 条候选，取 ' + (actives.length ? 'active' : '任意') + ' 最新）'
+        });
+      } catch (e) {
+        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '拉取 spec 失败：' + e.message });
+      } finally {
+        btn.textContent = old; btn.disabled = false;
+      }
     });
     document.getElementById('masr-hash').addEventListener('click', async () => {
       const txt = UI.getSpecText();
