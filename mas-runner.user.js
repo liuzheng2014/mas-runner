@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.2.1
+// @version      0.2.3
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -293,7 +293,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.2.1',
+    RUNNER_VERSION: '0.2.3',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -1368,7 +1368,7 @@
   SVC.spec = function () { return SVC.call('GET', '/spec', { script_id: SVC.SPEC_SCRIPT }); };
   SVC.writeResult = function (payload) { return SVC.call('POST', '/result', null, payload); };
   SVC.bindStart = function () { return SVC.call('GET', '/bind/start'); };
-  SVC.bindPoll = function (bindCode) { return SVC.call('GET', '/bind/poll', { bind_code: bindCode }); };
+  SVC.bindPoll = function (q) { return SVC.call('GET', '/bind/poll', q || {}); };
 
   /* ---------- 任务面板 v0.2.1：自助绑定（用户全程不接触任何 ID） ---------- */
 
@@ -1391,86 +1391,94 @@
   function renderBind(box) {
     box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未绑定身份</span>' +
       '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
-      '第一次使用，30 秒完成绑定：<br>' +
-      '① 点下面按钮 —— 会自动复制绑定码，并打开飞书登记表单<br>' +
-      '② 表单里「身份ID」粘贴这串码，填好姓名提交<br>' +
-      '③ 提交后面板自动完成，不用再点任何东西' +
+      '第一次使用，30 秒完成：<br>' +
+      '① 点下面按钮，打开飞书登记表单<br>' +
+      '② 填好姓名和部门，提交<br>' +
+      '③ 提交后这里自动完成，不用再点任何东西' +
       '</div>' +
-      '<div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
-      '<span id="masr-bindcode" style="font-family:ui-monospace,Consolas,monospace;font-size:22px;letter-spacing:4px;font-weight:700;color:#1d4ed8">······</span>' +
-      '<button class="primary" id="masr-bind-go">复制绑定码并打开登记表单</button>' +
-      '<button id="masr-bind-again" style="display:none">重新获取</button>' +
-      '</div>' +
+      '<div style="margin-top:8px"><button class="primary" id="masr-bind-go">打开登记表单</button>' +
+      ' <button id="masr-bind-again" style="display:none">重新开始</button></div>' +
       '<div id="masr-bind-out" style="margin-top:6px;font-size:11px;color:#8f959e"></div>';
 
     const $out = function () { return document.getElementById('masr-bind-out'); };
-    const $code = function () { return document.getElementById('masr-bindcode'); };
+    const $go = function () { return document.getElementById('masr-bind-go'); };
     const $again = function () { return document.getElementById('masr-bind-again'); };
 
-    let bindCode = '';
     let formUrl = '';
 
-    function pollBind(theCode, tries) {
-      if (!$code()) return; // 面板已被替换或页面已关，停止轮询
-      SVC.bindPoll(theCode).then(function (j) {
-        if (!$code()) return;
-        if (j.state === 'bound') {
-          GM_setValue(SVC.C_KEY, j.device_code);
-          GM_setValue(SVC.M_KEY, JSON.stringify({ name: j.name, open_id: j.open_id, dept: j.dept || '' }));
-          UI.appendLog({ t: Date.now(), level: 'ok', msg: '身份绑定完成：' + j.name + (j.dept ? '（' + j.dept + '）' : '') + '，之后只显示你自己的待办' });
-          UI.renderTasks();
-          return;
-        }
+    function showChoose(cands) {
+      const out = $out();
+      if (!out) return;
+      if (!cands || !cands.length) { out.textContent = '没有可选的登记记录，请先提交表单'; return; }
+      out.innerHTML = '<div style="margin-bottom:4px">检测到 ' + cands.length + ' 条未绑定登记，点你自己那条：</div>' +
+        cands.map(function (c, i) {
+          const t = c.created ? new Date(c.created).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+          const label = (c.name || '(无名)') + (c.dept ? ' · ' + c.dept : '') + (t ? ' · ' + t : '');
+          return '<button data-cand="' + i + '" style="margin:2px 6px 2px 0">' + label + '</button>';
+        }).join('');
+      out.querySelectorAll('button[data-cand]').forEach(function (b) {
+        b.addEventListener('click', function () {
+          const c = cands[Number(b.getAttribute('data-cand'))];
+          if ($out()) $out().textContent = '正在绑定「' + (c.name || '') + '」…';
+          pollBind({ record_id: c.record_id }, 6);
+        });
+      });
+    }
+
+    function onBound(j) {
+      GM_setValue(SVC.C_KEY, j.device_code);
+      GM_setValue(SVC.M_KEY, JSON.stringify({ name: j.name, open_id: j.open_id, dept: j.dept || '' }));
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '身份绑定完成：' + j.name + (j.dept ? '（' + j.dept + '）' : '') + '，之后只显示你自己的待办' });
+      UI.renderTasks();
+    }
+
+    function pollBind(state, tries) {
+      if (!$out()) return;
+      SVC.bindPoll(state).then(function (j) {
+        if (!$out()) return;
+        if (j.state === 'bound') return onBound(j);
+        if (j.state === 'choose') { showChoose(j.candidates); return; }
         if (j.state === 'expired') {
-          if ($out()) $out().textContent = j.hint || '登记已过期，请点「重新获取」';
+          if ($out()) $out().textContent = j.hint || '登记已过期，请点「重新开始」';
           if ($again()) $again().style.display = '';
           return;
         }
         if (tries <= 0) {
-          if ($out()) $out().textContent = '等待超时。填完表后点「重新获取」再走一次。';
+          if ($out()) $out().textContent = '等待超时。填完表后点「重新开始」再走一次。';
           if ($again()) $again().style.display = '';
           return;
         }
-        if ($out()) $out().textContent = '⏳ 等待提交…（最长再等 ' + Math.ceil(tries * 3 / 60) + ' 分钟）';
-        setTimeout(function () { pollBind(theCode, tries - 1); }, 3000);
-      }).catch(function (e) {
-        if (!$code()) return;
-        if ($out()) $out().textContent = '轮询出错：' + e.message + '（重试中）';
-        if (tries > 0) setTimeout(function () { pollBind(theCode, tries - 1); }, 6000);
-      });
-    }
-
-    function acquire() {
-      bindCode = ''; formUrl = '';
-      if ($code()) $code().textContent = '······';
-      if ($out()) $out().textContent = '正在获取绑定码…';
-      SVC.bindStart().then(function (j) {
-        bindCode = j.code; formUrl = j.form_url;
-        if ($code()) $code().textContent = j.code;
-        if ($out()) $out().textContent = '绑定码 ' + j.expires_min + ' 分钟内有效；表单里「' + j.field_hint + '」一栏粘贴它。';
-        if ($again()) $again().style.display = '';
-      }).catch(function (e) {
-        if ($out()) $out().textContent = '获取绑定码失败：' + e.message;
-      });
-    }
-
-    document.getElementById('masr-bind-go').addEventListener('click', function () {
-      if (!bindCode) { if ($out()) $out().textContent = '绑定码还没拿到，稍等一下再点'; return; }
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(bindCode).then(function () {
-            if ($out()) $out().textContent = '绑定码已复制 → 在弹出的表单里粘贴到「身份ID」';
-          }).catch(function () {});
+        if ($out()) {
+          $out().textContent = (j.hint ? j.hint + '；' : '') + '⏳ 等待提交…（最长再等 ' + Math.ceil(tries * 3 / 60) + ' 分钟）';
         }
-      } catch (e) {}
-      try { window.open(formUrl, '_blank', 'noopener'); } catch (e) {}
-      if ($out()) $out().textContent = '已打开登记表单，提交后这里会自动完成…';
-      pollBind(bindCode, 200);
+        setTimeout(function () { pollBind(state, tries - 1); }, 3000);
+      }).catch(function (e) {
+        if (!$out()) return;
+        if ($out()) $out().textContent = '轮询出错：' + e.message + '（重试中）';
+        if (tries > 0) setTimeout(function () { pollBind(state, tries - 1); }, 6000);
+      });
+    }
+
+    // 拿到表单地址（顺带的服务地址配置入口，客户端不需要展示绑定码）
+    SVC.bindStart().then(function (j) {
+      formUrl = j.form_url;
+      if ($out()) $out().textContent = '点按钮打开表单；提交后这里会自动完成。';
+    }).catch(function (e) {
+      if ($out()) $out().textContent = '连接服务失败：' + e.message;
     });
 
-    $again().addEventListener('click', function () { $again().style.display = 'none'; acquire(); });
+    document.getElementById('masr-bind-go').addEventListener('click', function () {
+      if (!formUrl) { if ($out()) $out().textContent = '表单地址还没拿到，稍等一秒再点'; return; }
+      const since = Date.now();
+      try { window.open(formUrl, '_blank', 'noopener'); } catch (e) {}
+      if ($out()) $out().textContent = '已打开登记表单，提交后这里会自动完成…';
+      pollBind({ since: since }, 200);
+    });
 
-    acquire();
+    $again().addEventListener('click', function () {
+      $again().style.display = 'none';
+      document.getElementById('masr-bind-go').click();
+    });
   }
 
   // ③ 已绑定 → 我的待办
