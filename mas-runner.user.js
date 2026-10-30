@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.15
+// @version      0.1.16
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -64,6 +64,10 @@
  *   - v0.1.15：spec 与参数自动记忆——上次加载的 spec 原文存 GM，页面刷新/跳转落地/新标签页
  *     打开时自动恢复（粘贴框、badge、参数表都回来），参数按 spec_id 记住上次填的值并回填；
  *     恢复走静默路径（不往跨页日志灌噪音），加载失败也不阻断手动粘贴
+ *
+ *   - v0.1.16：启动静默自检更新——每 6 小时最多一次在后台拉 manifest，发现新版只在悬浮球
+ *     右上角点一颗脉冲红点（不弹窗、不打断、不写日志噪音）；面板「检查更新」按钮保留为
+ *     手动立即查询入口。配合油猴自身的 @updateURL 自动升级，业务同学日常零操作
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -285,7 +289,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.15',
+    RUNNER_VERSION: '0.1.16',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -776,6 +780,9 @@
       #masr-ball{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:44px;height:44px;border-radius:50%;
         background:#1a66ff;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
         cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25);user-select:none}
+      #masr-dot{position:absolute;top:-2px;right:-2px;width:11px;height:11px;border-radius:50%;
+        background:#e8452c;border:2px solid #fff;box-sizing:border-box;animation:masr-pulse 1.6s infinite}
+      @keyframes masr-pulse{0%,100%{opacity:1}50%{opacity:.45}}
       #masr-panel{position:fixed;right:18px;bottom:70px;z-index:2147483000;width:520px;max-height:70vh;overflow:auto;
         background:#fff;color:#222;border:1px solid #d9d9e3;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.2);
         font:12px/1.6 -apple-system,'Segoe UI',sans-serif;padding:12px;display:none}
@@ -1039,9 +1046,29 @@
     }
     return 0;
   }
-  UI.checkUpdate = async function () {
+  // 有新版本时在悬浮球上点一颗红点：不打扰，但一眼能看到
+  function setUpdateDot(on, ver) {
+    const ball = document.getElementById('masr-ball');
+    if (!ball) return;
+    let dot = document.getElementById('masr-dot');
+    if (on) {
+      if (!dot) {
+        dot = document.createElement('span');
+        dot.id = 'masr-dot';
+        ball.appendChild(dot);
+      }
+      dot.title = '有新版本 v' + (ver || '') + ' 可更新';
+      ball.title = 'MAS-Runner v' + GV.RUNNER_VERSION + '｜有新版本 v' + (ver || '') + '（点击打开/收起）';
+    } else if (dot) {
+      dot.remove();
+      ball.title = 'MAS-Runner v' + GV.RUNNER_VERSION + '（点击打开/收起）';
+    }
+  }
+  UI.setUpdateDot = setUpdateDot;
+
+  UI.checkUpdate = async function (silent) {
     const out = document.getElementById('masr-update-out');
-    out.textContent = '检查中…';
+    if (out && !silent) out.textContent = '检查中…';
     let lastErr = '';
     for (const url of GV.UPDATE_MANIFEST) {
       try {
@@ -1049,18 +1076,32 @@
         if (res.status !== 200) { lastErr = 'HTTP ' + res.status; continue; }
         const m = JSON.parse(res.text);
         if (cmpVer(m.version, GV.RUNNER_VERSION) > 0) {
-          out.innerHTML = '<span style="color:#1a7f43">发现新版本 v' + m.version + ' → </span>' +
-            '<a href="' + (m.install_url || GV.INSTALL_URL) + '" target="_blank" style="color:#0b6cd4">点此更新</a>';
+          if (out) {
+            out.innerHTML = '<span style="color:#1a7f43">发现新版本 v' + m.version + ' → </span>' +
+              '<a href="' + (m.install_url || GV.INSTALL_URL) + '" target="_blank" style="color:#0b6cd4">点此更新</a>';
+          }
+          setUpdateDot(true, m.version);
           UI.appendLog({ t: Date.now(), level: 'warn', msg: '发现新版本 Runner v' + m.version + '（当前 v' + GV.RUNNER_VERSION + '）：' + (m.notes || '') });
         } else {
-          out.innerHTML = '<span style="color:#666">已是最新 v' + GV.RUNNER_VERSION + '</span>';
-          UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + GV.RUNNER_VERSION });
+          if (out && !silent) out.innerHTML = '<span style="color:#666">已是最新 v' + GV.RUNNER_VERSION + '</span>';
+          setUpdateDot(false);
+          if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + GV.RUNNER_VERSION });
         }
         return;
       } catch (e) { lastErr = e.message; }
     }
-    out.innerHTML = '<span style="color:#b00">检查失败</span>';
-    UI.appendLog({ t: Date.now(), level: 'warn', msg: '更新检查失败（' + lastErr + '）——不影响使用，可稍后重试或手动到仓库安装' });
+    if (out && !silent) out.innerHTML = '<span style="color:#b00">检查失败</span>';
+    if (!silent) UI.appendLog({ t: Date.now(), level: 'warn', msg: '更新检查失败（' + lastErr + '）——不影响使用，可稍后重试或手动到仓库安装' });
+  };
+
+  // 启动时静默自检（默认 6 小时一次）：不打扰、不弹窗，发现新版只在悬浮球点个红点
+  UI.autoCheckUpdate = async function () {
+    const KEY = 'masr_update_checked_at';
+    const now = Date.now();
+    const last = parseInt(GM_getValue(KEY, '0'), 10) || 0;
+    if (now - last < 6 * 60 * 60 * 1000) return;
+    GM_setValue(KEY, String(now));
+    await UI.checkUpdate(true);
   };
   UI.renderSteps = function (spec) {
     const el = document.getElementById('masr-steps');
@@ -1237,6 +1278,9 @@
         try { window.close(); } catch (e) {}
       }
     }, 1500);
+
+    // 静默自检更新（6 小时一次）：不弹窗、不打断，发现新版只在悬浮球点一颗红点
+    setTimeout(function () { UI.autoCheckUpdate(); }, 4000);
   }
 
   // 暴露引擎给测试与控制台（不影响页面）
