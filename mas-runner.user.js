@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.2.0
+// @version      0.2.1
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -293,7 +293,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.2.0',
+    RUNNER_VERSION: '0.2.1',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -1367,58 +1367,118 @@
   SVC.tasks = function () { return SVC.call('GET', '/tasks', { limit: 50 }); };
   SVC.spec = function () { return SVC.call('GET', '/spec', { script_id: SVC.SPEC_SCRIPT }); };
   SVC.writeResult = function (payload) { return SVC.call('POST', '/result', null, payload); };
+  SVC.bindStart = function () { return SVC.call('GET', '/bind/start'); };
+  SVC.bindPoll = function (bindCode) { return SVC.call('GET', '/bind/poll', { bind_code: bindCode }); };
 
-  /* ---------- 任务面板 ---------- */
-  UI.currentTask = null;
+  /* ---------- 任务面板 v0.2.1：自助绑定（用户全程不接触任何 ID） ---------- */
 
-  UI.renderTasks = function () {
-    const box = document.getElementById('masr-tasks');
-    if (!box) return;
-    const me = SVC.me();
-    const base = SVC.base();
+  // ① 还没配服务地址
+  function renderSvcSetup(box) {
+    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未配置服务地址</span>' +
+      '<div style="margin-top:4px;font-size:11px;color:#8f959e">服务地址由管理员提供，填一次即可</div>' +
+      '<div class="row" style="margin-top:4px"><input id="masr-svc-base" placeholder="https://..." style="width:240px"> ' +
+      '<button class="primary" id="masr-svc-save">保存</button></div>' +
+      '<div id="masr-task-out" style="font-size:11px;color:#8f959e"></div>';
+    document.getElementById('masr-svc-save').addEventListener('click', function () {
+      const v = document.getElementById('masr-svc-base').value.trim();
+      if (!v) { document.getElementById('masr-task-out').textContent = '请填服务地址'; return; }
+      GM_setValue(SVC.B_KEY, v);
+      UI.renderTasks();
+    });
+  }
 
-    if (!base || !SVC.code()) {
-      box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未连接</span>' +
-        '<div style="margin-top:4px;font-size:11px;color:#8f959e">首次使用：填入服务地址和属你个人的接入码（向管理员索取）</div>' +
-        '<div class="row"><input id="masr-svc-base" placeholder="https://..." value="" style="width:250px"> ' +
-        '<input id="masr-svc-code" placeholder="接入码" style="width:130px"> ' +
-        '<button class="primary" id="masr-svc-save">连接</button></div>' +
-        '<div id="masr-task-out" style="font-size:11px;color:#8f959e"></div>';
-      const out = document.getElementById('masr-task-out');
-      document.getElementById('masr-svc-save').addEventListener('click', async function () {
-        const b = document.getElementById('masr-svc-base').value.trim();
-        const c = document.getElementById('masr-svc-code').value.trim();
-        if (!b || !c) { out.textContent = '服务地址和接入码都要填'; return; }
-        GM_setValue(SVC.B_KEY, b); GM_setValue(SVC.C_KEY, c);
-        out.textContent = '正在验证接入码…';
-        try {
-          const m = await SVC.bind();
-          UI.appendLog({ t: Date.now(), level: 'ok', msg: '已连接任务服务：' + m.name });
+  // ② 未绑定 → 自助绑定
+  function renderBind(box) {
+    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未绑定身份</span>' +
+      '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
+      '第一次使用，30 秒完成绑定：<br>' +
+      '① 点下面按钮 —— 会自动复制绑定码，并打开飞书登记表单<br>' +
+      '② 表单里「身份ID」粘贴这串码，填好姓名提交<br>' +
+      '③ 提交后面板自动完成，不用再点任何东西' +
+      '</div>' +
+      '<div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+      '<span id="masr-bindcode" style="font-family:ui-monospace,Consolas,monospace;font-size:22px;letter-spacing:4px;font-weight:700;color:#1d4ed8">······</span>' +
+      '<button class="primary" id="masr-bind-go">复制绑定码并打开登记表单</button>' +
+      '<button id="masr-bind-again" style="display:none">重新获取</button>' +
+      '</div>' +
+      '<div id="masr-bind-out" style="margin-top:6px;font-size:11px;color:#8f959e"></div>';
+
+    const $out = function () { return document.getElementById('masr-bind-out'); };
+    const $code = function () { return document.getElementById('masr-bindcode'); };
+    const $again = function () { return document.getElementById('masr-bind-again'); };
+
+    let bindCode = '';
+    let formUrl = '';
+
+    function pollBind(theCode, tries) {
+      if (!$code()) return; // 面板已被替换或页面已关，停止轮询
+      SVC.bindPoll(theCode).then(function (j) {
+        if (!$code()) return;
+        if (j.state === 'bound') {
+          GM_setValue(SVC.C_KEY, j.device_code);
+          GM_setValue(SVC.M_KEY, JSON.stringify({ name: j.name, open_id: j.open_id, dept: j.dept || '' }));
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '身份绑定完成：' + j.name + (j.dept ? '（' + j.dept + '）' : '') + '，之后只显示你自己的待办' });
           UI.renderTasks();
-        } catch (e) {
-          out.textContent = e.message;
+          return;
         }
+        if (j.state === 'expired') {
+          if ($out()) $out().textContent = j.hint || '登记已过期，请点「重新获取」';
+          if ($again()) $again().style.display = '';
+          return;
+        }
+        if (tries <= 0) {
+          if ($out()) $out().textContent = '等待超时。填完表后点「重新获取」再走一次。';
+          if ($again()) $again().style.display = '';
+          return;
+        }
+        if ($out()) $out().textContent = '⏳ 等待提交…（最长再等 ' + Math.ceil(tries * 3 / 60) + ' 分钟）';
+        setTimeout(function () { pollBind(theCode, tries - 1); }, 3000);
+      }).catch(function (e) {
+        if (!$code()) return;
+        if ($out()) $out().textContent = '轮询出错：' + e.message + '（重试中）';
+        if (tries > 0) setTimeout(function () { pollBind(theCode, tries - 1); }, 6000);
       });
-      return;
     }
 
-    if (!me) {
-      box.innerHTML = '<b>任务</b> <span style="color:#c02a2a">接入码无效或已撤销</span>' +
-        '<div class="row"><button id="masr-svc-reset">重新填写</button>' +
-        '<button id="masr-svc-rebind">重试连接</button></div><div id="masr-task-out" style="font-size:11px"></div>';
-      document.getElementById('masr-svc-reset').addEventListener('click', function () {
-        GM_deleteValue(SVC.B_KEY); GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); UI.renderTasks();
+    function acquire() {
+      bindCode = ''; formUrl = '';
+      if ($code()) $code().textContent = '······';
+      if ($out()) $out().textContent = '正在获取绑定码…';
+      SVC.bindStart().then(function (j) {
+        bindCode = j.code; formUrl = j.form_url;
+        if ($code()) $code().textContent = j.code;
+        if ($out()) $out().textContent = '绑定码 ' + j.expires_min + ' 分钟内有效；表单里「' + j.field_hint + '」一栏粘贴它。';
+        if ($again()) $again().style.display = '';
+      }).catch(function (e) {
+        if ($out()) $out().textContent = '获取绑定码失败：' + e.message;
       });
-      document.getElementById('masr-svc-rebind').addEventListener('click', async function () {
-        try { await SVC.bind(); UI.renderTasks(); }
-        catch (e) { document.getElementById('masr-task-out').textContent = e.message; }
-      });
-      return;
     }
 
-    box.innerHTML = '<b>任务</b> <span style="color:#1a7f45">已连接：' + me.name + '</span>' +
+    document.getElementById('masr-bind-go').addEventListener('click', function () {
+      if (!bindCode) { if ($out()) $out().textContent = '绑定码还没拿到，稍等一下再点'; return; }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(bindCode).then(function () {
+            if ($out()) $out().textContent = '绑定码已复制 → 在弹出的表单里粘贴到「身份ID」';
+          }).catch(function () {});
+        }
+      } catch (e) {}
+      try { window.open(formUrl, '_blank', 'noopener'); } catch (e) {}
+      if ($out()) $out().textContent = '已打开登记表单，提交后这里会自动完成…';
+      pollBind(bindCode, 200);
+    });
+
+    $again().addEventListener('click', function () { $again().style.display = 'none'; acquire(); });
+
+    acquire();
+  }
+
+  // ③ 已绑定 → 我的待办
+  function renderBound(box, me) {
+    box.innerHTML = '<b>任务</b> <span style="color:#1a7f45">' + (me.name || '已绑定') +
+      (me.dept ? ' · ' + me.dept : '') + '</span>' +
       ' <button class="primary" id="masr-task-pull">拉我的待办</button>' +
-      ' <button id="masr-task-unbind">断开</button>' +
+      ' <button id="masr-task-unbind">解除绑定</button>' +
       '<div id="masr-task-list" style="margin-top:4px"></div>';
 
     document.getElementById('masr-task-unbind').addEventListener('click', function () {
@@ -1430,7 +1490,7 @@
       try {
         const j = await SVC.tasks();
         if (!j.total) {
-          list.innerHTML = '<div style="font-size:11px;color:#8f959e">没有待处理的记录（状态为空 + 账户ID非空 + 创建人是你）</div>';
+          list.innerHTML = '<div style="font-size:11px;color:#8f959e">没有待处理的记录（需同时满足：创建人是你、状态为空、账户ID已填）</div>';
           return;
         }
         list.innerHTML = '<div style="font-size:11px;color:#8f959e">共 ' + j.total + ' 条待办，点「执行」自动载入 spec 并带上账户ID</div>' +
@@ -1446,6 +1506,28 @@
         list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + e.message + '</div>';
       }
     });
+  }
+
+  UI.renderTasks = function () {
+    const box = document.getElementById('masr-tasks');
+    if (!box) return;
+    if (!SVC.base()) { renderSvcSetup(box); return; }
+    if (!SVC.code()) { renderBind(box); return; }
+    const me = SVC.me();
+    if (!me) {
+      box.innerHTML = '<b>任务</b> <span style="color:#c02a2a">设备码失效（可能已在表里撤销）</span>' +
+        '<div class="row"><button id="masr-svc-reset">重新绑定身份</button>' +
+        '<button id="masr-svc-rebind">重试连接</button></div><div id="masr-task-out" style="font-size:11px"></div>';
+      document.getElementById('masr-svc-reset').addEventListener('click', function () {
+        GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); UI.renderTasks();
+      });
+      document.getElementById('masr-svc-rebind').addEventListener('click', async function () {
+        try { await SVC.bind(); UI.renderTasks(); }
+        catch (e) { document.getElementById('masr-task-out').textContent = e.message; }
+      });
+      return;
+    }
+    renderBound(box, me);
   };
 
   // 点一条待办：拉 active spec → 自动填账户ID → 提示点执行
