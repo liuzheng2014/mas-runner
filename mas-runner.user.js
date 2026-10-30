@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.2
+// @version      0.4.3
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -71,6 +71,13 @@
  *   - v0.1.16：启动静默自检更新——每 6 小时最多一次在后台拉 manifest，发现新版只在悬浮球
  *     右上角点一颗脉冲红点（不弹窗、不打断、不写日志噪音）；面板「检查更新」按钮保留为
  *     手动立即查询入口。配合油猴自身的 @updateURL 自动升级，业务同学日常零操作
+ *
+ *   - v0.4.3：①顶部改两行式——第一行「解释器版本 / 检查更新」，第二行「业务脚本 spec_id +
+ *     版本 + 状态」，两种版本号从此分离（原来挤在一个 h3 里，v0.4.2 和 spec v0.8.0 混着看）；
+ *     ②装完新版本自动重载——点「更新 vX」打开安装页 → 装完切回页面自动重载（最多一次，
+ *     不打断正在跑的任务；重载后日志/参数/续跑状态都从 GM 存储恢复，不丢东西）；
+ *     ③「锁定」改名「锁定凭证」并加说明（只清本机口令钥匙，不解绑、不影响已回写结果）；
+ *     ④回写失败落本地待写队列，任务行出现「重试回写 (N)」，服务恢复后一键补写
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -292,7 +299,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.2',
+    RUNNER_VERSION: '0.4.3',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -840,8 +847,25 @@
       @keyframes masr-pulse{0%,100%{opacity:1}50%{opacity:.45}}
       #masr-panel{position:fixed;right:18px;bottom:70px;z-index:2147483000;width:520px;max-height:70vh;overflow:auto;
         background:#fff;color:#222;border:1px solid #d9d9e3;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.2);
-        font:12px/1.6 -apple-system,'Segoe UI',sans-serif;padding:12px;display:none}
+        font:12px/1.6 -apple-system,'Segoe UI',sans-serif;padding:0 12px 12px;display:none}
       #masr-panel h3{margin:2px 0 8px;font-size:13px}
+      /* --- 顶部：两行，第一行身份/版本，第二行业务脚本（版本号拆开，避免互相混淆） --- */
+      #masr-head{position:sticky;top:0;z-index:5;margin:0 -12px 8px;padding:9px 12px 7px;
+        background:#f7f9fc;border-bottom:1px solid #e3e8f0;border-radius:10px 10px 0 0}
+      #masr-head .h-row{display:flex;align-items:center;gap:6px;min-height:22px;overflow:hidden}
+      #masr-head .h-row+.h-row{margin-top:5px}
+      #masr-head .brand{font-size:12.5px;font-weight:700;color:#243447;letter-spacing:.2px;white-space:nowrap}
+      #masr-head .brand i{font-style:normal;color:#1a66ff}
+      #masr-head .grow{flex:1 1 auto}
+      #masr-head .lbl{font-size:10.5px;color:#8f959e;white-space:nowrap}
+      .masr-chip{display:inline-block;padding:0 6px;border-radius:9px;font-size:10.5px;line-height:16px;
+        border:1px solid #dfe3ec;background:#fff;color:#5a6b87;white-space:nowrap;vertical-align:middle}
+      .masr-chip.runner{border-color:#ccdaf5;background:#eef4ff;color:#1a5fd0;font-weight:600}
+      .masr-chip.spec{border-color:#c7e6d6;background:#eefaf3;color:#11713f;font-weight:600}
+      .masr-spec-name{font-size:12px;font-weight:600;color:#1f2d3d;max-width:185px;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle}
+      .masr-mini{font-size:11px!important;padding:2px 7px!important;line-height:16px!important}
+      .masr-upd{font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px}
       #masr-panel textarea{width:100%;height:110px;font:11px/1.5 Consolas,monospace;box-sizing:border-box}
       #masr-panel .row{margin:6px 0}
       #masr-panel button{margin-right:6px;padding:3px 10px;border:1px solid #bbb;border-radius:6px;background:#f6f7fa;cursor:pointer;font-size:12px}
@@ -862,12 +886,20 @@
     const panel = document.createElement('div');
     panel.id = 'masr-panel';
     panel.innerHTML = `
-      <h3>MAS-Runner v${GV.RUNNER_VERSION}
-        <button id="masr-check-update" style="font-size:11px;padding:1px 6px;margin-left:6px;cursor:pointer">检查更新</button>
-        <button id="masr-dev-toggle" style="font-size:11px;padding:1px 6px;cursor:pointer" title="手工粘贴 spec.json（仅调试用）">dev</button>
-        <span id="masr-update-out" style="font-size:11px;color:#666"></span>
-        <span id="masr-spec-badge"></span>
-      </h3>
+      <div id="masr-head">
+        <div class="h-row">
+          <span class="brand">MAS <i>Runner</i></span>
+          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.3</span>
+          <span class="grow"></span>
+          <span class="masr-upd" id="masr-update-out"></span>
+          <button class="masr-mini" id="masr-check-update" title="检查解释器有没有新版本">检查更新</button>
+          <button class="masr-mini" id="masr-dev-toggle" title="手工粘贴 spec.json（仅调试用）">dev</button>
+        </div>
+        <div class="h-row" title="业务脚本 = 这一步要跑的 spec（版本由业务方维护，与解释器版本无关）">
+          <span class="lbl">业务脚本</span>
+          <span id="masr-spec-badge"><span class="lbl">未加载</span></span>
+        </div>
+      </div>
       <div class="row" id="masr-selfcheck"></div>
       <div class="row" id="masr-tasks" style="border:1px solid #d6e4ff;background:#f7faff;border-radius:8px;padding:6px 8px"></div>
       <div class="row" id="masr-conn" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
@@ -891,7 +923,14 @@
     `;
     document.body.appendChild(ball); document.body.appendChild(panel);
     UI.makeSpecInput();
-    ball.addEventListener('click', () => { panel.style.display = panel.style.display === 'block' ? 'none' : 'block'; if (panel.style.display === 'block') UI.renderSelfCheck(); });
+    ball.addEventListener('click', () => {
+      panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+      if (panel.style.display === 'block') {
+        UI.renderSelfCheck();
+        UI.autoCheckUpdate(10 * 60 * 1000); // 打开面板顺手看一眼有没有新版（10 分钟内不重复请求）
+        maybeReloadAfterUpdate();
+      }
+    });
 
     document.getElementById('masr-dev-toggle').addEventListener('click', function () {
       const box = document.getElementById('masr-spec-box');
@@ -950,8 +989,40 @@
       RunState.clear(); UI.appendLog({ t: Date.now(), level: 'warn', msg: '续跑状态已清除' });
     });
     document.getElementById('masr-clear-logs').addEventListener('click', UI.clearLogs);
-    document.getElementById('masr-check-update').addEventListener('click', UI.checkUpdate);
+    document.getElementById('masr-check-update').addEventListener('click', function () {
+      if (UI._newVer) UI.startUpdate(); else UI.checkUpdate();
+    });
     UI.panel = panel;
+    UI.renderHead();
+  };
+
+  /* 顶部第一行：解释器版本号（GM_info 为准，取不到才用内嵌常量） */
+  UI.installedVersion = function () {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+        return String(GM_info.script.version);
+      }
+    } catch (e) {}
+    return GV.RUNNER_VERSION;
+  };
+  UI.renderHead = function () {
+    const el = document.getElementById('masr-runner-ver');
+    const v = UI.installedVersion();
+    if (el) { el.textContent = 'v' + v; el.title = '解释器版本 v' + v + '（Tampermonkey 里安装的脚本；业务脚本版本见下一行）'; }
+  };
+
+  /* 顶部第二行：业务脚本（spec）身份 —— 与解释器版本分开显示，谁的问题一眼可辨 */
+  UI.renderSpecBadge = function (spec) {
+    const badge = document.getElementById('masr-spec-badge');
+    if (!badge) return;
+    if (!spec) { badge.innerHTML = '<span class="lbl">未加载</span>'; return; }
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const okSpec = spec.status === 'active';
+    badge.innerHTML =
+      '<span class="masr-spec-name" title="' + esc(spec.spec_id + ' v' + spec.version) + '">' + esc(spec.spec_id) + '</span>' +
+      ' <span class="masr-chip spec" title="业务脚本版本（spec 自带，随业务方发版）">v' + esc(spec.version) + '</span>' +
+      ' <span class="masr-chip" style="' + (okSpec ? 'border-color:#c7e6d6;background:#eefaf3;color:#11713f' : 'border-color:#f0dcb0;background:#fff8e8;color:#8a6412') + '">' + esc(spec.status) + '</span>' +
+      (spec.owner ? ' <span class="lbl">owner ' + esc(spec.owner) + '</span>' : '');
   };
 
   // 粘贴输入框：行内强制样式防站点 CSS 吞掉；若仍不可见则降级为 contenteditable div
@@ -1743,6 +1814,7 @@
       return;
     }
     box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未解锁</span>' +
+      (lockNotice ? '<div style="margin-top:4px;font-size:10.5px;color:#b26a00">' + lockNotice + '</div>' : '') +
       '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
       '首次使用请输入管理员发给你的<b>接入口令</b>。只需一次，本机记住。<br>' +
       '口令只用来解开脚本里的加密凭证，不会发往任何服务器。</div>' +
@@ -1764,6 +1836,7 @@
         out.textContent = '口令正确，正在校验凭证…';
         await FL.token(true);          // 真发一次换 token，确认凭证可用
         inp.value = '';
+        lockNotice = '';
         UI.renderTasks();
       } catch (e) {
         go.disabled = false; go.textContent = '解锁';
@@ -1949,23 +2022,45 @@
 
   // ③ 已绑定 → 我的待办
   function renderBound(box, me) {
-    box.innerHTML = '<b>任务</b> <span style="color:#1a7f45">' + (me.name || '已绑定') +
-      (me.dept ? ' · ' + me.dept : '') + '</span>' + modeTag() +
-      ' <button class="primary" id="masr-task-pull">拉我的待办</button>' +
-      ' <button id="masr-task-unbind">解除绑定</button>' +
-      ' <button id="masr-task-lock" title="清掉本机保存的口令钥匙，下次需重新输入">锁定</button>' +
+    const pend = pwList();
+    box.innerHTML =
+      '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
+        '<b>任务</b>' +
+        '<span style="color:#1a7f45">' + (me.name || '已绑定') + (me.dept ? ' · ' + me.dept : '') + '</span>' +
+        modeTag() +
+        '<span style="flex:1 1 auto"></span>' +
+        '<button class="primary" id="masr-task-pull">拉我的待办</button>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-top:4px;font-size:10.5px;color:#8f959e;flex-wrap:wrap">' +
+        '<span title="只清掉本机记住的口令钥匙：下次打开要重新输口令。不解绑身份，不影响已回写的结果">' +
+          '<button id="masr-task-lock" class="masr-mini" title="清掉本机记住的口令钥匙；下次打开需重新输入口令（用于共用电脑或轮换口令）。不解绑身份、不影响已回写的结果">锁定凭证</button>' +
+          ' 共用电脑时点这个' +
+        '</span>' +
+        '<span title="换人用这台电脑：设备码、授权码、可回写名单一起清掉">' +
+          '<button id="masr-task-unbind" class="masr-mini" title="换人用这台电脑：设备码、授权码、可回写名单一起清掉">解除绑定</button>' +
+          ' 换人用这台电脑' +
+        '</span>' +
+        (pend.length ? '<span style="flex:1 1 auto"></span><button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button>' : '') +
+      '</div>' +
+      (lockNotice ? '<div style="margin-top:4px;font-size:10.5px;color:#b26a00">' + lockNotice + '</div>' : '') +
       '<div id="masr-task-list" style="margin-top:4px"></div>';
 
     document.getElementById('masr-task-lock').addEventListener('click', function () {
-      FL.lock(); UI.renderTasks();
+      FL.lock();
+      lockNotice = '已锁定：本机记住的口令钥匙已删除，下次打开需重新输入口令。身份绑定与已回写的结果都不受影响。';
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '已锁定凭证：本机口令钥匙已删除（下次打开需重新输入口令）' });
+      UI.renderTasks();
     });
 
     document.getElementById('masr-task-unbind').addEventListener('click', function () {
       // 换人用这台电脑：设备码、授权码、可回写名单一起清掉
       GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY);
       try { GM_deleteValue(FL.CLAIM_KEY); FL._mine = {}; } catch (e) {}
-      clearAuthCode(); UI.renderTasks();
+      clearAuthCode(); lockNotice = ''; UI.renderTasks();
     });
+
+    const rw = document.getElementById('masr-retry-writes');
+    if (rw) rw.addEventListener('click', function () { UI.retryWrites(rw); });
     document.getElementById('masr-task-pull').addEventListener('click', async function () {
       const list = document.getElementById('masr-task-list');
       list.innerHTML = '<span style="font-size:11px;color:#8f959e">正在查询…</span>';
@@ -1991,6 +2086,7 @@
   }
 
   let flBootTried = false;
+  let lockNotice = ''; // 「锁定凭证」后的说明，只在当次会话显示
   UI.renderTasks = function () {
     const box = document.getElementById('masr-tasks');
     if (!box) return;
@@ -2042,6 +2138,16 @@
         record_id: task.record_id, account_id: task.account_id,
         table_id: task.table_id, script_id: task.script_id || '',
       };
+      // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
+      if (SVC.mode() === 'svc') {
+        try { await SVC.ping(); }
+        catch (e) {
+          connOut = '<span style="color:#c02a2a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
+          UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），本次不执行：先把服务起来（temp-up / Workers），再点「重试连接」' });
+          UI.renderConn();
+          return;
+        }
+      }
       const scene = SVC.scriptFor(UI.currentTask);
       UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：账户 ' + (task.account_id || '') + '（' + task.record_id + '）· 场景 ' + scene });
       const s = await SVC.spec(scene);
@@ -2058,6 +2164,16 @@
   };
 
   // 执行完成 → 回写飞书（按 record_id 更新，服务端二次校验归属）
+  /* 回写失败不丢结果：落本地待办队列，服务恢复后一键重试（本机验证服务常被关掉） */
+  const PENDW_KEY = 'masr_pending_writes_v1';
+  function pwList() { try { return JSON.parse(GM_getValue(PENDW_KEY, '[]')) || []; } catch (e) { return []; } }
+  function pwSave(arr) { try { GM_setValue(PENDW_KEY, JSON.stringify(arr.slice(-20))); } catch (e) {} }
+  function pwAdd(payload) {
+    const a = pwList();
+    a.push(Object.assign({}, payload, { queued_at: Date.now() }));
+    pwSave(a);
+  }
+
   async function pushTaskResult(st, ok, outputs, err) {
     const task = st && st.task;
     if (!task || !task.record_id) return;
@@ -2073,10 +2189,51 @@
     try {
       await SVC.writeResult(payload);
       UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') });
+      UI.renderTasks();
     } catch (e) {
-      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 回写飞书失败：' + e.message + '（结果仍在本面板可复制/导出）' });
+      pwAdd(payload);
+      const local = /127\.0\.0\.1|localhost/.test(SVC.base() || '');
+      UI.appendLog({
+        t: Date.now(), level: 'fatal',
+        msg: '⚠️ 回写飞书失败：' + e.message +
+          (local ? '（本机验证服务没在跑？起来后点「重试回写」即可）' : '') +
+          ' —— 该结果已存本地待写队列，不会丢'
+      });
+      UI.renderTasks();
+      updResultWarn(pwList().length);
     }
   }
+  function updResultWarn(n) {
+    const el = document.getElementById('masr-result');
+    if (!el || !n) return;
+    const tip = document.createElement('div');
+    tip.style.cssText = 'margin-top:6px;padding:6px 8px;border:1px solid #f0d8a8;background:#fff8e8;border-radius:6px;font-size:11px;color:#8a6412';
+    tip.textContent = '有 ' + n + ' 条结果未写进飞书（已存本地）。服务恢复后到「任务」那一行点「重试回写」。';
+    el.appendChild(tip);
+  }
+
+  UI.retryWrites = async function (btn) {
+    const all = pwList();
+    if (!all.length) { UI.renderTasks(); return; }
+    if (btn) { btn.disabled = true; btn.textContent = '重试中…'; }
+    const left = [];
+    let okN = 0;
+    for (const p of all) {
+      const body = Object.assign({}, p);
+      delete body.queued_at;
+      try {
+        await SVC.writeResult(body);
+        okN++;
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
+      } catch (e) {
+        left.push(p);
+        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 补写仍失败：' + body.record_id + ' · ' + e.message });
+      }
+    }
+    pwSave(left);
+    UI.appendLog({ t: Date.now(), level: okN ? 'ok' : 'warn', msg: '重试完成：成功 ' + okN + ' 条，剩余 ' + left.length + ' 条' });
+    UI.renderTasks();
+  };
 
   /* 参数取值：任务行能给的直接给，不再让人手抄账户ID（抄错就会跑到别人账户上） */
   UI.taskParamValue = function (name) {
@@ -2130,10 +2287,7 @@
       validateSpecShape(spec);
       UI.spec = spec;
       if (opts.persist !== false) GM_setValue(GV.LAST_SPEC_KEY, text);
-      const badge = document.getElementById('masr-spec-badge');
-      badge.innerHTML = spec.spec_id + ' v' + spec.version +
-        ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
-        ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
+      UI.renderSpecBadge(spec);
       UI.renderParams(spec);
       document.getElementById('masr-run').textContent = spec.status === 'active' ? '重跑当前 spec' : '执行（draft → dry_run）';
       // 自动恢复（fromStore）静默处理：只更新 badge/参数表，不往跨页日志里灌噪音
@@ -2217,7 +2371,9 @@
     UI.appendLog({ t: Date.now(), level: 'warn', msg: '日志已清空' });
   };
 
-  // ---------- 自更新：显式「检查更新」（油猴自身也会按 @updateURL 静默更新，这里是可见入口 + 版本提示） ----------
+  // ---------- 自更新 ----------
+  // 油猴自己会按 @updateURL 定期拉新（默认一天一次），但「装完之后当前页面还在跑旧代码」
+  // 是它的固有行为：脚本只在新页面加载时才注入。这里补上最后一步——装完切回来自动重载。
   function cmpVer(a, b) {
     const pa = String(a || '0').split('.').map(n => parseInt(n, 10) || 0);
     const pb = String(b || '0').split('.').map(n => parseInt(n, 10) || 0);
@@ -2227,10 +2383,20 @@
     }
     return 0;
   }
+  const UPD = {
+    PEND_KEY: 'masr_upd_pending_v1', // { ver, url, at, tries, stale }
+    CHK_KEY: 'masr_upd_checked_at_v1',
+    SEEN_KEY: 'masr_upd_seen_ver_v1',
+  };
+  function pendGet() { try { return JSON.parse(GM_getValue(UPD.PEND_KEY, 'null')); } catch (e) { return null; } }
+  function pendSet(o) { try { GM_setValue(UPD.PEND_KEY, JSON.stringify(o)); } catch (e) {} }
+  function pendClear() { try { GM_deleteValue(UPD.PEND_KEY); } catch (e) {} }
+
   // 有新版本时在悬浮球上点一颗红点：不打扰，但一眼能看到
   function setUpdateDot(on, ver) {
     const ball = document.getElementById('masr-ball');
     if (!ball) return;
+    const cur = UI.installedVersion();
     let dot = document.getElementById('masr-dot');
     if (on) {
       if (!dot) {
@@ -2239,49 +2405,152 @@
         ball.appendChild(dot);
       }
       dot.title = '有新版本 v' + (ver || '') + ' 可更新';
-      ball.title = 'MAS-Runner v' + GV.RUNNER_VERSION + '｜有新版本 v' + (ver || '') + '（点击打开/收起）';
-    } else if (dot) {
-      dot.remove();
-      ball.title = 'MAS-Runner v' + GV.RUNNER_VERSION + '（点击打开/收起）';
+      ball.title = 'MAS-Runner v' + cur + '｜有新版本 v' + (ver || '') + '（点击打开/收起）';
+    } else {
+      if (dot) dot.remove();
+      ball.title = 'MAS-Runner v' + cur + '（点击打开/收起）';
     }
   }
   UI.setUpdateDot = setUpdateDot;
 
-  UI.checkUpdate = async function (silent) {
+  function updOut(html) {
     const out = document.getElementById('masr-update-out');
-    if (out && !silent) out.textContent = '检查中…';
+    if (out) { out.innerHTML = html; out.title = out.textContent || ''; }
+  }
+
+  // 检查结果落到「检查更新」按钮上：有新版就把按钮变成「更新 vX」，点一下就走安装
+  function applyUpdateState(ver) {
+    const btn = document.getElementById('masr-check-update');
+    UI._newVer = ver || '';
+    if (!btn) return;
+    if (ver) {
+      btn.textContent = '更新 v' + ver;
+      btn.classList.add('primary');
+      btn.title = '打开安装页升级到 v' + ver + '（装完切回本页会自动重载）';
+      setUpdateDot(true, ver);
+    } else {
+      btn.textContent = '检查更新';
+      btn.classList.remove('primary');
+      btn.title = '检查解释器有没有新版本';
+      setUpdateDot(false);
+    }
+  }
+
+  UI.checkUpdate = async function (silent) {
+    if (!silent) updOut('检查中…');
     let lastErr = '';
+    const cur = UI.installedVersion();
     for (const url of GV.UPDATE_MANIFEST) {
       try {
         const res = await gmFetch(url, { method: 'GET' });
         if (res.status !== 200) { lastErr = 'HTTP ' + res.status; continue; }
         const m = JSON.parse(res.text);
-        if (cmpVer(m.version, GV.RUNNER_VERSION) > 0) {
-          if (out) {
-            out.innerHTML = '<span style="color:#1a7f43">发现新版本 v' + m.version + ' → </span>' +
-              '<a href="' + (m.install_url || GV.INSTALL_URL) + '" target="_blank" style="color:#0b6cd4">点此更新</a>';
-          }
-          setUpdateDot(true, m.version);
-          UI.appendLog({ t: Date.now(), level: 'warn', msg: '发现新版本 Runner v' + m.version + '（当前 v' + GV.RUNNER_VERSION + '）：' + (m.notes || '') });
+        GM_setValue(UPD.CHK_KEY, String(Date.now()));
+        if (cmpVer(m.version, cur) > 0) {
+          UI._newUrl = m.install_url || GV.INSTALL_URL;
+          applyUpdateState(m.version);
+          updOut('<span style="color:#1a7f43">新版 v' + m.version + '</span>');
+          UI.appendLog({
+            t: Date.now(), level: 'warn',
+            msg: '发现新版本 Runner v' + m.version + '（当前 v' + cur + '）：' + (m.notes || '') +
+              ' —— 点右上角「更新 v' + m.version + '」安装，装完切回本页会自动重载'
+          });
         } else {
-          if (out && !silent) out.innerHTML = '<span style="color:#666">已是最新 v' + GV.RUNNER_VERSION + '</span>';
-          setUpdateDot(false);
-          if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + GV.RUNNER_VERSION });
+          applyUpdateState('');
+          if (!silent) updOut('<span style="color:#666">已是最新 v' + cur + '</span>');
+          if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + cur });
         }
         return;
       } catch (e) { lastErr = e.message; }
     }
-    if (out && !silent) out.innerHTML = '<span style="color:#b00">检查失败</span>';
+    if (!silent) updOut('<span style="color:#b00">检查失败</span>');
     if (!silent) UI.appendLog({ t: Date.now(), level: 'warn', msg: '更新检查失败（' + lastErr + '）——不影响使用，可稍后重试或手动到仓库安装' });
   };
 
-  // 启动时静默自检（默认 6 小时一次）：不打扰、不弹窗，发现新版只在悬浮球点个红点
-  UI.autoCheckUpdate = async function () {
-    const KEY = 'masr_update_checked_at';
+  /* 装完自动重载：只有「当前页面不忙」时才动手，避免打断正在跑的任务 */
+  function busyNow() {
+    if (UI._running) return true;
+    const st = RunState.get();
+    return !!(st && (st.phase === 'running' || st.phase === 'await_nav_check'));
+  }
+  let _watchArmed = false;
+  function armReloadWatch() {
+    if (_watchArmed) return;
+    _watchArmed = true;
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') maybeReloadAfterUpdate();
+    });
+    window.addEventListener('focus', maybeReloadAfterUpdate);
+  }
+  function maybeReloadAfterUpdate() {
+    const p = pendGet();
+    if (!p) return;
+    if (Date.now() - (p.at || 0) > 30 * 60 * 1000) { pendClear(); updatePendingHint(); return; }
+    if (cmpVer(UI.installedVersion(), p.ver) >= 0) {
+      // 本页已经是新版本：说明重载已生效，收尾
+      pendClear(); UI.renderHead(); applyUpdateState(''); updOut('已更新到 v' + UI.installedVersion());
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已更新到 v' + UI.installedVersion() + '（本页已生效）' });
+      return;
+    }
+    if (busyNow()) { updatePendingHint('正在执行任务，跑完后再重载'); return; }
+    if (p.tries >= 1) { // 已经重载过一次还是旧版 → 安装多半没完成，改手动，绝不循环刷新
+      p.stale = true; pendSet(p); updatePendingHint(); return;
+    }
+    p.tries = 1; p.at = Date.now(); pendSet(p);
+    let n = 3;
+    updOut('<span style="color:#1a7f43">3 秒后自动重载…</span>');
+    const tick = setInterval(function () {
+      n--;
+      if (n > 0) { updOut('<span style="color:#1a7f43">' + n + ' 秒后自动重载…</span>'); return; }
+      clearInterval(tick);
+      try { location.reload(); } catch (e) {}
+    }, 1000);
+  }
+  // 顶部提示：安装待完成 / 需要手动重载
+  function updatePendingHint(extra) {
+    const p = pendGet();
+    if (!p) return;
+    const cur = UI.installedVersion();
+    if (p.stale) {
+      updOut('<span style="color:#b26a00">仍是 v' + cur + '</span>' +
+        ' <button class="masr-mini primary" id="masr-reload-now">重载</button>' +
+        ' <button class="masr-mini" id="masr-reopen-install">安装页</button>');
+      bindPendingButtons(p);
+    } else if (extra) {
+      updOut('<span style="color:#8f959e">' + extra + '</span>');
+    }
+  }
+  function bindPendingButtons(p) {
+    const r = document.getElementById('masr-reload-now');
+    if (r) r.addEventListener('click', function () {
+      pendClear(); // 先清标记，避免重载后又被判成"待重载"
+      try { location.reload(); } catch (e) {}
+    });
+    const o = document.getElementById('masr-reopen-install');
+    if (o) o.addEventListener('click', function () {
+      try { window.open(p.url || GV.INSTALL_URL, '_blank', 'noopener'); } catch (e) {}
+    });
+  }
+
+  UI.startUpdate = function () {
+    const ver = UI._newVer;
+    if (!ver) { UI.checkUpdate(); return; }
+    const url = UI._newUrl || GV.INSTALL_URL;
+    pendSet({ ver: ver, url: url, at: Date.now(), tries: 0, stale: false });
+    updOut('<span style="color:#1a7f43">安装页已打开 v' + ver + '</span>');
+    UI.appendLog({
+      t: Date.now(), level: 'info',
+      msg: '已打开安装页 v' + ver + '：在油猴弹窗里点「安装」，装完切回本页会自动重载（日志/参数/待办都已存好，重载不丢）'
+    });
+    try { window.open(url, '_blank', 'noopener'); } catch (e) { UI.appendLog({ t: Date.now(), level: 'warn', msg: '打开安装页被拦截，请放行弹窗或手动访问 ' + url }); }
+    armReloadWatch();
+  };
+
+  // 启动时静默自检（默认 1 小时一次）：不打扰、不弹窗，发现新版只在悬浮球点个红点
+  UI.autoCheckUpdate = async function (minGapMs) {
     const now = Date.now();
-    const last = parseInt(GM_getValue(KEY, '0'), 10) || 0;
-    if (now - last < 6 * 60 * 60 * 1000) return;
-    GM_setValue(KEY, String(now));
+    const last = parseInt(GM_getValue(UPD.CHK_KEY, '0'), 10) || 0;
+    if (now - last < (minGapMs || 60 * 60 * 1000)) return;
     await UI.checkUpdate(true);
   };
   UI.renderSteps = function (spec) {
@@ -2299,12 +2568,7 @@
     el.style.color = phase === 'passed' ? '#1a7f43' : phase === 'failed' ? '#c22' : '#555';
   };
 
-  UI.setSpecBadge = function (spec) {
-    const badge = document.getElementById('masr-spec-badge');
-    badge.innerHTML = spec.spec_id + ' v' + spec.version +
-      ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
-      ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
-  };
+  UI.setSpecBadge = function (spec) { UI.renderSpecBadge(spec); };
 
   // 回放跳转前已完成的步骤（恢复日志可见性）
   UI.replayStepLogs = function (stepLogs) {
@@ -2397,7 +2661,14 @@
         if (stc.phase) {
           stc.phase = 'done';
           stc.final = { ok: false, error: code, message: e.message, at: Date.now() };
-          if (role === 'origin') stc.final.consumed = true; // 本页直接展示过，不再重复
+          if (role === 'origin') {
+            // 本页直接展示过，轮询器不再重复播报；但「失败」同样要回写（错误类型要进飞书表）
+            stc.final.consumed = true;
+            if (stc.task && stc.task.record_id && !stc.final.written) {
+              stc.final.written = true;
+              pushTaskResult(stc, false, null, { code: code, message: e.message });
+            }
+          }
           RunState.set(stc);
         }
       } catch (e2) {}
@@ -2421,6 +2692,23 @@
     UI.mount();
     UI.renderTasks();
     UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
+    // 版本落点：解释器升级后第一次加载，明确告诉人「现在跑的是哪个版本」
+    try {
+      const cur = UI.installedVersion();
+      const seen = String(GM_getValue(UPD.SEEN_KEY, '') || '');
+      if (seen !== cur) {
+        GM_setValue(UPD.SEEN_KEY, cur);
+        if (seen) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已从 v' + seen + ' 更新到 v' + cur + '（本页已生效）' });
+      }
+    } catch (e) {}
+    // 更新流程收尾：装完回到页面 → 自动重载（不打断正在跑的任务；最多自动重载一次，绝不循环）
+    armReloadWatch();
+    if (pendGet()) maybeReloadAfterUpdate();
+    // 有没写进飞书的结果：提示一次，按钮在「任务」行
+    const pw = pwList();
+    if (pw.length) {
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '有 ' + pw.length + ' 条结果还没写进飞书（已存本地）：服务恢复后点「重试回写」' });
+    }
     // 自动恢复上次加载的 spec 与参数：刷新、跳转落地、新标签页都不用重新粘贴
     try {
       const lastSpec = GM_getValue(GV.LAST_SPEC_KEY, '');
