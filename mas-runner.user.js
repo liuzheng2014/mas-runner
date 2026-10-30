@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.1
+// @version      0.4.2
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -292,7 +292,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.1',
+    RUNNER_VERSION: '0.4.2',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -864,14 +864,15 @@
     panel.innerHTML = `
       <h3>MAS-Runner v${GV.RUNNER_VERSION}
         <button id="masr-check-update" style="font-size:11px;padding:1px 6px;margin-left:6px;cursor:pointer">检查更新</button>
+        <button id="masr-dev-toggle" style="font-size:11px;padding:1px 6px;cursor:pointer" title="手工粘贴 spec.json（仅调试用）">dev</button>
         <span id="masr-update-out" style="font-size:11px;color:#666"></span>
         <span id="masr-spec-badge"></span>
       </h3>
       <div class="row" id="masr-selfcheck"></div>
       <div class="row" id="masr-tasks" style="border:1px solid #d6e4ff;background:#f7faff;border-radius:8px;padding:6px 8px"></div>
       <div class="row" id="masr-conn" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
-      <div class="row" id="masr-spec-box"><b>① 粘贴 spec.json（dev 模式）</b><br></div>
-      <div class="row">
+      <div class="row" id="masr-spec-box" style="display:none"><b>spec.json（开发调试用，正常不用碰）</b><br></div>
+      <div class="row" id="masr-dev-tools" style="display:none">
         <button class="primary" id="masr-load">加载 spec</button>
         <button id="masr-fs-pull">从飞书拉 spec</button>
         <button id="masr-hash">计算 SHA-256</button>
@@ -879,7 +880,7 @@
       </div>
       <div class="row" id="masr-params"></div>
       <div class="row">
-        <button class="primary" id="masr-run">执行（draft → dry_run）</button>
+        <button class="primary" id="masr-run">重跑当前 spec</button>
         <button id="masr-export">导出结果 JSON</button>
         <button id="masr-cancel-run">清除续跑状态</button>
         <button id="masr-clear-logs">清空日志</button>
@@ -891,6 +892,15 @@
     document.body.appendChild(ball); document.body.appendChild(panel);
     UI.makeSpecInput();
     ball.addEventListener('click', () => { panel.style.display = panel.style.display === 'block' ? 'none' : 'block'; if (panel.style.display === 'block') UI.renderSelfCheck(); });
+
+    document.getElementById('masr-dev-toggle').addEventListener('click', function () {
+      const box = document.getElementById('masr-spec-box');
+      const tools = document.getElementById('masr-dev-tools');
+      const on = box.style.display === 'none';
+      box.style.display = on ? '' : 'none';
+      tools.style.display = on ? '' : 'none';
+      this.style.background = on ? '#e8f3ff' : '';
+    });
 
     document.getElementById('masr-load').addEventListener('click', () => {
       UI.applySpec(UI.getSpecText(), {});
@@ -1069,6 +1079,7 @@
 
   // 字段名（与服务端 mas-service.mjs 的 F 保持一致）
   const FF = {
+    SCENE: '场景ID',
     ACCOUNT_ID: '账户ID', ACCOUNT_NAME: '账户名称', CLIENT: '客户主体', STATUS: '状态',
     SECRET: '秘钥', ERROR_TYPE: '错误类型', ELAPSED: '耗时ms',
     RUNNER_VER: 'runner版本', SPEC_VER: 'spec版本', CREATOR: '创建人',
@@ -1301,6 +1312,9 @@
         account_id: flPlain(f[FF.ACCOUNT_ID]),
         account_name: flPlain(f[FF.ACCOUNT_NAME]),
         client: flPlain(f[FF.CLIENT]),
+        // 行内「场景ID」优先（这一列现在还不存在，读不到就是空 → 回落到任务表默认场景）
+        script_id: flPlain(f[FF.SCENE]),
+        table_id: FL.T_TASKS,
       };
     });
     // 登记「本次查到的是哪几条」——回写时只认这些 id
@@ -1464,7 +1478,11 @@
     B_KEY: 'masr_svc_base_v1',
     C_KEY: 'masr_svc_code_v1',
     M_KEY: 'masr_svc_me_v1',
-    SPEC_SCRIPT: 'huawei_ads_get_key',
+    // 场景 → script_id：按「任务表」给默认值，任务行填了「场景ID」则以行内为准。
+    // 将来加场景：新任务表在这里加一行，或在那行任务里填场景ID —— 拉 spec 的代码不用改。
+    SCENE_BY_TABLE: { tblvQkpB9o2ovRiR: 'huawei_ads_get_key' },
+    DEFAULT_SCRIPT: 'huawei_ads_get_key',
+    TASKS_TABLE: 'tblvQkpB9o2ovRiR',
   };
   SVC.base = function () { return String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, ''); };
   SVC.code = function () { return String(GM_getValue(SVC.C_KEY, '') || ''); };
@@ -1538,11 +1556,24 @@
     GM_setValue(SVC.M_KEY, JSON.stringify(me));
     return me;
   };
-  SVC.tasks = function () {
-    return SVC.mode() === 'svc' ? SVC.call('GET', '/tasks', { limit: 50 }) : FL.tasks(50);
+  /* 这条任务该用哪个场景的 spec：行内「场景ID」> 任务表默认 > 全局默认 */
+  SVC.scriptFor = function (task) {
+    const t = task || (typeof UI !== 'undefined' && UI.currentTask) || {};
+    return String(t.script_id || SVC.SCENE_BY_TABLE[t.table_id || SVC.TASKS_TABLE] || SVC.DEFAULT_SCRIPT);
   };
-  SVC.spec = function () {
-    return SVC.mode() === 'svc' ? SVC.call('GET', '/spec', { script_id: SVC.SPEC_SCRIPT }) : FL.spec(SVC.SPEC_SCRIPT);
+
+  SVC.tasks = function () {
+    const p = SVC.mode() === 'svc' ? SVC.call('GET', '/tasks', { limit: 50 }) : FL.tasks(50);
+    return p.then(function (j) {
+      (j.items || []).forEach(function (t) {
+        if (!t.table_id) t.table_id = SVC.TASKS_TABLE;
+      });
+      return j;
+    });
+  };
+  SVC.spec = function (scriptId) {
+    const id = scriptId || SVC.scriptFor();
+    return SVC.mode() === 'svc' ? SVC.call('GET', '/spec', { script_id: id }) : FL.spec(id);
   };
   SVC.writeResult = function (payload) {
     return SVC.mode() === 'svc' ? SVC.call('POST', '/result', null, payload) : FL.writeResult(payload);
@@ -1944,14 +1975,14 @@
           list.innerHTML = '<div style="font-size:11px;color:#8f959e">没有待处理的记录（需同时满足：创建人是你、状态为空、账户ID已填）</div>';
           return;
         }
-        list.innerHTML = '<div style="font-size:11px;color:#8f959e">共 ' + j.total + ' 条待办，点「执行」自动载入 spec 并带上账户ID</div>' +
+        list.innerHTML = '<div style="font-size:11px;color:#8f959e">共 ' + j.total + ' 条待办：点「执行」直接开跑（自动拉对应场景的 spec，账户ID 来自这行）</div>' +
           '<table><tr><th>账户ID</th><th>名称</th><th>客户</th><th></th></tr>' +
           j.items.map(function (t, i) {
             return '<tr><td>' + (t.account_id || '-') + '</td><td>' + (t.account_name || '-') + '</td>' +
-              '<td>' + (t.client || '-') + '</td><td><button data-idx="' + i + '">执行</button></td></tr>';
+              '<td>' + (t.client || '-') + '</td><td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
           }).join('') + '</table>';
         list.querySelectorAll('button[data-idx]').forEach(function (b) {
-          b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))]); });
+          b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))], b); });
         });
       } catch (e) {
         list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + e.message + '</div>';
@@ -2000,17 +2031,29 @@
   })();
 
   // 点一条待办：拉 active spec → 自动填账户ID → 提示点执行
-  UI.runTask = async function (task) {
+  /* 点待办里的「执行」= 载入 + 立刻开跑，不需要再点下面那个按钮 */
+  UI.runTask = async function (task, btn) {
+    if (UI._running) return;
+    UI._running = true;
+    const old = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
     try {
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：账户 ' + (task.account_id || '') + '（' + task.record_id + '）' });
-      const s = await SVC.spec();
-      UI.currentTask = { record_id: task.record_id, account_id: task.account_id };
+      UI.currentTask = {
+        record_id: task.record_id, account_id: task.account_id,
+        table_id: task.table_id, script_id: task.script_id || '',
+      };
+      const scene = SVC.scriptFor(UI.currentTask);
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：账户 ' + (task.account_id || '') + '（' + task.record_id + '）· 场景 ' + scene });
+      const s = await SVC.spec(scene);
+      UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
-      const el = document.getElementById('masr-p-corp_id');
-      if (el) el.value = task.account_id || '';
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: '已载入 spec v' + s.version + '，参数已带入；点「执行」开始（跑完自动回写这条记录）' });
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '，账户ID 已从任务带入' });
+      await UI.doRun({ keepLog: true });
     } catch (e) {
-      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '载入任务失败：' + e.message });
+      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '执行失败（载入阶段）：' + e.message });
+    } finally {
+      UI._running = false;
+      if (btn) { btn.disabled = false; btn.textContent = old || '执行'; }
     }
   };
 
@@ -2035,14 +2078,36 @@
     }
   }
 
+  /* 参数取值：任务行能给的直接给，不再让人手抄账户ID（抄错就会跑到别人账户上） */
+  UI.taskParamValue = function (name) {
+    const t = UI.currentTask || {};
+    if (!t.record_id) return '';
+    if (name === 'corp_id' || name === 'account_id' || name === 'sub_account_id' || name === 'customer_id') {
+      return t.account_id || '';
+    }
+    if (t.params && t.params[name] != null) return String(t.params[name]);
+    return '';
+  };
+
   UI.renderParams = function (spec) {
     const box = document.getElementById('masr-params');
     const last = UI.lastParamsFor(spec.spec_id);
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-    box.innerHTML = '<b>② 参数</b>（datasource 自动取参 v0.2 提供，本版手填；上次填的值会自动回填）<br>' +
-      (spec.params || []).map(p =>
-        '<div class="row"><label>' + (p.label || p.name) + ' (' + p.name + ')：</label>' +
-        '<input id="masr-p-' + p.name + '" value="' + esc(last[p.name]) + '" placeholder="' + esc(p.description || '') + '"></div>').join('') || '<i>无参数</i>';
+    const list = spec.params || [];
+    const hasTask = !!(UI.currentTask && UI.currentTask.record_id);
+    if (!list.length) { box.innerHTML = '<b>参数</b> <i>这个 spec 不需要参数</i>'; return; }
+    box.innerHTML = '<b>参数</b>' +
+      (hasTask ? ' <span style="font-size:11px;color:#1a7f45">来自当前任务，无需填写</span>' : '') +
+      list.map(function (p) {
+        const auto = UI.taskParamValue(p.name);
+        if (auto) {
+          return '<div class="row"><label>' + esc(p.label || p.name) + '：</label>' +
+            '<code style="background:#f2f3f5;padding:1px 6px;border-radius:4px">' + esc(auto) + '</code>' +
+            '<span style="font-size:10px;color:#8f959e;margin-left:6px">任务行</span></div>';
+        }
+        return '<div class="row"><label>' + esc(p.label || p.name) + ' (' + p.name + ')：</label>' +
+          '<input id="masr-p-' + p.name + '" value="' + esc(last[p.name] || '') + '" placeholder="' + esc(p.description || '') + '"></div>';
+      }).join('');
   };
 
   // 参数记忆：按 spec_id 存最近一次填写的值（业务同学天天跑同一子客，不用每次重敲）
@@ -2070,7 +2135,7 @@
         ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
         ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
       UI.renderParams(spec);
-      document.getElementById('masr-run').textContent = spec.status === 'active' ? '执行' : '执行（draft → dry_run）';
+      document.getElementById('masr-run').textContent = spec.status === 'active' ? '重跑当前 spec' : '执行（draft → dry_run）';
       // 自动恢复（fromStore）静默处理：只更新 badge/参数表，不往跨页日志里灌噪音
       if (!opts.fromStore) {
         UI.appendLog({ t: Date.now(), level: 'ok', msg: 'spec 已加载: ' + spec.spec_id + ' v' + spec.version + '，' + spec.steps.length + ' 步' });
@@ -2250,7 +2315,8 @@
     });
   };
 
-  UI.doRun = async function () {
+  UI.doRun = async function (opts) {
+    opts = opts || {};
     // 续跑优先：落地页上 spec/参数从运行态恢复，不要求本页先粘贴 spec
     const st0 = RunState.get();
     const resuming = !!(st0 && st0.phase === 'await_nav_check');
@@ -2264,6 +2330,8 @@
       spec = UI.spec;
       params = {};
       for (const p of spec.params || []) {
+        const auto = UI.taskParamValue(p.name);
+        if (auto) { params[p.name] = auto; continue; }
         const el = document.getElementById('masr-p-' + p.name);
         const v = el ? el.value.trim() : '';
         if (p.required && !v) { alert('必填参数: ' + (p.label || p.name)); return; }
@@ -2275,7 +2343,7 @@
     }
     UI.spec = spec;
     UI.setSpecBadge(spec);
-    document.getElementById('masr-log').innerHTML = '';
+    if (!opts.keepLog) document.getElementById('masr-log').innerHTML = '';
     UI.renderSteps(spec);
     if (resuming) {
       UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 续跑模式：从运行态恢复（' + st0.navStepId + ' 之后）===' });
