@@ -1,0 +1,1197 @@
+// ==UserScript==
+// @name         MAS-Runner (spec interpreter v0.1)
+// @namespace    mas-runner
+// @version      0.1.14
+// @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
+// @author       MAS
+// @homepageURL  https://github.com/liuzheng2014/mas-runner
+// @supportURL   https://github.com/liuzheng2014/mas-runner/issues
+// @updateURL    https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
+// @downloadURL  https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
+// @match        https://ads.huawei.com/*
+// @match        https://*.ads.huawei.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @connect      svc-drcn.ads.huawei.com
+// @connect      raw.githubusercontent.com
+// @connect      cdn.jsdelivr.net
+// @connect      self
+// @run-at       document-idle
+// ==/UserScript==
+
+/*
+ * MAS-Runner v0.1 — 范围与边界（务必与 specs/README.md 的 Runner 契约对照）
+ *
+ * 已实现（v0.1）：
+ *   - spec 解释引擎：占位符解析、cookie 派生变量、api 步骤（fetch 优先 / GM_xhr 兜底）、
+ *     断言引擎（specs/README.md 全部断言语法）、extract、on_fail 结构化错误
+ *   - navigate 步骤 + 跨页续跑（GM 存储保存运行态，导航后新页面自动恢复）
+ *   - dry_run 门禁：status=draft 的 spec 只允许纯读执行，任何 write:true 步骤直接拦截
+ *   - 悬浮球 UI：粘贴 spec（dev 模式）、参数表单、步骤时间线、原始响应查看、结果导出
+ *   - 风控：rate_limit（max_rps + jitter）、no_retry_paths、cache_ttl 步骤缓存
+ *   - 自检：cookie 派生变量在位检查、传输通道探测
+ *   - v0.1.7：面板标题/悬浮球提示显示完整三位版本号（原硬编码 v0.1）
+ *   - v0.1.8：cookie 派生变量改为按步骤懒求值（原启动全量求值+缺失即终止，
+ *     会在"起点尚无派生 cookie"（如重新登录后 dsp_csrf_token 未生成）时误拦 S1；
+ *     现在哪个步骤用到哪个变量就在那步执行时现取，报错信息指明步骤与补救方式）
+ *   - v0.1.9：日志持久化——GM 跨页存储环形缓冲（300 条），页面加载/跳转/刷新后
+ *     自动回放全部历史日志并以分隔线标记本页会话起点；新增「清空日志」按钮。
+ *     修复真实痛点：跳转后日志清零无法追溯（2026-10-30 用户反馈）
+ *   - v0.1.10：navigate 步骤支持 open:"new-tab"（window.open 复刻 UI 进入方式，
+ *     保留 opener——对照实验证明 UI 新标签页进入的会话 trackingportal 全通，
+ *     同页 location.href 替换进入的会话缺 trackingportal 会话 101133）。
+ *     弹窗被拦截时报 E_SESSION 并提示放行（票据未消费可安全重跑）；
+ *     新标签页模式下当前页保留，续跑发生在新标签页（RunState 跨标签共享）
+ *   - v0.1.11：no_retry 路径超时/断连时报错附带 WAF 限流冷却指引（防用户反复重试加重惩罚；
+ *     2026-10-30 17:22 实测 permission 请求被 WAF 挂起 2 分 10 秒）
+ *   - v0.1.12：pageFetch 加 AbortController 快速失败（默认 25s）——WAF 挂起时 fetch 原本
+ *     要挂 ~100s 才被断连，再兜底 GM_xhr 30s，一次挂死白等 2 分多钟；现在 ~55s 内出结果
+ *   - v0.1.13：单点击全自动（业务可用性修复，2026-10-30 用户验收指出三宗罪：
+ *     两次人工续跑 / 辅助标签页不自毁 / 不回代理页）。①落地页 boot 检测到 await_nav_check
+ *     且 URL 匹配 expect、状态新鲜（10 分钟内）时自动续跑（2.5s 后），无需点击；
+ *     ②弹窗被拦自动降级为当前页导航（自动链路无用户手势，被拦是常态）；
+ *     ③完成后广播 final 到 GM 存储：辅助页 2s 自毁（window.close 仅对脚本打开的页有效），
+ *     发起页轮询接收并展示结果（代理页全程不跳转，天然"回到代理页"）。
+ *     角色标记走 sessionStorage（origin=发起页 / helper=落地页），GM 存储跨页共享结果
+ *
+ *   - v0.1.14：自更新通道（业务同学装一次永远最新）——头部声明 @updateURL/@downloadURL 指向
+ *     公开分发仓库 liuzheng2014/mas-runner（油猴静默自动更新）；面板加「检查更新」按钮，
+ *     拉 manifest.json 比对版本并给更新链接（raw 主通道 + jsDelivr 备用）；active spec
+ *     的执行按钮不再显示 draft→dry_run 字样
+ *
+ * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
+ *   - Bitable 轮询领任务、结果回写（在线模式）
+ *   - spec_index hash 核对（当前 dev 模式只能展示 paste 内容的 SHA-256 供人工比对）
+ *   - human 断点原语、ui 原语（DOM 操作）
+ *   - datasource 自动取参（v0.1 参数手填）
+ */
+
+(function () {
+  'use strict';
+
+  /* ==================== ENGINE-START（纯函数区，可被 Node 冒烟测试加载） ==================== */
+
+  const ENGINE = {};
+
+  // ---------- 路径解析：data.list[0].corpId ----------
+  ENGINE.resolvePath = function (obj, path) {
+    if (typeof path !== 'string') return undefined;
+    const segs = [];
+    path.replace(/([^.\[\]]+)|\[(\d+)\]/g, (_, name, idx) => {
+      if (name !== undefined) segs.push(name); else segs.push(Number(idx));
+      return '';
+    });
+    let cur = obj;
+    for (const s of segs) {
+      if (cur === null || cur === undefined) return undefined;
+      cur = cur[s];
+    }
+    return cur;
+  };
+
+  // ---------- 占位符解析 ----------
+  // scope: { name: value }；未定义的占位符 → 抛错（禁止猜测式兼容）
+  ENGINE.resolvePlaceholders = function (tpl, scope) {
+    if (typeof tpl === 'string') {
+      return tpl.replace(/\{\{([\w.\[\]-]+)\}\}/g, (whole, name) => {
+        if (!(name in scope)) throw new Error('E_SPEC: 未定义占位符 {{' + name + '}}');
+        const v = scope[name];
+        return (v === null || v === undefined) ? '' : String(v);
+      });
+    }
+    if (Array.isArray(tpl)) return tpl.map(x => ENGINE.resolvePlaceholders(x, scope));
+    if (tpl && typeof tpl === 'object') {
+      const out = {};
+      for (const k of Object.keys(tpl)) out[k] = ENGINE.resolvePlaceholders(tpl[k], scope);
+      return out;
+    }
+    return tpl;
+  };
+
+  ENGINE.findUnresolvedPlaceholders = function (tpl, scope, acc) {
+    acc = acc || [];
+    const scan = (node) => {
+      if (typeof node === 'string') {
+        node.replace(/\{\{([\w.\[\]-]+)\}\}/g, (_, name) => {
+          if (!(name in scope) && acc.indexOf(name) < 0) acc.push(name);
+          return '';
+        });
+      } else if (Array.isArray(node)) node.forEach(scan);
+      else if (node && typeof node === 'object') Object.keys(node).forEach(k => scan(node[k]));
+    };
+    scan(tpl);
+    return acc;
+  };
+
+  // ---------- cookie 派生变量 ----------
+  ENGINE.readCookie = function (docCookie, name) {
+    const m = docCookie.match(new RegExp('(?:^|;\\s*)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
+    return m ? decodeURIComponent(m[1]) : null;
+  };
+  ENGINE.parseCookieVar = function (docCookie, varDef) {
+    const raw = ENGINE.readCookie(docCookie, varDef.name);
+    if (raw === null) return { ok: false, reason: 'cookie 不存在: ' + varDef.name };
+    if (!varDef.parse || varDef.parse === 'raw') return { ok: true, value: raw };
+    const mPath = varDef.parse.match(/^json\.(.+)$/);
+    if (mPath) {
+      try {
+        const v = ENGINE.resolvePath(JSON.parse(raw), mPath[1]);
+        if (v === undefined || v === null) return { ok: false, reason: 'cookie JSON 中路径为空: ' + varDef.parse };
+        return { ok: true, value: String(v) };
+      } catch (e) { return { ok: false, reason: 'cookie JSON 解析失败(' + varDef.name + '): ' + e.message }; }
+    }
+    return { ok: false, reason: '不支持的 parse 规则: ' + varDef.parse };
+  };
+
+  // ---------- 断言引擎（语法 = specs/README.md「断言语法」唯一合法形式） ----------
+  // 返回 {pass: bool, detail: string}
+  ENGINE.evalAssert = function (raw, data, scope) {
+    const a = raw.trim();
+    const err = (msg) => ({ pass: false, detail: msg });
+
+    // len(path) OP N
+    let m = a.match(/^len\((.+)\)\s*(>=|<=|==|!=|>|<)\s*(\d+)$/);
+    if (m) {
+      const v = ENGINE.resolvePath(data, m[1].trim());
+      const len = (typeof v === 'string' || Array.isArray(v)) ? v.length : NaN;
+      if (Number.isNaN(len)) return err('len() 作用对象不是字符串/数组: ' + m[1] + ' → ' + JSON.stringify(v));
+      const n = Number(m[3]);
+      return { pass: ENGINE.cmpNum(len, m[2], n), detail: 'len=' + len + ' ' + m[2] + ' ' + n };
+    }
+
+    // path in [ ... ]
+    m = a.match(/^(.+?)\s+in\s+\[(.*)\]$/);
+    if (m) {
+      const v = ENGINE.resolvePath(data, m[1].trim());
+      const items = m[2].split(',').map(s => s.trim()).filter(Boolean)
+        .map(s => ENGINE.parseScalar(s, scope));
+      const pass = items.some(it => ENGINE.looseEq(v, it));
+      return { pass, detail: JSON.stringify(v) + ' in [' + items.map(x => JSON.stringify(x)) + ']' };
+    }
+
+    // path (!?)matches /re/    —— 正则体内允许空格，放最后用贪婪匹配
+    m = a.match(/^(.+?)\s+(!?)matches\s+\/([\s\S]*)\/$/);
+    if (m) {
+      const v = ENGINE.resolvePath(data, m[1].trim());
+      if (typeof v !== 'string') return err('matches 作用对象不是字符串: ' + m[1]);
+      let re; try { re = new RegExp(m[3]); } catch (e) { return err('正则非法: /' + m[3] + '/ ' + e.message); }
+      const hit = re.test(v);
+      const pass = m[2] === '!' ? !hit : hit;
+      return { pass, detail: (m[2] === '!' ? 'NOT ' : '') + 'matches /' + m[3] + '/ → ' + (hit ? '命中' : '未命中') + '（值长度 ' + v.length + '）' };
+    }
+
+    // path (!?)contains "s"
+    m = a.match(/^(.+?)\s+(!?)contains\s+"([^"]*)"$/);
+    if (m) {
+      const v = ENGINE.resolvePath(data, m[1].trim());
+      const s = String(v === undefined || v === null ? '' : (typeof v === 'object' ? JSON.stringify(v) : v));
+      const hit = s.indexOf(m[3]) >= 0;
+      return { pass: m[2] === '!' ? !hit : hit, detail: (m[2] === '!' ? 'NOT ' : '') + 'contains "' + m[3] + '" → ' + (hit ? '命中' : '未命中') };
+    }
+
+    // path exists
+    m = a.match(/^(.+?)\s+exists$/);
+    if (m) {
+      const v = ENGINE.resolvePath(data, m[1].trim());
+      return { pass: v !== undefined && v !== null, detail: m[1].trim() + ' → ' + (v === undefined ? 'undefined' : (v === null ? 'null' : '存在')) };
+    }
+
+    // path OP value
+    m = a.match(/^(.+?)\s*(==|!=|>=|<=|>|<)\s*(.+)$/);
+    if (m) {
+      const v = ENGINE.resolvePath(data, m[1].trim());
+      const target = ENGINE.parseScalar(m[3], scope);
+      if (m[2] === '==' || m[2] === '!=') {
+        const eq = ENGINE.looseEq(v, target);
+        return { pass: m[2] === '==' ? eq : !eq, detail: ENGINE.trimShow(v) + ' ' + m[2] + ' ' + JSON.stringify(target) };
+      }
+      const nv = Number(v), nt = Number(target);
+      if (v === undefined || v === null || nv === undefined || Number.isNaN(nv) || Number.isNaN(nt)) {
+        return err('数值比较遇到非数值: ' + ENGINE.trimShow(v) + ' ' + m[2] + ' ' + JSON.stringify(target));
+      }
+      return { pass: ENGINE.cmpNum(nv, m[2], nt), detail: ENGINE.trimShow(v) + ' ' + m[2] + ' ' + JSON.stringify(target) };
+    }
+
+    return err('无法识别的断言语法: ' + a);
+  };
+
+  ENGINE.parseScalar = function (s, scope) {
+    s = s.trim();
+    const ph = s.match(/^\{\{([\w.\[\]-]+)\}\}$/);
+    if (ph) {
+      if (!scope || !(ph[1] in scope)) throw new Error('E_SPEC: 断言中引用未定义占位符 {{' + ph[1] + '}}');
+      return scope[ph[1]];
+    }
+    if (/^".*"$/.test(s) || /^'.*'$/.test(s)) return s.slice(1, -1);
+    if (s === 'true') return true;
+    if (s === 'false') return false;
+    if (s === 'null') return null;
+    if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
+    return s; // 裸字符串按原值
+  };
+  ENGINE.looseEq = function (a, b) {
+    if (a === b) return true;
+    // JS == 语义：undefined 与 null 相等（断言 path == null 覆盖字段缺失场景）
+    if ((a === null || a === undefined) && (b === null || b === undefined)) return true;
+    if (a === null || a === undefined || b === null || b === undefined) return false;
+    const na = Number(a), nb = Number(b);
+    if (!Number.isNaN(na) && !Number.isNaN(nb) && String(na) === String(a) && String(nb) === String(b)) return na === nb;
+    return String(a) === String(b);
+  };
+  ENGINE.cmpNum = (a, op, b) => op === '>=' ? a >= b : op === '<=' ? a <= b : op === '>' ? a > b : op === '<' ? a < b : op === '==' ? a === b : a !== b;
+  ENGINE.trimShow = (v) => { const s = JSON.stringify(v); return s === undefined ? 'undefined' : (s.length > 80 ? s.slice(0, 80) + '…(' + s.length + ')' : s); };
+
+  // ---------- 脱敏（日志落表/落屏前必须过这里） ----------
+  ENGINE.SENSITIVE_KEY = /(api_?key|secret|token|password|passwd|ticket|authorization|cookie)/i;
+  ENGINE.redact = function (obj, depth) {
+    depth = depth || 0;
+    if (depth > 6) return '…';
+    if (typeof obj === 'string') return obj;
+    if (Array.isArray(obj)) return obj.map(x => ENGINE.redact(x, depth + 1));
+    if (obj && typeof obj === 'object') {
+      const out = {};
+      for (const k of Object.keys(obj)) {
+        out[k] = ENGINE.SENSITIVE_KEY.test(k) ? ENGINE.maskValue(obj[k]) : ENGINE.redact(obj[k], depth + 1);
+      }
+      return out;
+    }
+    return obj;
+  };
+  ENGINE.maskValue = function (v) {
+    const s = typeof v === 'string' ? v : JSON.stringify(v);
+    if (s === undefined || s === null) return v;
+    if (s.length <= 8) return '***';
+    return s.slice(0, 4) + '…***…' + s.slice(-4) + ' (' + s.length + 'ch)';
+  };
+
+  // ---------- SHA-256（crypto.subtle 包装，dev 模式展示 paste 内容指纹） ----------
+  ENGINE.sha256Hex = async function (text) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  /* ==================== ENGINE-END ==================== */
+
+  const GV = {
+    RUN_KEY: 'masr_run_v1',          // 运行态（跨页续跑）
+    CACHE_KEY: 'masr_cache_v1',      // 步骤缓存
+    TRANSPORT_KEY: 'masr_transport', // 通道探测结论（fetch / gm）
+    SCHEMA_SUPPORTED: '0.1',
+    RUNNER_VERSION: '0.1.14',
+    // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
+    // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
+    UPDATE_MANIFEST: [
+      'https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/manifest.json',
+      'https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/manifest.json'
+    ],
+    INSTALL_URL: 'https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js',
+  };
+
+  // ---------- 运行态存取（GM 存储跨域共享，导航后由新页面恢复） ----------
+  const RunState = {
+    get() { try { return JSON.parse(GM_getValue(GV.RUN_KEY, 'null')); } catch (e) { return null; } },
+    set(st) { GM_setValue(GV.RUN_KEY, JSON.stringify(st)); },
+    clear() { GM_deleteValue(GV.RUN_KEY); },
+  };
+  const StepCache = {
+    all() { try { return JSON.parse(GM_getValue(GV.CACHE_KEY, '{}')); } catch (e) { return {}; } },
+    get(specId, stepId, bodyKey) {
+      const c = this.all()[specId + '/' + stepId + '/' + bodyKey];
+      if (!c) return null;
+      if (Date.now() > c.expireAt) return null;
+      return c;
+    },
+    put(specId, stepId, bodyKey, data, ttlSec) {
+      const c = this.all();
+      c[specId + '/' + stepId + '/' + bodyKey] = { data, expireAt: Date.now() + ttlSec * 1000 };
+      GM_setValue(GV.CACHE_KEY, JSON.stringify(c));
+    },
+  };
+
+  // ---------- 风控限速器 ----------
+  function makeLimiter(rateLimit) {
+    const rl = rateLimit || {};
+    const minGap = rl.max_rps ? 1000 / rl.max_rps : 0;
+    let lastAt = 0;
+    return async function gate(noRetry) {
+      const jitter = (rl.jitter_ms && !noRetry) ? rl.jitter_ms[0] + Math.random() * (rl.jitter_ms[1] - rl.jitter_ms[0]) : 0;
+      const wait = Math.max(0, lastAt + minGap + jitter - Date.now());
+      if (wait > 0) await sleep(wait);
+      lastAt = Date.now();
+    };
+  }
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  function isNoRetryPath(spec, url) {
+    const paths = (spec.rate_limit && spec.rate_limit.no_retry_paths) || [];
+    return paths.some(p => url.indexOf(p) >= 0);
+  }
+
+  // ---------- 传输通道：页面 fetch 优先（自动带同源 Cookie），失败兜底 GM_xhr ----------
+  async function detectTransport() {
+    const saved = GM_getValue(GV.TRANSPORT_KEY, '');
+    if (saved) return saved;
+    return 'auto';
+  }
+  function pageFetch(url, opt) {
+    // 快速失败：WAF 挂起时 fetch 会无限挂住（实测 ~100s 才被断连），用 AbortController 限时
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opt.timeoutMs || 25000);
+    return fetch(url, {
+      method: opt.method || 'GET',
+      headers: opt.headers || {},
+      body: opt.bodyText,
+      credentials: 'include',
+      signal: ctrl.signal,
+    }).then(async (res) => {
+      clearTimeout(timer);
+      const text = await res.text();
+      return { status: res.status, text };
+    }).catch((e) => {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') throw new Error('fetch timeout(' + ((opt.timeoutMs || 25000) / 1000) + 's，疑似WAF挂起)');
+      throw e;
+    });
+  }
+  function gmFetch(url, opt) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: opt.method || 'GET',
+        url,
+        headers: opt.headers || {},
+        data: opt.bodyText,
+        timeout: 30000,
+        onload: (r) => resolve({ status: r.status, text: r.responseText }),
+        onerror: () => reject(new Error('GM_xhr network error')),
+        ontimeout: () => reject(new Error('GM_xhr timeout(30s)')),
+      });
+    });
+  }
+  async function httpOnce(url, opt) {
+    const mode = await detectTransport();
+    if (mode === 'gm') return gmFetch(url, opt);
+    if (mode === 'fetch') return pageFetch(url, opt);
+    // auto：先 fetch，网络层失败（CORS/断网）再走 GM
+    try {
+      return await pageFetch(url, opt);
+    } catch (e) {
+      return await gmFetch(url, opt);
+    }
+  }
+
+  // ---------- HTTP 响应体定位（页面 fetch 复现时可能拿到包了 http* 键的信封） ----------
+  function unwrapBody(json) {
+    if (json && typeof json === 'object' && !Array.isArray(json)) {
+      for (const k of Object.keys(json)) {
+        if (/^http/.test(k) && json[k] && typeof json[k] === 'object') return json[k];
+      }
+    }
+    return json;
+  }
+
+  /* ---------- 核心执行器 ---------- */
+
+  function buildScope(spec, params, extracted, extra) {
+    const scope = Object.assign({}, extra || {});
+    for (const p of spec.params || []) scope[p.name] = params[p.name];
+    for (const k of Object.keys(extracted)) scope[k] = extracted[k];
+    scope.task_id = scope.task_id || 'dev-' + Date.now();
+    scope.now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    return scope;
+  }
+
+  function prepareVars(spec) {
+    // 启动时尽力派生（仅作初始值）；缺失不致命——真实判定在每步执行前 ensureStepVars
+    const got = {};
+    const problems = [];
+    for (const name of Object.keys(spec.vars || {})) {
+      const r = ENGINE.parseCookieVar(document.cookie, spec.vars[name]);
+      if (r.ok) got[name] = r.value; else problems.push(name + ': ' + r.reason);
+    }
+    return { vars: got, problems };
+  }
+
+  function stepVarNames(spec, step) {
+    const hay = JSON.stringify(step.request || {}) + (step.url || '') +
+      JSON.stringify(step.assert || []) + JSON.stringify(step.expect || {});
+    return Object.keys(spec.vars || {}).filter(n => hay.indexOf('{{' + n) >= 0);
+  }
+
+  function ensureStepVars(spec, step, vars) {
+    // 按步骤懒派生：哪步用哪个变量，就在那一步执行时现取 cookie。
+    // 原因：派生 cookie 可能由前序 navigate 步骤的跳转链才生成（如 dsp_csrf_token），
+    // 启动时全量求值会对"起点尚不存在"的 cookie 误报 E_SESSION（v0.1.7 及之前的真实缺陷，2026-10-30 16:49 复现）。
+    for (const name of stepVarNames(spec, step)) {
+      const r = ENGINE.parseCookieVar(document.cookie, spec.vars[name]);
+      if (!r.ok) {
+        throw new RunnerError('E_SESSION', step.id + ' 需要派生变量 ' + name + '，但 ' + r.reason +
+          '。该 cookie 通常在进入对应平台上下文后才生成；请从流程起点（服务商平台首页）发起完整执行，而不是在中间页面直接续跑');
+      }
+      vars[name] = r.value; // 每步现取，cookie 轮换后取到的是新值
+    }
+  }
+
+  function validateSpecShape(spec) {
+    if (spec.schema_version !== GV.SCHEMA_SUPPORTED) {
+      throw new Error('E_SPEC: schema_version=' + spec.schema_version + '，本 Runner 仅支持 ' + GV.SCHEMA_SUPPORTED + '（版本协商：宁可停也不猜）');
+    }
+    if (!spec.spec_id || !spec.version || !Array.isArray(spec.steps) || !spec.steps.length) {
+      throw new Error('E_SPEC: spec_id/version/steps 缺失');
+    }
+    if (spec.last_verified_at) {
+      const days = (Date.now() - new Date(spec.last_verified_at).getTime()) / 86400000;
+      if (days > 30) throw new Error('E_SPEC: spec 已 ' + Math.floor(days) + ' 天未验证（last_verified_at=' + spec.last_verified_at + '），疑似失效，拒绝执行');
+    }
+  }
+
+  function checkDryRunPermission(spec) {
+    if (spec.status === 'draft') {
+      const hasWrite = spec.steps.some(s => s.write === true || s.mode === 'human');
+      if (hasWrite) {
+        // draft 允许跑到写操作前一步：执行引擎会在遇 write 步骤时停下（见 runSpec）
+        return { dryRun: true, stopAtWrite: true };
+      }
+      return { dryRun: true, stopAtWrite: true }; // 纯读 draft：dry_run 即正常执行读步骤
+    }
+    return { dryRun: false, stopAtWrite: false };
+  }
+
+  async function runSpec(spec, params, hooks) {
+    // hooks: {onLog(entry), onStep(stepId, phase, info)}
+    const log = (entry) => { hooks.onLog(entry); };
+    const onStep = hooks.onStep || (() => {});
+    validateSpecShape(spec);
+    const { dryRun } = checkDryRunPermission(spec);
+
+    const { vars, problems } = prepareVars(spec);
+    if (problems.length) {
+      log({ t: Date.now(), level: 'info', msg: '派生变量延后求值（在使用它的步骤执行时现取）: ' + problems.join('；') });
+    }
+    log({ t: Date.now(), level: 'info', msg: '派生变量就绪: ' + Object.keys(vars).join(', ') });
+    log({ t: Date.now(), level: 'info', msg: (dryRun ? '[dry_run] ' : '[run] ') + spec.spec_id + ' v' + spec.version + ' (' + spec.status + ')' });
+
+    const gate = makeLimiter(spec.rate_limit);
+    const extracted = {};
+    const stepLogs = [];
+    let scope = buildScope(spec, params, extracted, vars);
+
+    // 预检：全部步骤的占位符当前可解析吗（除引用后步产物的）？——尽力预检，允许执行期再补
+    const missing = ENGINE.findUnresolvedPlaceholders(
+      spec.steps.map(s => s.request || { url: s.url }), scope);
+    if (missing.length) {
+      log({ t: Date.now(), level: 'warn', msg: '预检发现待运行期变量（若来自后步 extract 属正常）: ' + missing.join(', ') });
+    }
+
+    for (let i = 0; i < spec.steps.length; i++) {
+      const step = spec.steps[i];
+      try {
+        ensureStepVars(spec, step, vars);
+        scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域（vars 可能刚更新）
+        if (step.write === true) {
+          if (dryRun || true /* v0.1 一律拦截写操作：confirm 机制在 v0.2 随 human 原语一起上 */) {
+            log({ t: Date.now(), level: 'fatal', msg: 'S' + i + ' 写操作被 v0.1 Runner 拦截（写操作需 v0.2 confirm 机制）' });
+            throw new RunnerError('E_PERM', 'v0.1 Runner 不执行写操作: ' + step.id);
+          }
+        }
+        if (step.mode === 'human') {
+          throw new RunnerError('E_PERM', 'human 断点原语 v0.2 提供，本步骤无法执行: ' + step.id);
+        }
+        if (step.mode === 'navigate') {
+          const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, i);
+          if (nav && nav.initiated) {
+            // 导航发起是正常信号，不是失败。同页跳转：本页即将卸载；新标签页：本页保留
+            const tip = nav.openedTab
+              ? '=== ' + step.id + ' 已在新标签页打开子客门户（本页保留）。请切换到新标签页 → 打开悬浮球 → 点「执行」完成落地校验并续跑 ==='
+              : '=== ' + step.id + ' 导航已发起（这不是错误）。页面跳转后请打开悬浮球点「执行」完成落地校验并续跑；若 5 秒后页面仍未跳转，请截图日志反馈 ===';
+            log({ t: Date.now(), level: 'warn', msg: tip });
+            return { ok: true, navInitiated: true, openedTab: !!nav.openedTab, stepId: step.id, stepLogs, extracted, dryRun };
+          }
+          continue;
+        }
+        if (step.mode !== 'api') {
+          throw new RunnerError('E_SPEC', '未知步骤 mode: ' + step.mode);
+        }
+        await execApi(spec, step, scope, extracted, stepLogs, log, onStep, i, gate);
+        // 关键：每步执行完重建作用域，把本步抽取产物并入变量表（前步产物 {{Sn.x}} 通道）
+        scope = buildScope(spec, params, extracted, vars);
+      } catch (e) {
+        if (e instanceof RunnerError) {
+          log({ t: Date.now(), level: 'fatal', msg: step.id + ' 失败: [' + e.code + '] ' + e.message });
+          throw e;
+        }
+        // spec 定义的 on_fail 优先，但底层原因永远保留（三要素：期望/实际/差异）
+        const of = step.on_fail || {};
+        const code = /未定义占位符|无法识别/.test(e.message) ? 'E_SPEC' : 'E_NETWORK';
+        const msg = of.message ? (of.message + '｜底层: ' + e.message) : e.message;
+        log({ t: Date.now(), level: 'fatal', msg: step.id + ' 失败: [' + (of.error || code) + '] ' + msg });
+        throw new RunnerError(of.error || code, msg);
+      }
+    }
+
+    // outputs
+    const outputs = {};
+    for (const k of Object.keys(spec.outputs || {})) {
+      try { outputs[k] = ENGINE.resolvePlaceholders(spec.outputs[k], scope); }
+      catch (e) { outputs[k] = '<解析失败: ' + e.message + '>'; }
+    }
+    return { ok: true, dryRun, outputs, stepLogs, extracted };
+  }
+
+  function RunnerError(code, message) { this.code = code; this.message = message; }
+  RunnerError.prototype = Object.create(Error.prototype);
+
+  async function execApi(spec, step, scope, extracted, stepLogs, log, onStep, idx, gate) {
+    onStep(step.id, 'running');
+    const url = ENGINE.resolvePlaceholders(step.request.url, scope);
+    const headers = ENGINE.resolvePlaceholders(step.request.headers || {}, scope);
+    const bodyText = step.request.body !== undefined
+      ? JSON.stringify(ENGINE.resolvePlaceholders(step.request.body, scope)) : undefined;
+    const noRetry = isNoRetryPath(spec, url);
+    const bodyKey = (bodyText || '').length + ':' + url;
+
+    // 步骤缓存
+    if (step.cache_ttl_sec) {
+      const cached = StepCache.get(spec.spec_id, step.id, bodyKey);
+      if (cached) {
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 命中缓存（TTL ' + step.cache_ttl_sec + 's 内）' });
+        return applyResponse(spec, step, cached.data, scope, extracted, stepLogs, log, onStep, true);
+      }
+    }
+
+    await gate(noRetry);
+    log({ t: Date.now(), level: 'info', msg: step.id + ' → ' + (step.request.method || 'GET') + ' ' + url + (noRetry ? '（WAF 限流路径，禁重试）' : '') });
+    onStep(step.id, 'requesting');
+
+    const t0 = Date.now();
+    let res;
+    try { res = await httpOnce(url, { method: step.request.method || 'GET', headers, bodyText }); }
+    catch (e) {
+      // no_retry 路径失败不重试（WAF 挂起特征）；其他路径重试 1 次
+      if (!noRetry) {
+        log({ t: Date.now(), level: 'warn', msg: step.id + ' 请求失败（' + e.message + '），重试 1 次' });
+        await gate(noRetry);
+        res = await httpOnce(url, { method: step.request.method || 'GET', headers, bodyText });
+      } else {
+        // WAF 挂起场景：请求长时间无响应即超时/断连——给出冷却指引而不是让用户反复重试加重惩罚
+        if (/timeout|network error/i.test(e.message)) {
+          throw new RunnerError('E_NETWORK', '请求长时间无响应（' + e.message + '），疑似 WAF 对该路径限流挂起。请等待约 10 分钟让限流解除后，从服务商平台首页重新发起完整流程（不要反复重试，会加重惩罚）');
+        }
+        throw e;
+      }
+    }
+    const cost = Date.now() - t0;
+    log({ t: Date.now(), level: 'info', msg: step.id + ' ← HTTP ' + res.status + '，' + res.text.length + 'B，耗时 ' + cost + 'ms' });
+
+    let json;
+    try { json = JSON.parse(res.text); } catch (e) {
+      throw new RunnerError('E_DRIFT', '响应不是合法 JSON（前 120 字符: ' + res.text.slice(0, 120) + '）');
+    }
+    json = unwrapBody(json);
+
+    if (res.status !== 200) {
+      // 三要素：状态码 + 响应体快照（脱敏），否则服务端错误无从诊断
+      let snippet = res.text.slice(0, 200);
+      try { snippet = JSON.stringify(ENGINE.redact(JSON.parse(res.text))).slice(0, 200); } catch (e) { /* 非 JSON 原样截断 */ }
+      if (res.status === 401 || res.status === 403) throw new RunnerError('E_SESSION', 'HTTP ' + res.status + '，会话可能已失效｜响应: ' + snippet);
+      throw new RunnerError('E_NETWORK', 'HTTP ' + res.status + '｜响应: ' + snippet);
+    }
+    if (step.cache_ttl_sec) StepCache.put(spec.spec_id, step.id, bodyKey, json, step.cache_ttl_sec);
+    return applyResponse(spec, step, json, scope, extracted, stepLogs, log, onStep, false);
+  }
+
+  function applyResponse(spec, step, json, scope, extracted, stepLogs, log, onStep, fromCache) {
+    // 断言
+    const assertResults = [];
+    for (const a of step.assert || []) {
+      let r;
+      try { r = ENGINE.evalAssert(a, json, scope); }
+      catch (e) { r = { pass: false, detail: e.message }; }
+      assertResults.push({ assert: a, pass: r.pass, detail: r.detail });
+      if (!r.pass) {
+        const of = step.on_fail || {};
+        onStep(step.id, 'failed');
+        log({ t: Date.now(), level: 'fatal', msg: step.id + ' 断言失败: ' + a + '（' + r.detail + '）' });
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 响应快照: ' + JSON.stringify(ENGINE.redact(json)).slice(0, 600) });
+        throw new RunnerError(of.error || 'E_ASSERT', (of.message || '断言失败: ' + a) + '｜' + r.detail);
+      }
+    }
+    // 抽取
+    const got = {};
+    for (const k of Object.keys(step.extract || {})) {
+      const path = step.extract[k];
+      if (path === null) { got[k] = '<extract 未定义（unconfirmed），跳过>'; continue; }
+      const v = ENGINE.resolvePath(json, path);
+      if (v === undefined || v === null) {
+        const of = step.on_fail || {};
+        onStep(step.id, 'failed');
+        throw new RunnerError(of.error || 'E_DRIFT', '抽取路径不存在: ' + path + '（响应: ' + JSON.stringify(ENGINE.redact(json)).slice(0, 300) + '）');
+      }
+      extracted[step.id + '.' + k] = v;
+      got[k] = v;
+    }
+    stepLogs.push({
+      id: step.id, name: step.name, mode: step.mode, fromCache,
+      assertResults, extract: ENGINE.redact(got),
+      response: ENGINE.redact(json),
+      rawResponseRef: step.id, // UI 可看完整脱敏 JSON
+    });
+    onStep(step.id, 'passed');
+    log({ t: Date.now(), level: 'ok', msg: step.id + ' ✓ 断言 ' + assertResults.length + ' 条全过' + (Object.keys(got).length ? '，抽取: ' + Object.keys(got).join(', ') : '') });
+  }
+
+  async function execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, idx) {
+    // navigate 前必须先把运行态落盘（导航会销毁当前 JS 环境）
+    const url = ENGINE.resolvePlaceholders(step.url, scope);
+    if (!/^https:\/\//.test(url)) throw new RunnerError('E_SPEC', 'navigate 目标非法: ' + url);
+    const newTab = step.open === 'new-tab';
+    log({ t: Date.now(), level: 'info', msg: step.id + ' → ' + (newTab ? '新标签页打开 ' : '导航 ') + maskUrl(url) + '（运行态已保存）' });
+    onStep(step.id, 'navigating');
+    const st = RunState.get() || {};
+    st.phase = 'await_nav_check';
+    st.navStepId = step.id;
+    st.navExpect = step.expect || {};
+    st.navAt = Date.now();
+    st.extracted = extracted;   // 产物随行：落地页续跑时恢复变量表
+    st.stepLogs = stepLogs;     // 日志随行：落地后面板能看到完整时间线
+    RunState.set(st);
+    // 留时间让 UI 渲染日志；location.href 是异步的，页面真正卸载前脚本会继续走完
+    await sleep(300);
+    if (newTab) {
+      // 新标签页进入：复刻 UI 的 window.open 行为（保留 opener）。
+      // 证据：2026-10-30 对照实验——UI(window.open) 进入的会话 trackingportal 全通（spec.manual-assist 三步全绿），
+      // 当前页 location.href 替换进入的会话缺 trackingportal 会话（101133），疑似 SSO 握手依赖 opener 收尾。
+      const w = window.open(url, '_blank');
+      if (!w) {
+        // 0.1.13：弹窗被拦时降级为当前页导航（落点相同，expect 校验兜底），不再硬报错——
+        // 自动续跑链路中本页没有用户手势，被拦是常态而非异常
+        log({ t: Date.now(), level: 'warn', msg: step.id + ' 弹窗被浏览器拦截，降级为当前页导航（落点不变）' });
+        location.href = url;
+        await sleep(500);
+        return { initiated: true, openedTab: false, pageStayed: true };
+      }
+      try { sessionStorage.setItem('masrTransit', '1'); } catch (e) {}
+      await sleep(500);
+      // 当前页不卸载；续跑发生在新标签页（RunState 跨标签共享）
+      return { initiated: true, openedTab: true };
+    }
+    location.href = url;
+    await sleep(500);
+    // 能走到这 = 页面没有卸载 = 导航未生效（被拦截或目标拒绝）
+    return { initiated: true, pageStayed: true };
+  }
+
+  // 日志脱敏：票据/token 类查询参数打码
+  function maskUrl(u) {
+    return u.replace(/([?&](ticket|token|code|auth)=)[^&]+/gi, '$1***');
+  }
+
+  // 落地后恢复：检查 expect{url_contains, cookie_exists}
+  async function resumeAfterNavigate(spec, params) {
+    const st = RunState.get();
+    if (!st || st.phase !== 'await_nav_check') return null;
+    const expect = st.navExpect || {};
+    const problems = [];
+    if (expect.url_contains && location.href.indexOf(expect.url_contains) < 0) {
+      problems.push('URL 不含 "' + expect.url_contains + '"（当前: ' + location.href.slice(0, 120) + '）');
+    }
+    if (expect.cookie_exists) {
+      // 等待 cookie 就位（302 链路可能需要几秒）
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        if (ENGINE.readCookie(document.cookie, expect.cookie_exists)) break;
+        await sleep(500);
+      }
+      if (!ENGINE.readCookie(document.cookie, expect.cookie_exists)) {
+        problems.push('cookie 不存在: ' + expect.cookie_exists);
+      }
+    }
+    // 恢复执行环境
+    const stepIdx = spec.steps.findIndex(s => s.id === st.navStepId);
+    const step = spec.steps[stepIdx];
+    const logEntries = st.log || [];
+    const log = (entry) => { logEntries.push(entry); st.log = logEntries; RunState.set(st); UI.appendLog(entry); };
+    if (problems.length) {
+      RunState.clear();
+      const of = step.on_fail || {};
+      log({ t: Date.now(), level: 'fatal', msg: st.navStepId + ' expect 校验失败: ' + problems.join('；') });
+      throw new RunnerError(of.error || 'E_SESSION', (of.message || '导航后校验失败') + '｜' + problems.join('；'));
+    }
+    log({ t: Date.now(), level: 'ok', msg: st.navStepId + ' ✓ 落地校验通过（' + location.href.slice(0, 80) + '…）' });
+    // 导航步骤也进步骤表/日志（步骤表 ✓ 与结果导出完整）
+    (st.stepLogs = st.stepLogs || []).push({
+      id: st.navStepId, name: step.name, mode: 'navigate', fromCache: false,
+      assertResults: [{ assert: 'expect(url_contains+cookie_exists)', pass: true, detail: '落地校验通过' }],
+      extract: {},
+    });
+    RunState.clear();
+    // 继续执行后续步骤（抽取产物与日志从运行态恢复）
+    return continueFrom(spec, params, stepIdx + 1, log, st.extracted || {}, st.stepLogs || []);
+  }
+
+  async function continueFrom(spec, params, fromIdx, log, extracted0, stepLogs0) {
+    // 与 runSpec 相同的循环，从 fromIdx 继续（navigate 恢复专用）
+    const { vars } = prepareVars(spec);
+    const gate = makeLimiter(spec.rate_limit);
+    const extracted = Object.assign({}, extracted0 || {});
+    const stepLogs = stepLogs0 || [];
+    let scope = buildScope(spec, params, extracted, vars);
+    for (let i = fromIdx; i < spec.steps.length; i++) {
+      const step = spec.steps[i];
+      ensureStepVars(spec, step, vars);
+      scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域
+      if (step.write === true) throw new RunnerError('E_PERM', 'v0.1 不执行写操作: ' + step.id);
+      if (step.mode === 'navigate') {
+        const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i);
+        if (nav && nav.initiated) return { ok: true, navInitiated: true, stepId: step.id, stepLogs, extracted, resumed: true };
+        continue;
+      }
+      if (step.mode === 'human') throw new RunnerError('E_PERM', 'human 原语 v0.2 提供: ' + step.id);
+      if (step.mode !== 'api') throw new RunnerError('E_SPEC', '未知 mode: ' + step.mode);
+      await execApi(spec, step, scope, extracted, stepLogs, log, () => {}, i, gate);
+      scope = buildScope(spec, params, extracted, vars); // 每步重建作用域（同 runSpec）
+    }
+    const outputs = {};
+    for (const k of Object.keys(spec.outputs || {})) {
+      try { outputs[k] = ENGINE.resolvePlaceholders(spec.outputs[k], scope); }
+      catch (e) { outputs[k] = '<解析失败: ' + e.message + '>'; }
+    }
+    return { ok: true, dryRun: true, outputs, stepLogs, extracted, resumed: true };
+  }
+
+  /* ==================== UI ==================== */
+
+  const UI = {};
+  UI.mount = function () {
+    if (document.getElementById('masr-ball')) return;
+    const css = document.createElement('style');
+    css.textContent = `
+      #masr-ball{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:44px;height:44px;border-radius:50%;
+        background:#1a66ff;color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;
+        cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.25);user-select:none}
+      #masr-panel{position:fixed;right:18px;bottom:70px;z-index:2147483000;width:520px;max-height:70vh;overflow:auto;
+        background:#fff;color:#222;border:1px solid #d9d9e3;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.2);
+        font:12px/1.6 -apple-system,'Segoe UI',sans-serif;padding:12px;display:none}
+      #masr-panel h3{margin:2px 0 8px;font-size:13px}
+      #masr-panel textarea{width:100%;height:110px;font:11px/1.5 Consolas,monospace;box-sizing:border-box}
+      #masr-panel .row{margin:6px 0}
+      #masr-panel button{margin-right:6px;padding:3px 10px;border:1px solid #bbb;border-radius:6px;background:#f6f7fa;cursor:pointer;font-size:12px}
+      #masr-panel button.primary{background:#1a66ff;color:#fff;border-color:#1a66ff}
+      #masr-panel .log{background:#101418;color:#cde3ff;font:11px/1.5 Consolas,monospace;padding:8px;border-radius:8px;
+        max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+      #masr-panel .ok{color:#4caf7d}.fatal{color:#ff6b6b}.warn{color:#ffb84d}
+      #masr-panel table{border-collapse:collapse;width:100%}
+      #masr-panel td,#masr-panel th{border:1px solid #e3e3ec;padding:2px 6px;text-align:left;font-size:11px}
+      #masr-panel input{padding:2px 6px;border:1px solid #ccc;border-radius:4px;width:200px}
+      .masr-tag{display:inline-block;padding:0 6px;border-radius:8px;font-size:10px;margin-left:6px}
+    `;
+    document.head.appendChild(css);
+
+    const ball = document.createElement('div');
+    ball.id = 'masr-ball'; ball.textContent = 'MAS';
+    ball.title = 'MAS-Runner v' + GV.RUNNER_VERSION + '（点击打开/收起）';
+    const panel = document.createElement('div');
+    panel.id = 'masr-panel';
+    panel.innerHTML = `
+      <h3>MAS-Runner v${GV.RUNNER_VERSION}
+        <button id="masr-check-update" style="font-size:11px;padding:1px 6px;margin-left:6px;cursor:pointer">检查更新</button>
+        <span id="masr-update-out" style="font-size:11px;color:#666"></span>
+        <span id="masr-spec-badge"></span>
+      </h3>
+      <div class="row" id="masr-selfcheck"></div>
+      <div class="row" id="masr-spec-box"><b>① 粘贴 spec.json（dev 模式）</b><br></div>
+      <div class="row">
+        <button class="primary" id="masr-load">加载 spec</button>
+        <button id="masr-hash">计算 SHA-256</button>
+        <span id="masr-hash-out"></span>
+      </div>
+      <div class="row" id="masr-params"></div>
+      <div class="row">
+        <button class="primary" id="masr-run">执行（draft → dry_run）</button>
+        <button id="masr-export">导出结果 JSON</button>
+        <button id="masr-cancel-run">清除续跑状态</button>
+        <button id="masr-clear-logs">清空日志</button>
+      </div>
+      <div class="row"><b>步骤时间线</b><div id="masr-steps"></div></div>
+      <div class="row"><b>日志</b><div class="log" id="masr-log"></div></div>
+      <div class="row" id="masr-result"></div>
+    `;
+    document.body.appendChild(ball); document.body.appendChild(panel);
+    UI.makeSpecInput();
+    ball.addEventListener('click', () => { panel.style.display = panel.style.display === 'block' ? 'none' : 'block'; if (panel.style.display === 'block') UI.renderSelfCheck(); });
+
+    document.getElementById('masr-load').addEventListener('click', () => {
+      try {
+        const { spec, repaired } = UI.parseSpecText(UI.getSpecText());
+        validateSpecShape(spec);
+        UI.spec = spec;
+        const badge = document.getElementById('masr-spec-badge');
+        badge.innerHTML = spec.spec_id + ' v' + spec.version +
+          ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
+          ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
+        UI.renderParams(spec);
+        document.getElementById('masr-run').textContent = spec.status === 'active' ? '执行' : '执行（draft → dry_run）';
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: 'spec 已加载: ' + spec.spec_id + ' v' + spec.version + '，' + spec.steps.length + ' 步' });
+        if (repaired) UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到弯引号等脏字符，已自动修复——但建议以后先粘到记事本再复制过来，保证与 git 里的原文逐字节一致' });
+      } catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: 'spec 加载失败: ' + e.message }); }
+    });
+    document.getElementById('masr-hash').addEventListener('click', async () => {
+      const txt = UI.getSpecText();
+      if (!txt) return;
+      const h = await ENGINE.sha256Hex(txt);
+      document.getElementById('masr-hash-out').textContent = h.slice(0, 16) + '…';
+      console.log('[MASR] spec sha256 =', h);
+      UI.appendLog({ t: Date.now(), level: 'info', msg: 'SHA-256（全文，供 spec_index 登记）: ' + h });
+    });
+    document.getElementById('masr-run').addEventListener('click', () => UI.doRun());
+    document.getElementById('masr-export').addEventListener('click', () => {
+      if (!UI.lastResult) { alert('还没有运行结果'); return; }
+      const blob = new Blob([JSON.stringify(UI.lastResult, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'masr-result-' + (UI.spec ? UI.spec.spec_id : 'unknown') + '-' + Date.now() + '.json';
+      a.click();
+    });
+    document.getElementById('masr-cancel-run').addEventListener('click', () => {
+      RunState.clear(); UI.appendLog({ t: Date.now(), level: 'warn', msg: '续跑状态已清除' });
+    });
+    document.getElementById('masr-clear-logs').addEventListener('click', UI.clearLogs);
+    document.getElementById('masr-check-update').addEventListener('click', UI.checkUpdate);
+    UI.panel = panel;
+  };
+
+  // 粘贴输入框：行内强制样式防站点 CSS 吞掉；若仍不可见则降级为 contenteditable div
+  UI.makeSpecInput = function () {
+    const box = document.getElementById('masr-spec-box');
+    const mk = (tag) => {
+      const el = document.createElement(tag);
+      el.id = 'masr-spec-text';
+      el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;'
+        + 'width:100%!important;height:110px!important;min-height:110px!important;margin:4px 0 0;padding:6px!important;'
+        + 'font:11px/1.5 Consolas,monospace!important;color:#222!important;background:#fafafa!important;'
+        + 'border:1px solid #bbb!important;border-radius:6px!important;box-sizing:border-box!important;white-space:pre-wrap!important;overflow:auto!important';
+      if (tag === 'TEXTAREA') el.placeholder = '粘贴 specs/<spec_id>/spec.json 全文';
+      else { el.contentEditable = 'true'; el.setAttribute('data-placeholder', '粘贴 specs/<spec_id>/spec.json 全文'); el.textContent = ''; }
+      box.appendChild(el);
+      return el;
+    };
+    let el = mk('TEXTAREA');
+    // 100ms 后体检：被站点 CSS 隐藏（高度为 0 / 不可见）→ 换 contenteditable div
+    setTimeout(() => {
+      if (!el.isConnected || el.offsetHeight < 10) {
+        el.remove();
+        el = mk('DIV');
+        UI.specInputMode = 'editable';
+        console.warn('[MASR] 站点样式隐藏了 textarea，已降级为 contenteditable 输入框');
+      }
+      UI.specInput = el;
+    }, 100);
+    UI.specInput = el;
+  };
+  UI.getSpecText = function () {
+    const el = UI.specInput;
+    if (!el) return '';
+    return el.tagName === 'TEXTAREA' ? el.value : el.textContent;
+  };
+
+  // 粘贴文本清洗：剥离 BOM/零宽字符；直接解析失败再尝试弯引号还原（自动修复并明确告知）
+  UI.parseSpecText = function (raw) {
+    const clean = String(raw || '')
+      .replace(/^\uFEFF/, '')
+      .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+      .trim();
+    try { return { spec: JSON.parse(clean), repaired: false }; }
+    catch (e1) {
+      const fixed = clean.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
+      const spec = JSON.parse(fixed); // 仍失败就抛原始样式错误
+      return { spec, repaired: true };
+    }
+  };
+
+  UI.renderParams = function (spec) {
+    const box = document.getElementById('masr-params');
+    box.innerHTML = '<b>② 参数</b>（datasource 自动取参 v0.2 提供，本版手填）<br>' +
+      (spec.params || []).map(p =>
+        '<div class="row"><label>' + (p.label || p.name) + ' (' + p.name + ')：</label>' +
+        '<input id="masr-p-' + p.name + '" placeholder="' + (p.description || '') + '"></div>').join('') || '<i>无参数</i>';
+  };
+
+  UI.renderSelfCheck = function () {
+    const sc = document.getElementById('masr-selfcheck');
+    const items = [];
+    items.push(['TM 存储', typeof GM_getValue === 'function' ? 'ok' : '缺失']);
+    items.push(['页面 origin', location.origin]);
+    const spec = UI.spec;
+    const varNames = spec ? Object.keys(spec.vars || {}) : [];
+    for (const n of varNames) {
+      const def = spec.vars[n];
+      const present = !!ENGINE.readCookie(document.cookie, def.name);
+      items.push(['cookie ' + def.name, present ? '在位' : '不在位（该域下无此 cookie）']);
+    }
+    const st = RunState.get();
+    items.push(['续跑状态', st ? ('存在：' + st.phase + ' @' + (st.navStepId || '')) : '无']);
+    sc.innerHTML = '<b>自检</b>：' + items.map(([k, v]) =>
+      '<span style="margin-right:12px">' + k + '=<b class="' + (/ok|在位/.test(v) ? 'ok' : 'warn') + '">' + v + '</b></span>').join('');
+  };
+
+  // 持久化日志：GM 跨页存储，页面跳转/刷新后仍可追溯（v0.1.9）
+  const LogStore = {
+    KEY: 'masr_logs_v1',
+    MAX: 300, // 环形上限，超出淘汰最旧
+    get() {
+      try { return JSON.parse(GM_getValue(LogStore.KEY, '[]')) || []; }
+      catch (e) { return []; }
+    },
+    push(entry) {
+      const arr = LogStore.get();
+      arr.push({ t: entry.t, level: entry.level, msg: String(entry.msg).slice(0, 2000) });
+      while (arr.length > LogStore.MAX) arr.shift();
+      try { GM_setValue(LogStore.KEY, JSON.stringify(arr)); } catch (e) { /* 存储失败不阻断执行 */ }
+    },
+    clear() { try { GM_deleteValue(LogStore.KEY); } catch (e) {} }
+  };
+
+  UI.renderLogEntry = function (entry) {
+    const el = document.getElementById('masr-log');
+    if (!el) return;
+    const cls = entry.level === 'fatal' ? 'fatal' : entry.level === 'warn' ? 'warn' : entry.level === 'ok' ? 'ok' : '';
+    el.innerHTML += '<span class="' + cls + '">[' + new Date(entry.t).toLocaleTimeString() + '] ' + entry.msg + '</span>\n';
+    el.scrollTop = el.scrollHeight;
+  };
+
+  UI.appendLog = function (entry) {
+    LogStore.push(entry);
+    UI.renderLogEntry(entry);
+  };
+
+  UI.replayPersistedLogs = function () {
+    const el = document.getElementById('masr-log');
+    if (!el) return;
+    const history = LogStore.get();
+    if (!history.length) return;
+    history.forEach(UI.renderLogEntry);
+    // 分隔线：标记历史与本次页面会话的边界（不入存储）
+    const sep = document.createElement('div');
+    sep.style.cssText = 'color:#7a8aa0;border-top:1px dashed #7a8aa0;margin:6px 0;padding-top:4px';
+    sep.textContent = '───── 以上为历史日志（跨页保留）｜本页：' + location.pathname.slice(0, 60) + ' ─────';
+    el.appendChild(sep);
+    el.scrollTop = el.scrollHeight;
+  };
+
+  UI.clearLogs = function () {
+    LogStore.clear();
+    const el = document.getElementById('masr-log');
+    if (el) el.innerHTML = '';
+    UI.appendLog({ t: Date.now(), level: 'warn', msg: '日志已清空' });
+  };
+
+  // ---------- 自更新：显式「检查更新」（油猴自身也会按 @updateURL 静默更新，这里是可见入口 + 版本提示） ----------
+  function cmpVer(a, b) {
+    const pa = String(a || '0').split('.').map(n => parseInt(n, 10) || 0);
+    const pb = String(b || '0').split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const x = pa[i] || 0, y = pb[i] || 0;
+      if (x !== y) return x > y ? 1 : -1;
+    }
+    return 0;
+  }
+  UI.checkUpdate = async function () {
+    const out = document.getElementById('masr-update-out');
+    out.textContent = '检查中…';
+    let lastErr = '';
+    for (const url of GV.UPDATE_MANIFEST) {
+      try {
+        const res = await gmFetch(url, { method: 'GET' });
+        if (res.status !== 200) { lastErr = 'HTTP ' + res.status; continue; }
+        const m = JSON.parse(res.text);
+        if (cmpVer(m.version, GV.RUNNER_VERSION) > 0) {
+          out.innerHTML = '<span style="color:#1a7f43">发现新版本 v' + m.version + ' → </span>' +
+            '<a href="' + (m.install_url || GV.INSTALL_URL) + '" target="_blank" style="color:#0b6cd4">点此更新</a>';
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: '发现新版本 Runner v' + m.version + '（当前 v' + GV.RUNNER_VERSION + '）：' + (m.notes || '') });
+        } else {
+          out.innerHTML = '<span style="color:#666">已是最新 v' + GV.RUNNER_VERSION + '</span>';
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + GV.RUNNER_VERSION });
+        }
+        return;
+      } catch (e) { lastErr = e.message; }
+    }
+    out.innerHTML = '<span style="color:#b00">检查失败</span>';
+    UI.appendLog({ t: Date.now(), level: 'warn', msg: '更新检查失败（' + lastErr + '）——不影响使用，可稍后重试或手动到仓库安装' });
+  };
+  UI.renderSteps = function (spec) {
+    const el = document.getElementById('masr-steps');
+    el.innerHTML = '<table><tr><th>#</th><th>步骤</th><th>mode</th><th>状态</th></tr>' +
+      spec.steps.map((s, i) =>
+        '<tr><td>S' + (i + 1) + '</td><td>' + (s.name || s.id) + '</td><td>' + s.mode + '</td><td id="masr-step-' + s.id + '">待执行</td></tr>').join('') +
+      '</table>';
+  };
+  UI.markStep = function (stepId, phase) {
+    const el = document.getElementById('masr-step-' + stepId);
+    if (!el) return;
+    const map = { running: '⏳ running', requesting: '→ 请求中', navigating: '→ 导航中', passed: '✓ 通过', failed: '✗ 失败' };
+    el.textContent = map[phase] || phase;
+    el.style.color = phase === 'passed' ? '#1a7f43' : phase === 'failed' ? '#c22' : '#555';
+  };
+
+  UI.setSpecBadge = function (spec) {
+    const badge = document.getElementById('masr-spec-badge');
+    badge.innerHTML = spec.spec_id + ' v' + spec.version +
+      ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
+      ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
+  };
+
+  // 回放跳转前已完成的步骤（恢复日志可见性）
+  UI.replayStepLogs = function (stepLogs) {
+    (stepLogs || []).forEach(s => {
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: s.id + ' ✓（跳转前已完成）' + (s.name || '') +
+        '，断言 ' + ((s.assertResults || []).length) + ' 条' + (s.extract ? '，抽取: ' + Object.keys(s.extract).join(', ') : '') });
+      UI.markStep(s.id, 'passed');
+    });
+  };
+
+  UI.doRun = async function () {
+    // 续跑优先：落地页上 spec/参数从运行态恢复，不要求本页先粘贴 spec
+    const st0 = RunState.get();
+    const resuming = !!(st0 && st0.phase === 'await_nav_check');
+    let spec, params;
+    if (resuming) {
+      try { spec = JSON.parse(st0.specJson); }
+      catch (e) { alert('续跑状态损坏，已清除：' + e.message); RunState.clear(); return; }
+      params = st0.params || {};
+    } else {
+      if (!UI.spec) { alert('请先加载 spec'); return; }
+      spec = UI.spec;
+      params = {};
+      for (const p of spec.params || []) {
+        const el = document.getElementById('masr-p-' + p.name);
+        const v = el ? el.value.trim() : '';
+        if (p.required && !v) { alert('必填参数: ' + (p.label || p.name)); return; }
+        if (v) params[p.name] = v;
+      }
+      // 角色标记：发起页（通常为代理页）永不自毁，负责展示最终结果
+      try { sessionStorage.setItem('masrRole', 'origin'); } catch (e) {}
+    }
+    UI.spec = spec;
+    UI.setSpecBadge(spec);
+    document.getElementById('masr-log').innerHTML = '';
+    UI.renderSteps(spec);
+    if (resuming) {
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 续跑模式：从运行态恢复（' + st0.navStepId + ' 之后）===' });
+      UI.replayStepLogs(st0.stepLogs);
+    } else {
+      // 运行态初始化（供 navigate 续跑恢复用）
+      RunState.set({
+        phase: 'running', specId: spec.spec_id, specVersion: spec.version,
+        specJson: JSON.stringify(spec), params, log: [], startedAt: Date.now(),
+        runnerVersion: GV.RUNNER_VERSION,
+      });
+    }
+    const hooks = { onLog: UI.appendLog, onStep: UI.markStep };
+    try {
+      let result;
+      if (resuming) result = await resumeAfterNavigate(spec, params);
+      else result = await runSpec(spec, params, hooks);
+      UI.lastResult = result;
+      if (result.navInitiated) {
+        const tip = result.openedTab
+          ? '=== ' + result.stepId + ' 已在新标签页打开。落地页会自动续跑（约 2.5 秒），若未自动续跑再切过去点「执行」 ==='
+          : '=== ' + result.stepId + ' 导航已发起。落地页会自动续跑（约 2.5 秒），本页无需操作 ===';
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: tip });
+        document.getElementById('masr-result').innerHTML = result.openedTab
+          ? '<b style="color:#b8860b">⏳ 新标签页已打开</b>：落地后自动续跑，全部跑完辅助标签页会自动关闭、结果回到本页。'
+          : '<b style="color:#b8860b">⏳ 等待导航落地</b>：落地后自动续跑；若 8 秒后未自动续跑，切到落地页点「执行」。';
+      } else {
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 执行完成 ===' });
+        renderOutputs(result.outputs || {});
+        // 广播最终结果：辅助标签页自毁，发起页弹窗展示
+        const role = (function(){ try { return sessionStorage.getItem('masrRole') || ''; } catch (e) { return ''; } })();
+        const stc = RunState.get() || {};
+        stc.phase = 'done';
+        stc.final = { ok: true, outputs: result.outputs || {}, at: Date.now(), specId: spec.spec_id };
+        RunState.set(stc);
+        if (role !== 'origin') {
+          UI.appendLog({ t: Date.now(), level: 'info', msg: '⏪ 本页为辅助标签页，2 秒后自动关闭；结果将回到发起页展示' });
+          setTimeout(function () { try { window.close(); } catch (e) {} }, 2000);
+        }
+      }
+      console.log('[MASR] result =', result); // 本地调试用，不入表格
+    } catch (e) {
+      const code = e.code || 'E_UNKNOWN';
+      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '=== 终止: [' + code + '] ' + e.message + ' ===' });
+      UI.lastResult = { ok: false, error: code, message: e.message };
+      // 失败也广播（发起页能看到）；但辅助页不自毁，保留现场供排查
+      try {
+        const role = sessionStorage.getItem('masrRole') || '';
+        const stc = RunState.get() || {};
+        if (stc.phase) {
+          stc.phase = 'done';
+          stc.final = { ok: false, error: code, message: e.message, at: Date.now() };
+          if (role === 'origin') stc.final.consumed = true; // 本页直接展示过，不再重复
+          RunState.set(stc);
+        }
+      } catch (e2) {}
+    } finally {
+      const st = RunState.get();
+      if (st && st.phase === 'running') RunState.clear();
+      UI.renderSelfCheck();
+    }
+  };
+
+  function renderOutputs(outputs) {
+    const rEl = document.getElementById('masr-result');
+    rEl.innerHTML = '<b>outputs</b>（导出 JSON 可见完整值；下表已脱敏）<table>' +
+      Object.keys(outputs || {}).map(k =>
+        '<tr><td>' + k + '</td><td>' + ENGINE.maskValue(outputs[k]) + '</td></tr>').join('') + '</table>';
+  }
+
+  /* ==================== 启动 ==================== */
+
+  function boot() {
+    UI.mount();
+    UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
+    const st = RunState.get();
+    if (st && st.phase === 'await_nav_check') {
+      UI.replayStepLogs(st.stepLogs);
+      // 自动续跑条件：①状态新鲜（10 分钟内）②当前页 URL 匹配本步 expect——避免在错误的标签页上误启动
+      const fresh = Date.now() - (st.navAt || 0) < 10 * 60 * 1000;
+      const urlOk = !st.navExpect || !st.navExpect.url_contains ||
+                    location.href.indexOf(st.navExpect.url_contains) >= 0;
+      if (fresh && urlOk) {
+        try { sessionStorage.setItem('masrRole', 'helper'); } catch (e) {}
+        UI.appendLog({ t: Date.now(), level: 'info', msg: '⏩ ' + st.navStepId + ' 落地校验已排队：2.5 秒后自动续跑（无需点击）' });
+        setTimeout(function () { UI.doRun(); }, 2500);
+      } else {
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到未完成的导航续跑（' + st.navStepId + '）：本页不匹配落地条件或状态过旧，点「执行」手动校验' });
+      }
+      console.log('[MASR] await_nav_check:', st.navStepId, 'expect=', st.navExpect, 'auto=', fresh && urlOk);
+    }
+    // 发起页轮询：接收其他标签页广播的最终结果；辅助页收到后自毁（兜底，主路径见 doRun）
+    setInterval(function () {
+      let s, role;
+      try { s = RunState.get(); role = sessionStorage.getItem('masrRole') || ''; } catch (e) { return; }
+      if (!s || !s.final || s.final.consumed) return;
+      if (role === 'origin') {
+        s.final.consumed = true; RunState.set(s);
+        if (s.final.ok) {
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 流程完成（辅助标签页已自动关闭，结果已回到本页）===' });
+          renderOutputs(s.final.outputs || {});
+        } else {
+          UI.appendLog({ t: Date.now(), level: 'fatal', msg: '=== 流程在某个后续页面终止: [' + (s.final.error || 'E_UNKNOWN') + '] ' + (s.final.message || '') + ' ===' });
+        }
+        setTimeout(function () { RunState.clear(); }, 1500);
+      } else if (role && Date.now() - s.final.at < 5 * 60 * 1000) {
+        // 辅助页/中转页：结果已广播，安全关闭（仅对脚本打开的标签页有效）
+        try { window.close(); } catch (e) {}
+      }
+    }, 1500);
+  }
+
+  // 暴露引擎给测试与控制台（不影响页面）
+  try { (unsafeWindow || window).__MASR_TEST__ = ENGINE; } catch (e) { window.__MASR_TEST__ = ENGINE; }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+
+  window.__MASR_BOOT__ = boot;
+})();
