@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.21
+// @version      0.2.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -20,6 +20,7 @@
 // @connect      cdn.jsdelivr.net
 // @connect      open.feishu.cn
 // @connect      accounts.feishu.cn
+// @connect      *
 // @connect      self
 // @run-at       document-start
 // ==/UserScript==
@@ -292,7 +293,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.21',
+    RUNNER_VERSION: '0.2.0',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -1183,6 +1184,7 @@
         <span id="masr-spec-badge"></span>
       </h3>
       <div class="row" id="masr-selfcheck"></div>
+      <div class="row" id="masr-tasks" style="border:1px solid #d6e4ff;background:#f7faff;border-radius:8px;padding:6px 8px"></div>
       <div class="row" id="masr-feishu" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
       <div class="row" id="masr-spec-box"><b>① 粘贴 spec.json（dev 模式）</b><br></div>
       <div class="row">
@@ -1315,6 +1317,172 @@
       return { spec, repaired: true };
     }
   };
+
+  /* ==================== 任务服务（v0.2 主路径） ====================
+   * 业务同学的飞书账号都是外部号，进不了自建应用可用范围 → 客户端拿不到 user_access_token。
+   * 改为：身份留在服务端（应用身份代持），客户端只持一个可撤销的「接入码」。
+   * 端点据接入码识别是谁，并强制只返回/只允许改 创建人 = 本人的行。
+   */
+  const SVC = {
+    B_KEY: 'masr_svc_base_v1',
+    C_KEY: 'masr_svc_code_v1',
+    M_KEY: 'masr_svc_me_v1',
+    SPEC_SCRIPT: 'huawei_ads_get_key',
+  };
+  SVC.base = function () { return String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, ''); };
+  SVC.code = function () { return String(GM_getValue(SVC.C_KEY, '') || ''); };
+  SVC.me = function () { try { return JSON.parse(GM_getValue(SVC.M_KEY, 'null')); } catch (e) { return null; } };
+
+  SVC.call = function (method, path, query, body) {
+    const base = SVC.base();
+    if (!base) return Promise.reject(new Error('E_SVC 还没填服务地址'));
+    let url = base + path;
+    const q = query || {};
+    const ks = Object.keys(q);
+    if (ks.length) url += '?' + ks.map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(q[k]); }).join('&');
+    return new Promise(function (resolve, reject) {
+      GM_xmlhttpRequest({
+        method: method,
+        url: url,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mas-code': SVC.code() },
+        data: body ? JSON.stringify(body) : null,
+        timeout: 20000,
+        onload: function (r) {
+          let j = {};
+          try { j = JSON.parse(r.responseText || '{}'); } catch (e) { return reject(new Error('E_SVC_PARSE http=' + r.status)); }
+          if (r.status >= 400 || j.ok === false) return reject(new Error(j.error || ('E_SVC ' + r.status)));
+          resolve(j);
+        },
+        onerror: function () { reject(new Error('E_SVC_NET ' + url)); },
+        ontimeout: function () { reject(new Error('E_SVC_TIMEOUT ' + url)); },
+      });
+    });
+  };
+
+  SVC.bind = async function () {
+    const j = await SVC.call('GET', '/me');
+    GM_setValue(SVC.M_KEY, JSON.stringify(j.me));
+    return j.me;
+  };
+  SVC.tasks = function () { return SVC.call('GET', '/tasks', { limit: 50 }); };
+  SVC.spec = function () { return SVC.call('GET', '/spec', { script_id: SVC.SPEC_SCRIPT }); };
+  SVC.writeResult = function (payload) { return SVC.call('POST', '/result', null, payload); };
+
+  /* ---------- 任务面板 ---------- */
+  UI.currentTask = null;
+
+  UI.renderTasks = function () {
+    const box = document.getElementById('masr-tasks');
+    if (!box) return;
+    const me = SVC.me();
+    const base = SVC.base();
+
+    if (!base || !SVC.code()) {
+      box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未连接</span>' +
+        '<div style="margin-top:4px;font-size:11px;color:#8f959e">首次使用：填入服务地址和属你个人的接入码（向管理员索取）</div>' +
+        '<div class="row"><input id="masr-svc-base" placeholder="https://..." value="" style="width:250px"> ' +
+        '<input id="masr-svc-code" placeholder="接入码" style="width:130px"> ' +
+        '<button class="primary" id="masr-svc-save">连接</button></div>' +
+        '<div id="masr-task-out" style="font-size:11px;color:#8f959e"></div>';
+      const out = document.getElementById('masr-task-out');
+      document.getElementById('masr-svc-save').addEventListener('click', async function () {
+        const b = document.getElementById('masr-svc-base').value.trim();
+        const c = document.getElementById('masr-svc-code').value.trim();
+        if (!b || !c) { out.textContent = '服务地址和接入码都要填'; return; }
+        GM_setValue(SVC.B_KEY, b); GM_setValue(SVC.C_KEY, c);
+        out.textContent = '正在验证接入码…';
+        try {
+          const m = await SVC.bind();
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '已连接任务服务：' + m.name });
+          UI.renderTasks();
+        } catch (e) {
+          out.textContent = e.message;
+        }
+      });
+      return;
+    }
+
+    if (!me) {
+      box.innerHTML = '<b>任务</b> <span style="color:#c02a2a">接入码无效或已撤销</span>' +
+        '<div class="row"><button id="masr-svc-reset">重新填写</button>' +
+        '<button id="masr-svc-rebind">重试连接</button></div><div id="masr-task-out" style="font-size:11px"></div>';
+      document.getElementById('masr-svc-reset').addEventListener('click', function () {
+        GM_deleteValue(SVC.B_KEY); GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); UI.renderTasks();
+      });
+      document.getElementById('masr-svc-rebind').addEventListener('click', async function () {
+        try { await SVC.bind(); UI.renderTasks(); }
+        catch (e) { document.getElementById('masr-task-out').textContent = e.message; }
+      });
+      return;
+    }
+
+    box.innerHTML = '<b>任务</b> <span style="color:#1a7f45">已连接：' + me.name + '</span>' +
+      ' <button class="primary" id="masr-task-pull">拉我的待办</button>' +
+      ' <button id="masr-task-unbind">断开</button>' +
+      '<div id="masr-task-list" style="margin-top:4px"></div>';
+
+    document.getElementById('masr-task-unbind').addEventListener('click', function () {
+      GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); UI.renderTasks();
+    });
+    document.getElementById('masr-task-pull').addEventListener('click', async function () {
+      const list = document.getElementById('masr-task-list');
+      list.innerHTML = '<span style="font-size:11px;color:#8f959e">正在查询…</span>';
+      try {
+        const j = await SVC.tasks();
+        if (!j.total) {
+          list.innerHTML = '<div style="font-size:11px;color:#8f959e">没有待处理的记录（状态为空 + 账户ID非空 + 创建人是你）</div>';
+          return;
+        }
+        list.innerHTML = '<div style="font-size:11px;color:#8f959e">共 ' + j.total + ' 条待办，点「执行」自动载入 spec 并带上账户ID</div>' +
+          '<table><tr><th>账户ID</th><th>名称</th><th>客户</th><th></th></tr>' +
+          j.items.map(function (t, i) {
+            return '<tr><td>' + (t.account_id || '-') + '</td><td>' + (t.account_name || '-') + '</td>' +
+              '<td>' + (t.client || '-') + '</td><td><button data-idx="' + i + '">执行</button></td></tr>';
+          }).join('') + '</table>';
+        list.querySelectorAll('button[data-idx]').forEach(function (b) {
+          b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))]); });
+        });
+      } catch (e) {
+        list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + e.message + '</div>';
+      }
+    });
+  };
+
+  // 点一条待办：拉 active spec → 自动填账户ID → 提示点执行
+  UI.runTask = async function (task) {
+    try {
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：账户 ' + (task.account_id || '') + '（' + task.record_id + '）' });
+      const s = await SVC.spec();
+      UI.currentTask = { record_id: task.record_id, account_id: task.account_id };
+      UI.applySpec(JSON.stringify(s.spec), { persist: true });
+      const el = document.getElementById('masr-p-corp_id');
+      if (el) el.value = task.account_id || '';
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '已载入 spec v' + s.version + '，参数已带入；点「执行」开始（跑完自动回写这条记录）' });
+    } catch (e) {
+      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '载入任务失败：' + e.message });
+    }
+  };
+
+  // 执行完成 → 回写飞书（按 record_id 更新，服务端二次校验归属）
+  async function pushTaskResult(st, ok, outputs, err) {
+    const task = st && st.task;
+    if (!task || !task.record_id) return;
+    const payload = {
+      record_id: task.record_id,
+      ok: !!ok,
+      elapsed_ms: Date.now() - (st.startedAt || Date.now()),
+      runner_version: GV.RUNNER_VERSION,
+      spec_version: st.specVersion || '',
+    };
+    if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
+    else payload.error_type = (err && err.code) || 'E_UNKNOWN';
+    try {
+      await SVC.writeResult(payload);
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') });
+    } catch (e) {
+      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 回写飞书失败：' + e.message + '（结果仍在本面板可复制/导出）' });
+    }
+  }
 
   /* ---------- 飞书登录区块（v0.1.17） ---------- */
   UI.renderFeishu = function () {
@@ -1645,6 +1813,7 @@
         phase: 'running', specId: spec.spec_id, specVersion: spec.version,
         specJson: JSON.stringify(spec), params, log: [], startedAt: Date.now(),
         runnerVersion: GV.RUNNER_VERSION,
+        task: UI.currentTask || null,
       });
     }
     const hooks = { onLog: UI.appendLog, onStep: UI.markStep };
@@ -1711,6 +1880,7 @@
     // 飞书域只做一件事：接住 OAuth 回调（code 在 URL 上）。不挂 UI、不动页面。
     if (fsIsFeishuHost()) { fsCallbackWatch(); return; }
     UI.mount();
+    UI.renderTasks();
     UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
     // 自动恢复上次加载的 spec 与参数：刷新、跳转落地、新标签页都不用重新粘贴
     try {
@@ -1748,6 +1918,11 @@
           renderOutputs(s.final.outputs || {});
         } else {
           UI.appendLog({ t: Date.now(), level: 'fatal', msg: '=== 流程在某个后续页面终止: [' + (s.final.error || 'E_UNKNOWN') + '] ' + (s.final.message || '') + ' ===' });
+        }
+        // 回写飞书（只有带任务上下文时才写；服务端会再校验归属）
+        if (!s.final.written) {
+          s.final.written = true; RunState.set(s);
+          pushTaskResult(s, s.final.ok, s.final.outputs, { code: s.final.error, message: s.final.message });
         }
         setTimeout(function () { RunState.clear(); }, 1500);
       } else if (role && Date.now() - s.final.at < 5 * 60 * 1000) {

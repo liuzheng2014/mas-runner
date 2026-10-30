@@ -1,13 +1,13 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.1.21",
+  "version": "0.2.0",
   "file": "mas-runner.user.js",
-  "sha256": "e28e27e975800df5576d543004f5d8d8f5d83731210c942db4e006e504d7f012",
-  "bytes": 92204,
-  "published_at": "2026-10-30T19:35:41+08:00",
+  "sha256": "f9903d065f1b025ec4aec68b769a211692dedd7e8846e0ebfdaf9e96b6281f67",
+  "bytes": 101470,
+  "published_at": "2026-10-30T20:12:42+08:00",
   "install_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "runner v0.1.21: callback watch only when pending auth exists (zero footprint on normal Feishu pages), explicit no-code diagnostic"
+  "notes": "runner v0.2.0: 任务面板接入转发端点（服务地址+接入码）→ 拉我的待办 → 点一条自动载 spec 带参 → 执行完成自动回写飞书"
 }
