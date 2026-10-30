@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.20
+// @version      0.1.21
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -292,7 +292,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.20',
+    RUNNER_VERSION: '0.1.21',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -600,6 +600,9 @@
   // 只在这一个页面做回调接收：轮询 30 秒，拿到 code 就办一次
   function fsCallbackWatch() {
     let done = false;
+    const hasPending = function () {
+      try { return !!JSON.parse(GM_getValue(FS.P_KEY, 'null')); } catch (e) { return false; }
+    };
     const tick = function () {
       if (done) return;
       const hit = fsUrlCode();
@@ -608,8 +611,21 @@
       fsHandleCallback(hit.code, hit.state);
     };
     tick();
+    if (done) return;
+    // 普通飞书页面（没有 code、本地也没有待完成的授权）→ 不轮询、不留痕
+    if (!hasPending()) return;
     let n = 0;
-    const iv = setInterval(function () { n++; tick(); if (done || n > 150) clearInterval(iv); }, 200);
+    const iv = setInterval(function () {
+      n++;
+      tick();
+      if (done) { clearInterval(iv); return; }
+      if (n > 150) {
+        clearInterval(iv);
+        fsBanner('⚠️ 没有拿到授权码',
+          '回调页地址上没找到 <code>code</code> 参数（可能被页面路由清掉了）。<br>' +
+          '请把地址栏整条 URL 复制给维护者，或在 Runner 面板点「重新登录」再试一次。', 'err');
+      }
+    }, 200);
   }
 
   // 统一的 OpenAPI 调用（Bearer）
