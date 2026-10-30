@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.1.14
+// @version      0.1.15
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -60,6 +60,10 @@
  *     公开分发仓库 liuzheng2014/mas-runner（油猴静默自动更新）；面板加「检查更新」按钮，
  *     拉 manifest.json 比对版本并给更新链接（raw 主通道 + jsDelivr 备用）；active spec
  *     的执行按钮不再显示 draft→dry_run 字样
+ *
+ *   - v0.1.15：spec 与参数自动记忆——上次加载的 spec 原文存 GM，页面刷新/跳转落地/新标签页
+ *     打开时自动恢复（粘贴框、badge、参数表都回来），参数按 spec_id 记住上次填的值并回填；
+ *     恢复走静默路径（不往跨页日志灌噪音），加载失败也不阻断手动粘贴
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -278,8 +282,10 @@
     RUN_KEY: 'masr_run_v1',          // 运行态（跨页续跑）
     CACHE_KEY: 'masr_cache_v1',      // 步骤缓存
     TRANSPORT_KEY: 'masr_transport', // 通道探测结论（fetch / gm）
+    LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
+    LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.1.14',
+    RUNNER_VERSION: '0.1.15',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -822,19 +828,7 @@
     ball.addEventListener('click', () => { panel.style.display = panel.style.display === 'block' ? 'none' : 'block'; if (panel.style.display === 'block') UI.renderSelfCheck(); });
 
     document.getElementById('masr-load').addEventListener('click', () => {
-      try {
-        const { spec, repaired } = UI.parseSpecText(UI.getSpecText());
-        validateSpecShape(spec);
-        UI.spec = spec;
-        const badge = document.getElementById('masr-spec-badge');
-        badge.innerHTML = spec.spec_id + ' v' + spec.version +
-          ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
-          ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
-        UI.renderParams(spec);
-        document.getElementById('masr-run').textContent = spec.status === 'active' ? '执行' : '执行（draft → dry_run）';
-        UI.appendLog({ t: Date.now(), level: 'ok', msg: 'spec 已加载: ' + spec.spec_id + ' v' + spec.version + '，' + spec.steps.length + ' 步' });
-        if (repaired) UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到弯引号等脏字符，已自动修复——但建议以后先粘到记事本再复制过来，保证与 git 里的原文逐字节一致' });
-      } catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: 'spec 加载失败: ' + e.message }); }
+      UI.applySpec(UI.getSpecText(), {});
     });
     document.getElementById('masr-hash').addEventListener('click', async () => {
       const txt = UI.getSpecText();
@@ -884,10 +878,19 @@
         el = mk('DIV');
         UI.specInputMode = 'editable';
         console.warn('[MASR] 站点样式隐藏了 textarea，已降级为 contenteditable 输入框');
+        UI.specInput = el;
+        UI.restoreSpecText(); // 降级替换后把记忆的 spec 文本重新填回去
       }
       UI.specInput = el;
     }, 100);
     UI.specInput = el;
+  };
+  // 把「上次加载的 spec 原文」回填到粘贴框（刷新/降级换框后都能看到同一份内容）
+  UI.restoreSpecText = function () {
+    const t = GM_getValue(GV.LAST_SPEC_KEY, '');
+    const el = UI.specInput;
+    if (!t || !el) return;
+    if (el.tagName === 'TEXTAREA') el.value = t; else el.textContent = t;
   };
   UI.getSpecText = function () {
     const el = UI.specInput;
@@ -911,10 +914,50 @@
 
   UI.renderParams = function (spec) {
     const box = document.getElementById('masr-params');
-    box.innerHTML = '<b>② 参数</b>（datasource 自动取参 v0.2 提供，本版手填）<br>' +
+    const last = UI.lastParamsFor(spec.spec_id);
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    box.innerHTML = '<b>② 参数</b>（datasource 自动取参 v0.2 提供，本版手填；上次填的值会自动回填）<br>' +
       (spec.params || []).map(p =>
         '<div class="row"><label>' + (p.label || p.name) + ' (' + p.name + ')：</label>' +
-        '<input id="masr-p-' + p.name + '" placeholder="' + (p.description || '') + '"></div>').join('') || '<i>无参数</i>';
+        '<input id="masr-p-' + p.name + '" value="' + esc(last[p.name]) + '" placeholder="' + esc(p.description || '') + '"></div>').join('') || '<i>无参数</i>';
+  };
+
+  // 参数记忆：按 spec_id 存最近一次填写的值（业务同学天天跑同一子客，不用每次重敲）
+  UI.lastParamsFor = function (specId) {
+    try { return JSON.parse(GM_getValue(GV.LAST_PARAMS_KEY, '{}'))[specId] || {}; } catch (e) { return {}; }
+  };
+  UI.saveParams = function (specId, params) {
+    try {
+      const all = JSON.parse(GM_getValue(GV.LAST_PARAMS_KEY, '{}'));
+      all[specId] = params;
+      GM_setValue(GV.LAST_PARAMS_KEY, JSON.stringify(all));
+    } catch (e) { /* 记忆失败不影响执行 */ }
+  };
+
+  // spec 加载：抽取为公共函数，供「加载 spec」按钮与启动时自动恢复共用
+  UI.applySpec = function (text, opts) {
+    opts = opts || {};
+    try {
+      const { spec, repaired } = UI.parseSpecText(text);
+      validateSpecShape(spec);
+      UI.spec = spec;
+      if (opts.persist !== false) GM_setValue(GV.LAST_SPEC_KEY, text);
+      const badge = document.getElementById('masr-spec-badge');
+      badge.innerHTML = spec.spec_id + ' v' + spec.version +
+        ' <span class="masr-tag" style="background:' + (spec.status === 'active' ? '#e2f4e8;color:#1a7f43' : '#fff3d6;color:#8a6d1a') + '">' + spec.status + '</span>' +
+        ' <span class="masr-tag" style="background:#eee">owner ' + (spec.owner || '?') + '</span>';
+      UI.renderParams(spec);
+      document.getElementById('masr-run').textContent = spec.status === 'active' ? '执行' : '执行（draft → dry_run）';
+      // 自动恢复（fromStore）静默处理：只更新 badge/参数表，不往跨页日志里灌噪音
+      if (!opts.fromStore) {
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: 'spec 已加载: ' + spec.spec_id + ' v' + spec.version + '，' + spec.steps.length + ' 步' });
+      }
+      if (repaired) UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到弯引号等脏字符，已自动修复——但建议以后先粘到记事本再复制过来，保证与 git 里的原文逐字节一致' });
+      return true;
+    } catch (e) {
+      if (!opts.fromStore) UI.appendLog({ t: Date.now(), level: 'fatal', msg: 'spec 加载失败: ' + e.message });
+      return false;
+    }
   };
 
   UI.renderSelfCheck = function () {
@@ -1069,6 +1112,7 @@
         if (p.required && !v) { alert('必填参数: ' + (p.label || p.name)); return; }
         if (v) params[p.name] = v;
       }
+      UI.saveParams(spec.spec_id, params); // 记住这次填的值，下次自动回填
       // 角色标记：发起页（通常为代理页）永不自毁，负责展示最终结果
       try { sessionStorage.setItem('masrRole', 'origin'); } catch (e) {}
     }
@@ -1150,6 +1194,14 @@
   function boot() {
     UI.mount();
     UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
+    // 自动恢复上次加载的 spec 与参数：刷新、跳转落地、新标签页都不用重新粘贴
+    try {
+      const lastSpec = GM_getValue(GV.LAST_SPEC_KEY, '');
+      if (lastSpec) {
+        UI.applySpec(lastSpec, { fromStore: true, persist: false });
+        if (UI.spec) UI.restoreSpecText();
+      }
+    } catch (e) { /* 恢复失败不影响手动粘贴 */ }
     const st = RunState.get();
     if (st && st.phase === 'await_nav_check') {
       UI.replayStepLogs(st.stepLogs);
