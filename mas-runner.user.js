@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.2.5
+// @version      0.4.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -293,7 +293,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.2.5',
+    RUNNER_VERSION: '0.4.0',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -1318,6 +1318,460 @@
     }
   };
 
+  /* ==================== 直连模式（v0.4：Runner 自己调飞书开放 API） ====================
+   * 目标：不依赖任何后端，也能「拉任务 → 执行 → 回写」跑通。
+   *
+   * 凭证不再明文/混淆放在脚本里，而是 AES-256-GCM 密文（下面 ENC）。
+   * 解它的钥匙由 PKDF2-SHA256(口令, 60 万轮) 现场派生 —— 口令不在脚本里，
+   * 由管理员私下发放，脚本首次使用时人工输入一次。
+   *
+   * 这道防线拦得住什么：脚本公开挂在网上 = 只泄露一段密文，没有口令打不开。
+   * 拦不住什么：拿到口令的人（也就是所有正式使用者）能解出 app_secret；
+   *   口令若太弱，拿到密文的人可以离线穷举。所以口令必须够长（≥16 位随机）。
+   * 真要「连使用者都碰不到密钥」，只有服务端代持一条路（面板填服务地址即可切换）。
+   *
+   * 切回服务端：面板里填上服务地址即可 —— SVC.mode() 变成 'svc'，本模块不再被调用。
+   */
+  const ENC = {
+    v: 1,
+    kdf: 'PBKDF2-SHA256',
+    iter: 600000,
+    salt: '/uh49taz9B3WjbOsxjHymw==',
+    iv: 'NH9L7UajUnCrkMo0',
+    ct: 'bcfMO7KlPEVBJZaoDSeaCfeE4ctE5/BndwT2ok3cuzGDE8Yi5K417EzMSRT4ZKi24b+Ya61R5Dpi/mrDP8Kj9bwk7wdYL42A2LVyXKhEhntpF30BNlk=',
+  };
+  const KEK_KEY = 'masr_kek_v1';   // 派生出来的钥匙（base64），存了就不用每次输口令
+  const CRED_KEY = 'masr_cred_v1'; // 解出来的凭证，仅本次会话内存使用
+
+  function b64ToBytes(s) {
+    const bin = atob(String(s || ''));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function bytesToB64(u) {
+    let s = '';
+    for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
+    return btoa(s);
+  }
+
+  async function deriveKek(pass, salt, iter) {
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: salt, iterations: iter, hash: 'SHA-256' },
+      base, { name: 'AES-GCM', length: 256 }, true, ['decrypt']
+    );
+  }
+
+  // AES-GCM 的认证标签会替我验口令：口令错 → 直接抛 OperationError
+  async function openWith(kek) {
+    const buf = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: b64ToBytes(ENC.iv) }, kek, b64ToBytes(ENC.ct)
+    );
+    const o = JSON.parse(new TextDecoder().decode(buf));
+    if (!o || !o.id || !o.sec) throw new Error('E_ENC_SHAPE');
+    return { id: String(o.id), sec: String(o.sec) };
+  }
+
+  const FL = {
+    API: 'https://open.feishu.cn/open-apis',
+    APP_TOKEN: 'OC2LbUsiLaRyhcse8P2cZyXintf',
+    T_TASKS: 'tblvQkpB9o2ovRiR',
+    T_SPECS: 'tblKAlQwYgLT3fys',
+    T_REG: 'tblXzPlk6NLPxsNS',
+    FORM_URL: 'https://scnzhojz10ln.feishu.cn/share/base/form/shrcn1WrOocHO5cG8cHrorhXJJe',
+    TTL_MIN: 30,
+    TOK_KEY: 'masr_fl_token_v1',
+  };
+
+  // 字段名（与服务端 mas-service.mjs 的 F 保持一致）
+  const FF = {
+    ACCOUNT_ID: '账户ID', ACCOUNT_NAME: '账户名称', CLIENT: '客户主体', STATUS: '状态',
+    SECRET: '秘钥', ERROR_TYPE: '错误类型', ELAPSED: '耗时ms',
+    RUNNER_VER: 'runner版本', SPEC_VER: 'spec版本', CREATOR: '创建人',
+    REG_NAME: '姓名', REG_DEPT: '部门', REG_CODE: '授权码', REG_DEVICE: '身份ID', REG_CREATED: '创建时间',
+  };
+  const WRITABLE = [FF.STATUS, FF.SECRET, FF.ERROR_TYPE, FF.ELAPSED, FF.RUNNER_VER, FF.SPEC_VER];
+  const ST = { OK: '获取成功', FAIL: '获取失败' };
+
+  /* --- 值归一化：文本可能是字符串 / 富文本分段数组；人员字段是 {id,name} 数组 --- */
+  function flPlain(v) {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number') return String(v);
+    if (Array.isArray(v)) {
+      return v.map(function (x) {
+        if (x == null) return '';
+        if (typeof x === 'string') return x;
+        return x.text != null ? x.text : (x.name || x.en_name || '');
+      }).join('');
+    }
+    if (typeof v === 'object') {
+      if (v.text != null) return String(v.text);
+      if (v.value != null) return flPlain(v.value);
+      return v.name || '';
+    }
+    return String(v);
+  }
+  function flPeople(v) {
+    if (!v) return [];
+    const arr = Array.isArray(v) ? v : [v];
+    return arr.map(function (x) {
+      return { open_id: (x && (x.id || x.open_id)) || '', name: (x && (x.name || x.en_name)) || '' };
+    }).filter(function (p) { return p.open_id; });
+  }
+
+  /* --- 凭证：口令解锁 → 内存缓存；没解锁就发不出任何请求 --- */
+  FL._c = null;
+  FL.lockedReason = 'need-pass'; // '' | 'need-pass' | 'bad-pass' | 'no-crypto' | 'no-blob'
+
+  FL.unlocked = function () { return !!FL._c; };
+
+  FL.unlock = async function (pass, remember) {
+    if (!ENC.salt || String(ENC.salt).indexOf('__') === 0) {
+      FL.lockedReason = 'no-blob';
+      throw new Error('E_ENC 这个构建没有内嵌凭证');
+    }
+    if (typeof crypto === 'undefined' || !crypto.subtle) {
+      FL.lockedReason = 'no-crypto';
+      throw new Error('E_CRYPTO 当前页面不支持 WebCrypto（必须 https）');
+    }
+    const salt = b64ToBytes(ENC.salt);
+    const kek = await deriveKek(pass, salt, ENC.iter);
+    let cred;
+    try {
+      cred = await openWith(kek);
+    } catch (e) {
+      FL.lockedReason = 'bad-pass';
+      throw new Error('E_PASS 口令不对');
+    }
+    FL._c = cred;
+    FL.lockedReason = '';
+    if (remember !== false) {
+      try {
+        const raw = new Uint8Array(await crypto.subtle.exportKey('raw', kek));
+        GM_setValue(KEK_KEY, bytesToB64(raw));
+      } catch (e) {}
+    }
+    return cred;
+  };
+
+  // 开机静默解锁：只有本机存过钥匙时成立（换浏览器 / 清数据 / 换口令后都会要求重输）
+  FL.boot = async function () {
+    if (FL._c) return true;
+    let saved = '';
+    try { saved = GM_getValue(KEK_KEY, ''); } catch (e) {}
+    if (!saved) { FL.lockedReason = 'need-pass'; return false; }
+    try {
+      const kek = await crypto.subtle.importKey('raw', b64ToBytes(saved), { name: 'AES-GCM' }, true, ['decrypt']);
+      FL._c = await openWith(kek);
+      FL.lockedReason = '';
+      return true;
+    } catch (e) {
+      try { GM_deleteValue(KEK_KEY); } catch (e2) {}
+      FL.lockedReason = 'need-pass';
+      return false;
+    }
+  };
+
+  // 所有走直连的调用统一从这里取凭证
+  FL.ensure = async function () {
+    if (FL._c) return FL._c;
+    if (await FL.boot()) return FL._c;
+    throw new Error('E_LOCKED 需要先输入接入口令');
+  };
+
+  // 换人用这台机器 / 口令轮换：清掉本机钥匙
+  FL.lock = function () {
+    FL._c = null; FL.lockedReason = 'need-pass';
+    try { GM_deleteValue(KEK_KEY); } catch (e) {}
+  };
+
+  FL.token = async function (force) {
+    if (!force) {
+      let c = null;
+      try { c = JSON.parse(GM_getValue(FL.TOK_KEY, 'null')); } catch (e) {}
+      if (c && c.v && Date.now() < c.exp - 120000) return c.v;
+    }
+    const cr = await FL.ensure();
+    const res = await fsHttp('POST', FL.API + '/auth/v3/tenant_access_token/internal', {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ app_id: cr.id, app_secret: cr.sec }),
+    });
+    let j = {};
+    try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FL_PARSE http=' + res.status); }
+    if (j.code !== 0 || !j.tenant_access_token) throw new Error('E_FL_TOKEN ' + j.code + ' ' + (j.msg || ''));
+    GM_setValue(FL.TOK_KEY, JSON.stringify({ v: j.tenant_access_token, exp: Date.now() + (j.expire || 3000) * 1000 }));
+    return j.tenant_access_token;
+  };
+
+  // 统一调用：token 过期（99991661/99991663）自动换一次再重试
+  FL.api = async function (method, path, body, retried) {
+    const tok = await FL.token();
+    const res = await fsHttp(method, FL.API + path, {
+      headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json; charset=utf-8' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let j = {};
+    try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FL_PARSE http=' + res.status); }
+    if (!retried && (j.code === 99991661 || j.code === 99991663)) {
+      await FL.token(true);
+      return FL.api(method, path, body, true);
+    }
+    if (j.code !== 0) {
+      if (j.code === 1254043) { const e = new Error('E_NOT_FOUND 记录不存在'); e.status = 404; throw e; }
+      throw new Error('E_FL ' + j.code + ' ' + (j.msg || '') + ' ' + String(path).split('?')[0]);
+    }
+    return j.data || {};
+  };
+
+  const flTab = function (t) { return '/bitable/v1/apps/' + FL.APP_TOKEN + '/tables/' + t; };
+  // 注意：不传 field_names —— 实测会让文本字段变成分段数组、长文本被吞
+  FL.search = function (table, filter, size, auto) {
+    return FL.api('POST', flTab(table) + '/records/search?page_size=' + (size || 50), {
+      filter: filter, automatic_fields: auto !== false,
+    });
+  };
+
+  /* 回写守卫：只认「以本人身份查询到的待办」里的 record_id。
+   * 用途是防止误传/构造 id 去改别的行 —— 线上数据只允许改自己刚查出来的那几条。
+   * 名单落 GM（最多 80 条），页面刷新后仍可回写，但永远不会扩大到你没查过的记录。
+   */
+  FL.CLAIM_KEY = 'masr_fl_claims_v1';
+  FL._mine = (function () {
+    try { return JSON.parse(GM_getValue('masr_fl_claims_v1', '{}')) || {}; } catch (e) { return {}; }
+  })();
+  FL.claim = function (recordId) {
+    if (!recordId) return;
+    FL._mine[String(recordId)] = Date.now();
+    try {
+      const ks = Object.keys(FL._mine);
+      if (ks.length > 80) ks.slice(0, ks.length - 80).forEach(function (k) { delete FL._mine[k]; });
+      GM_setValue(FL.CLAIM_KEY, JSON.stringify(FL._mine));
+    } catch (e) {}
+  };
+  FL.claimed = function (recordId) { return !!FL._mine[String(recordId || '')]; };
+
+  /* --- 设备码：本地 HMAC 签名（服务端版本用 app_secret 做同样的事，切过去无缝） --- */
+  function flB64uEncode(str) {
+    const u = new TextEncoder().encode(str);
+    let bin = '';
+    for (let i = 0; i < u.length; i++) bin += String.fromCharCode(u[i]);
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  function flB64uDecode(s) {
+    const b = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(b + '='.repeat((4 - b.length % 4) % 4));
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(u);
+  }
+  async function flHmac16(text) {
+    const enc = new TextEncoder();
+    const cr = await FL.ensure();
+    const k = await crypto.subtle.importKey('raw', enc.encode(cr.sec), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', k, enc.encode(String(text)));
+    let hex = '';
+    new Uint8Array(sig).forEach(function (b) { hex += (b < 16 ? '0' : '') + b.toString(16); });
+    return hex.slice(0, 16);
+  }
+  async function flSign(openId) { return 'd_' + flB64uEncode(String(openId)) + '.' + (await flHmac16(openId)); }
+  async function flVerify(code) {
+    const m = /^d_([A-Za-z0-9_-]+)\.([0-9a-f]{16})$/.exec(String(code || ''));
+    if (!m) return '';
+    let openId = '';
+    try { openId = flB64uDecode(m[1]); } catch (e) { return ''; }
+    if (!openId) return '';
+    return (await flHmac16(openId)) === m[2] ? openId : '';
+  }
+
+  function flIdentity(rec) {
+    const f = rec.fields || {};
+    const c = flPeople(f[FF.CREATOR])[0];
+    if (!c) return null;
+    return {
+      name: flPlain(f[FF.REG_NAME]) || c.name,
+      open_id: c.open_id,
+      dept: flPlain(f[FF.REG_DEPT]),
+      record_id: rec.record_id,
+    };
+  }
+
+  /* --- 业务：待办 / spec / 回写 --- */
+  FL.tasks = async function (limit) {
+    const code = SVC.code();
+    const openId = code ? await flVerify(code) : '';
+    if (!openId) throw new Error('E_AUTH 设备码无效，请重新绑定');
+    const size = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    const data = await FL.search(FL.T_TASKS, {
+      conjunction: 'and',
+      conditions: [
+        { field_name: FF.CREATOR, operator: 'is', value: [openId] },
+        { field_name: FF.STATUS, operator: 'isEmpty', value: [] },
+        { field_name: FF.ACCOUNT_ID, operator: 'isNotEmpty', value: [] },
+      ],
+    }, size, false);
+    const items = (data.items || []).map(function (r) {
+      const f = r.fields || {};
+      return {
+        record_id: r.record_id,
+        account_id: flPlain(f[FF.ACCOUNT_ID]),
+        account_name: flPlain(f[FF.ACCOUNT_NAME]),
+        client: flPlain(f[FF.CLIENT]),
+      };
+    });
+    // 登记「本次查到的是哪几条」——回写时只认这些 id
+    items.forEach(function (t) { FL.claim(t.record_id); });
+    return { total: data.total != null ? data.total : items.length, items: items };
+  };
+
+  FL.spec = async function (scriptId) {
+    const data = await FL.api('POST', flTab(FL.T_SPECS) + '/records/search?page_size=200', { automatic_fields: false });
+    const rows = (data.items || []).filter(function (r) {
+      const f = r.fields || {};
+      return flPlain(f.script_id) === scriptId && flPlain(f.spec_json);
+    });
+    const pick = rows.sort(function (a, b) {
+      return flPlain((b.fields || {}).version).localeCompare(flPlain((a.fields || {}).version), 'zh-CN', { numeric: true });
+    })[0];
+    if (!pick) throw new Error('E_NOT_FOUND 没有找到可用的 spec：' + scriptId);
+    const f = pick.fields || {};
+    let spec = flPlain(f.spec_json);
+    try { spec = JSON.parse(spec); } catch (e) {}
+    return { spec_id: scriptId, version: flPlain(f.version), status: flPlain(f.spec_status), spec: spec };
+  };
+
+  FL.writeResult = async function (payload) {
+    const recordId = String(payload.record_id || '').trim();
+    if (!recordId) throw new Error('E_PARAM 缺少 record_id');
+    // 只允许回写「本次以本人身份查询到的待办」，别的一律拒绝（含手传/构造的 id）
+    if (!FL.claimed(recordId)) {
+      throw new Error('E_GUARD 这个 record_id 不在你刚查到的待办里，拒绝回写');
+    }
+    const code = SVC.code();
+    const openId = code ? await flVerify(code) : '';
+    if (!openId) throw new Error('E_AUTH 设备码无效');
+
+    const rec = (await FL.api('GET', flTab(FL.T_TASKS) + '/records/' + encodeURIComponent(recordId))).record;
+    if (!rec) throw new Error('E_NOT_FOUND 记录不存在');
+    const creators = flPeople((rec.fields || {})[FF.CREATOR]);
+    if (!creators.some(function (p) { return p.open_id === openId; })) {
+      throw new Error('E_FORBIDDEN 这条记录不是你创建的，拒绝回写');
+    }
+
+    const fields = {};
+    fields[FF.STATUS] = payload.ok ? ST.OK : ST.FAIL;
+    if (payload.secret != null) fields[FF.SECRET] = String(payload.secret);
+    if (payload.error_type) fields[FF.ERROR_TYPE] = String(payload.error_type);
+    if (payload.elapsed_ms != null && isFinite(Number(payload.elapsed_ms))) fields[FF.ELAPSED] = Number(payload.elapsed_ms);
+    if (payload.runner_version) fields[FF.RUNNER_VER] = String(payload.runner_version);
+    if (payload.spec_version) fields[FF.SPEC_VER] = String(payload.spec_version);
+    Object.keys(fields).forEach(function (k) { if (WRITABLE.indexOf(k) < 0) delete fields[k]; });
+
+    await FL.api('PUT', flTab(FL.T_TASKS) + '/records/' + encodeURIComponent(recordId), { fields: fields });
+    return { record_id: recordId, written: Object.keys(fields) };
+  };
+
+  /* --- 业务：绑定 --- */
+  FL.bindMeta = function () {
+    return { form_url: FL.FORM_URL, form_field: FF.REG_CODE, expires_min: FL.TTL_MIN, code_len: 6 };
+  };
+
+  FL.bindPoll = async function (opts) {
+    const code = String(opts.code || '').trim().toUpperCase();
+    const since = Number(opts.since || 0);
+    const recId = String(opts.record_id || '').trim();
+
+    let rec = null;
+    let how = '';
+
+    if (recId) {
+      const d = await FL.api('GET', flTab(FL.T_REG) + '/records/' + encodeURIComponent(recId) + '?automatic_fields=true');
+      rec = d.record || null;
+      how = 'record_id';
+    } else if (/^[A-Z0-9]{4,12}$/.test(code)) {
+      const d = await FL.search(FL.T_REG, {
+        conjunction: 'and',
+        conditions: [{ field_name: FF.REG_CODE, operator: 'is', value: [code] }],
+      }, 5);
+      rec = (d.items || [])[0] || null;
+      how = 'code';
+    }
+
+    if (!rec) {
+      const d = await FL.search(FL.T_REG, {
+        conjunction: 'and',
+        conditions: [
+          { field_name: FF.REG_DEVICE, operator: 'isEmpty', value: [] },
+          { field_name: FF.REG_NAME, operator: 'isNotEmpty', value: [] },
+        ],
+      }, 50);
+      let cands = d.items || [];
+      if (since) {
+        const floor = since - 120000;
+        cands = cands.filter(function (r) {
+          const c = Number(flPlain((r.fields || {})[FF.REG_CREATED]) || 0);
+          return !c || c >= floor;
+        });
+      }
+      if (cands.length === 1 && since > 0) { rec = cands[0]; how = 'time-window'; }
+      else if (cands.length >= 1) {
+        return {
+          state: 'choose',
+          hint: '检测到 ' + cands.length + ' 条未绑定的登记，请选你自己那条',
+          candidates: cands.slice(0, 10).map(function (r) {
+            const f = r.fields || {};
+            return {
+              record_id: r.record_id,
+              name: flPlain(f[FF.REG_NAME]),
+              dept: flPlain(f[FF.REG_DEPT]),
+              created: Number(flPlain(f[FF.REG_CREATED]) || 0),
+            };
+          }),
+        };
+      } else return { state: 'pending' };
+    }
+
+    const fields = rec.fields || {};
+    const created = Number(flPlain(fields[FF.REG_CREATED]) || 0);
+    if (created && Date.now() - created > FL.TTL_MIN * 60000) {
+      return { state: 'expired', hint: '这条登记已超过 ' + FL.TTL_MIN + ' 分钟，请换一个授权码再提交一次' };
+    }
+
+    const me = flIdentity(rec);
+    if (!me) return { state: 'pending', hint: '记录已找到但取不到创建人，请确认表单已关闭匿名提交' };
+
+    const existing = flPlain(fields[FF.REG_DEVICE]);
+    if (existing && existing !== me.open_id) {
+      return { state: 'pending', hint: '这条登记已被其他人绑定，请联系管理员' };
+    }
+    if (!existing) {
+      await FL.api('PUT', flTab(FL.T_REG) + '/records/' + encodeURIComponent(rec.record_id), {
+        fields: { [FF.REG_DEVICE]: me.open_id },
+      });
+    }
+    const device = await flSign(me.open_id);
+    return { state: 'bound', matched_by: how, device_code: device, name: me.name, dept: me.dept, open_id: me.open_id };
+  };
+
+  /** 校验设备码 + 回表确认未被撤销（等价服务端 /me） */
+  FL.me = async function () {
+    const code = SVC.code();
+    if (!code) return null;
+    const openId = await flVerify(code);
+    if (!openId) return null;
+    const d = await FL.search(FL.T_REG, {
+      conjunction: 'and',
+      conditions: [{ field_name: FF.REG_DEVICE, operator: 'is', value: [openId] }],
+    }, 5);
+    const rec = (d.items || [])[0];
+    if (!rec) return null;
+    const me = flIdentity(rec);
+    if (!me || me.open_id !== openId) return null;
+    GM_setValue(SVC.M_KEY, JSON.stringify({ name: me.name, open_id: me.open_id, dept: me.dept }));
+    return me;
+  };
+
   /* ==================== 任务服务（v0.2 主路径） ====================
    * 业务同学的飞书账号都是外部号，进不了自建应用可用范围 → 客户端拿不到 user_access_token。
    * 改为：身份留在服务端（应用身份代持），客户端只持一个可撤销的「接入码」。
@@ -1359,23 +1813,82 @@
     });
   };
 
+  /* 两种模式：填了服务地址走服务端（安全），没填就跑直连（无依赖，先能用） */
+  SVC.mode = function () { return SVC.base() ? 'svc' : 'direct'; };
+
   SVC.bind = async function () {
-    const j = await SVC.call('GET', '/me');
-    GM_setValue(SVC.M_KEY, JSON.stringify(j.me));
-    return j.me;
+    let me;
+    if (SVC.mode() === 'svc') me = (await SVC.call('GET', '/me')).me;
+    else {
+      me = await FL.me();
+      if (!me) throw new Error('E_AUTH 设备码无效，或已在登记表里被撤销');
+    }
+    GM_setValue(SVC.M_KEY, JSON.stringify(me));
+    return me;
   };
-  SVC.tasks = function () { return SVC.call('GET', '/tasks', { limit: 50 }); };
-  SVC.spec = function () { return SVC.call('GET', '/spec', { script_id: SVC.SPEC_SCRIPT }); };
-  SVC.writeResult = function (payload) { return SVC.call('POST', '/result', null, payload); };
-  SVC.bindStart = function () { return SVC.call('GET', '/bind/start'); };
-  SVC.bindPoll = function (q) { return SVC.call('GET', '/bind/poll', q || {}); };
+  SVC.tasks = function () {
+    return SVC.mode() === 'svc' ? SVC.call('GET', '/tasks', { limit: 50 }) : FL.tasks(50);
+  };
+  SVC.spec = function () {
+    return SVC.mode() === 'svc' ? SVC.call('GET', '/spec', { script_id: SVC.SPEC_SCRIPT }) : FL.spec(SVC.SPEC_SCRIPT);
+  };
+  SVC.writeResult = function (payload) {
+    return SVC.mode() === 'svc' ? SVC.call('POST', '/result', null, payload) : FL.writeResult(payload);
+  };
+  SVC.bindMeta = function () {
+    return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/meta') : Promise.resolve(FL.bindMeta());
+  };
+  SVC.bindPoll = function (q) {
+    return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/poll', q || {}) : FL.bindPoll(q || {});
+  };
+
+  /* ---------- 授权码：本地随机生成，不经过服务端 ----------
+   * 6 位 × 32 字符集（无 I/O/0/1）≈ 10.7 亿种，30 分钟窗口内碰撞概率可忽略。
+   * 码只是「把表里某一行对上这次会话」的关联凭证，真正身份来自表单记录的创建人。
+   */
+  const AUTH_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const AUTH_LEN = 6;
+  const AUTH_TTL_MS = 30 * 60 * 1000;
+  const AUTH_KEY = 'masr.authcode';
+  const FORM_KEY = 'masr.formurl';
+
+  function genAuthCode() {
+    let s = '';
+    const buf = new Uint8Array(AUTH_LEN);
+    if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(buf);
+    else for (let i = 0; i < AUTH_LEN; i++) buf[i] = Math.floor(Math.random() * 256);
+    for (let i = 0; i < AUTH_LEN; i++) s += AUTH_CHARS[buf[i] % AUTH_CHARS.length];
+    return s;
+  }
+
+  // 同一个码在 30 分钟内可复用（重开面板不用换码，用户填过的表也不会白填）
+  function reuseAuthCode() {
+    try {
+      const saved = JSON.parse(GM_getValue(AUTH_KEY, 'null'));
+      if (saved && saved.code && Date.now() - saved.ts < AUTH_TTL_MS) return saved.code;
+    } catch (e) {}
+    return '';
+  }
+  function saveAuthCode(code) {
+    GM_setValue(AUTH_KEY, JSON.stringify({ code: code, ts: Date.now() }));
+  }
+  function clearAuthCode() { GM_deleteValue(AUTH_KEY); }
 
   /* ---------- 任务面板 v0.2.1：自助绑定（用户全程不接触任何 ID） ---------- */
 
-  // ① 还没配服务地址
-  function renderSvcSetup(box) {
-    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未配置服务地址</span>' +
-      '<div style="margin-top:4px;font-size:11px;color:#8f959e">服务地址由管理员提供，填一次即可</div>' +
+  function modeTag() {
+    return SVC.mode() === 'svc'
+      ? '<span style="font-size:10px;color:#1a7f45;border:1px solid #b7e0c8;border-radius:3px;padding:0 4px;margin-left:4px">后端</span>'
+      : '<span style="font-size:10px;color:#8f959e;border:1px solid #dcdfe6;border-radius:3px;padding:0 4px;margin-left:4px">直连</span>';
+  }
+
+  // ① 还没配服务地址（只在直连不可用时出现）
+  function renderSvcSetup(box, reason) {
+    const head = reason === 'nokey'
+      ? '内嵌凭证不可用，请填服务端地址'
+      : '未配置服务地址';
+    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">' + head + '</span>' +
+      '<div style="margin-top:4px;font-size:11px;color:#8f959e">正常情况下不需要填 —— 脚本自带直连；填写后改为走后端（更安全）</div>' +
       '<div class="row" style="margin-top:4px"><input id="masr-svc-base" placeholder="https://..." style="width:240px"> ' +
       '<button class="primary" id="masr-svc-save">保存</button></div>' +
       '<div id="masr-task-out" style="font-size:11px;color:#8f959e"></div>';
@@ -1387,19 +1900,73 @@
     });
   }
 
-  // ② 未绑定 → 自助绑定
+  // ② 未解锁 → 输入接入口令（凭证是密文，没有口令什么都做不了）
+  function renderUnlock(box) {
+    const bad = FL.lockedReason === 'bad-pass';
+    const broken = FL.lockedReason === 'no-blob' || FL.lockedReason === 'no-crypto';
+    if (broken) {
+      box.innerHTML = '<b>任务</b> <span style="color:#c02a2a">凭证不可用</span>' +
+        '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
+        (FL.lockedReason === 'no-blob'
+          ? '这个构建没有内嵌凭证（发布版故意留空），请填服务端地址。'
+          : '当前页面不支持 WebCrypto，请在 https 的飞书页面使用。') + '</div>' +
+        '<div class="row" style="margin-top:6px"><input id="masr-svc-base" placeholder="https://..." style="width:240px"> ' +
+        '<button class="primary" id="masr-svc-save">保存服务地址</button></div>';
+      document.getElementById('masr-svc-save').addEventListener('click', function () {
+        const v = document.getElementById('masr-svc-base').value.trim();
+        if (!v) return;
+        GM_setValue(SVC.B_KEY, v);
+        UI.renderTasks();
+      });
+      return;
+    }
+    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未解锁</span>' +
+      '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
+      '首次使用请输入管理员发给你的<b>接入口令</b>。只需一次，本机记住。<br>' +
+      '口令只用来解开脚本里的加密凭证，不会发往任何服务器。</div>' +
+      '<div class="row" style="margin-top:6px">' +
+      '<input id="masr-pass" type="password" placeholder="接入口令" autocomplete="off" style="width:230px"> ' +
+      '<button class="primary" id="masr-pass-go">解锁</button></div>' +
+      '<div id="masr-pass-out" style="margin-top:6px;font-size:11px;color:' + (bad ? '#c02a2a' : '#8f959e') + '">' +
+      (bad ? '口令不对，再试一次' : '') + '</div>';
+
+    const inp = document.getElementById('masr-pass');
+    const out = document.getElementById('masr-pass-out');
+    const go = document.getElementById('masr-pass-go');
+    async function submit() {
+      const p = inp.value;
+      if (!p) { out.textContent = '请输入口令'; return; }
+      go.disabled = true; go.textContent = '解锁中…'; out.textContent = '正在派生密钥（约 1 秒）…';
+      try {
+        await FL.unlock(p);
+        out.textContent = '口令正确，正在校验凭证…';
+        await FL.token(true);          // 真发一次换 token，确认凭证可用
+        inp.value = '';
+        UI.renderTasks();
+      } catch (e) {
+        go.disabled = false; go.textContent = '解锁';
+        out.style.color = '#c02a2a';
+        out.textContent = /E_PASS/.test(e.message) ? '口令不对，再试一次' : ('解锁失败：' + e.message.replace(/^E_\w+\s*/, ''));
+      }
+    }
+    go.addEventListener('click', submit);
+    inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') submit(); });
+    setTimeout(function () { try { inp.focus(); } catch (e) {} }, 60);
+  }
+
+  // ③ 未绑定 → 自助绑定
   function renderBind(box) {
-    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未绑定身份</span>' +
+    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未绑定身份</span>' + modeTag() +
       '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
       '第一次使用，30 秒完成：<br>' +
-      '① 点下面按钮 —— 绑定码会自动复制，并打开飞书登记表单<br>' +
-      '② 表单里「授权码」粘贴它，填好姓名部门，提交<br>' +
+      '① 点下面按钮 —— 自动复制授权码，并打开飞书登记表单<br>' +
+      '② 表单里「授权码」一栏粘贴它，填好姓名部门，提交<br>' +
       '③ 提交后这里自动完成，不用再点任何东西' +
       '</div>' +
       '<div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
       '<span id="masr-bindcode" title="点击复制" style="font-family:ui-monospace,Consolas,monospace;font-size:22px;letter-spacing:4px;font-weight:700;color:#1d4ed8;cursor:pointer;user-select:all">······</span>' +
-      '<button class="primary" id="masr-bind-go">复制码并打开登记表单</button>' +
-      '<button id="masr-bind-again" style="display:none">重新获取</button>' +
+      '<button class="primary" id="masr-bind-go">复制授权码并打开表单</button>' +
+      '<button id="masr-bind-again" style="display:none">换一个码</button>' +
       '</div>' +
       '<div id="masr-bind-out" style="margin-top:6px;font-size:11px;color:#8f959e"></div>';
 
@@ -1409,6 +1976,7 @@
 
     let bindCode = '';
     let formUrl = '';
+    let expiresMin = 30;
     let tipTimer = null;
 
     function copyText(t) {
@@ -1451,7 +2019,7 @@
     function copyNow(quiet) {
       if (!bindCode) return Promise.resolve(false);
       return copyText(bindCode).then(function (ok) {
-        if (ok) tip('绑定码 ' + bindCode + ' 已复制 —— 粘到表单「授权码」一栏');
+        if (ok) tip('授权码 ' + bindCode + ' 已复制 —— 粘到表单「授权码」一栏');
         else tip('自动复制被浏览器拦下了，请手动选中上面的 ' + bindCode + ' 复制');
         return ok;
       });
@@ -1490,12 +2058,12 @@
         if (j.state === 'bound') return onBound(j);
         if (j.state === 'choose') { showChoose(j.candidates); return; }
         if (j.state === 'expired') {
-          tip(j.hint || '登记已过期，请点「重新获取」');
+          tip(j.hint || '登记已过期，请点「换一个码」再走一次');
           if ($again()) $again().style.display = '';
           return;
         }
         if (tries <= 0) {
-          tip('等待超时。填完表后点「重新获取」再走一次。');
+          tip('等待超时。填完表后点「换一个码」再走一次。');
           if ($again()) $again().style.display = '';
           return;
         }
@@ -1512,18 +2080,26 @@
       });
     }
 
-    function acquire() {
-      bindCode = ''; formUrl = '';
-      if ($code()) $code().textContent = '······';
-      tip('正在获取绑定码…');
-      SVC.bindStart().then(function (j) {
-        bindCode = j.code; formUrl = j.form_url;
-        if ($code()) $code().textContent = j.code;
-        tip('点「复制码并打开登记表单」——码会自动复制，' + j.expires_min + ' 分钟内有效');
-        if ($again()) $again().style.display = '';
+    function acquire(force) {
+      // 码由本地面生成：30 分钟内复用同一个，force=true 才换新的
+      bindCode = force ? '' : reuseAuthCode();
+      if (!bindCode) { bindCode = genAuthCode(); saveAuthCode(bindCode); }
+      if ($code()) $code().textContent = bindCode;
+
+      formUrl = GM_getValue(FORM_KEY, '');
+      if (formUrl) tip('授权码已就绪，' + expiresMin + ' 分钟内有效');
+      else tip('正在获取表单地址…');
+
+      SVC.bindMeta().then(function (j) {
+        formUrl = j.form_url || '';
+        expiresMin = j.expires_min || expiresMin;
+        GM_setValue(FORM_KEY, formUrl);
+        tip('授权码已就绪，' + expiresMin + ' 分钟内有效 —— 点按钮会先复制再打开表单');
       }).catch(function (e) {
-        tip('获取绑定码失败：' + e.message);
+        tip(formUrl ? '表单地址沿用上次缓存；服务端暂时连不上：' + e.message
+                    : '连不上服务端，拿不到表单地址：' + e.message);
       });
+      if ($again()) $again().style.display = '';
     }
 
     if ($code()) {
@@ -1531,32 +2107,42 @@
     }
 
     document.getElementById('masr-bind-go').addEventListener('click', function () {
-      if (!bindCode) { tip('绑定码还没拿到，稍等一下再点'); return; }
+      if (!bindCode) { tip('授权码还没生成，稍等一下再点'); return; }
       const state = { code: bindCode, since: Date.now() };
       copyNow().then(function () {
         if (formUrl) { try { window.open(formUrl, '_blank', 'noopener'); } catch (e) {} }
+        else tip('没有表单地址，请手动打开管理员给你的飞书登记表单');
         pollBind(state, 200);
       });
     });
 
     $again().addEventListener('click', function () {
       $again().style.display = 'none';
-      acquire();
+      clearAuthCode();
+      acquire(true);
     });
 
-    acquire();
+    acquire(false);
   }
 
   // ③ 已绑定 → 我的待办
   function renderBound(box, me) {
     box.innerHTML = '<b>任务</b> <span style="color:#1a7f45">' + (me.name || '已绑定') +
-      (me.dept ? ' · ' + me.dept : '') + '</span>' +
+      (me.dept ? ' · ' + me.dept : '') + '</span>' + modeTag() +
       ' <button class="primary" id="masr-task-pull">拉我的待办</button>' +
       ' <button id="masr-task-unbind">解除绑定</button>' +
+      ' <button id="masr-task-lock" title="清掉本机保存的口令钥匙，下次需重新输入">锁定</button>' +
       '<div id="masr-task-list" style="margin-top:4px"></div>';
 
+    document.getElementById('masr-task-lock').addEventListener('click', function () {
+      FL.lock(); UI.renderTasks();
+    });
+
     document.getElementById('masr-task-unbind').addEventListener('click', function () {
-      GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); UI.renderTasks();
+      // 换人用这台电脑：设备码、授权码、可回写名单一起清掉
+      GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY);
+      try { GM_deleteValue(FL.CLAIM_KEY); FL._mine = {}; } catch (e) {}
+      clearAuthCode(); UI.renderTasks();
     });
     document.getElementById('masr-task-pull').addEventListener('click', async function () {
       const list = document.getElementById('masr-task-list');
@@ -1582,10 +2168,22 @@
     });
   }
 
+  let flBootTried = false;
   UI.renderTasks = function () {
     const box = document.getElementById('masr-tasks');
     if (!box) return;
-    if (!SVC.base()) { renderSvcSetup(box); return; }
+    // 直连模式：先尝试静默解锁（本机存过钥匙才成立），不成再要口令
+    if (!SVC.base() && !FL.unlocked()) {
+      if (!flBootTried) {
+        flBootTried = true;
+        box.innerHTML = '<b>任务</b> <span style="color:#8f959e">检查凭证…</span>';
+        FL.boot().then(function (ok) { if (ok) UI.renderTasks(); else renderUnlock(box); })
+          .catch(function () { renderUnlock(box); });
+        return;
+      }
+      renderUnlock(box);
+      return;
+    }
     if (!SVC.code()) { renderBind(box); return; }
     const me = SVC.me();
     if (!me) {
@@ -1593,7 +2191,7 @@
         '<div class="row"><button id="masr-svc-reset">重新绑定身份</button>' +
         '<button id="masr-svc-rebind">重试连接</button></div><div id="masr-task-out" style="font-size:11px"></div>';
       document.getElementById('masr-svc-reset').addEventListener('click', function () {
-        GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); UI.renderTasks();
+        GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY); clearAuthCode(); UI.renderTasks();
       });
       document.getElementById('masr-svc-rebind').addEventListener('click', async function () {
         try { await SVC.bind(); UI.renderTasks(); }
