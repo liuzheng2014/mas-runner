@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.8
+// @version      0.4.9
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -310,7 +310,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.8',
+    RUNNER_VERSION: '0.4.9',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -2837,8 +2837,8 @@
           }
         } catch (e) {}
         const tip = result.openedTab
-          ? '=== ' + result.stepId + ' 已在新标签页打开。落地页会自动续跑（约 2.5 秒），若未自动续跑再切过去点「执行」 ==='
-          : '=== ' + result.stepId + ' 导航已发起。落地页会自动续跑（约 2.5 秒），本页无需操作 ===';
+          ? '=== ' + result.stepId + ' 已在新标签页打开。落地页就绪会自动续跑（通常 1 秒内，慢链路按 cookie 到位触发），若没续上再切过去点「执行」 ==='
+          : '=== ' + result.stepId + ' 导航已发起。落地页就绪会自动续跑（通常 1 秒内），本页无需操作 ===';
         UI.appendLog({ t: Date.now(), level: 'warn', msg: tip });
         document.getElementById('masr-result').innerHTML = result.openedTab
           ? '<b style="color:#b8860b">⏳ 新标签页已打开</b>：落地后自动续跑，全部跑完辅助标签页会自动关闭、结果回到本页。'
@@ -2898,6 +2898,71 @@
 
   /* ==================== 启动 ==================== */
 
+  // 导航落地「就绪即续」：替代原来固定 2.5s 的盲等。
+  // 触发条件（由调用处保证）：本页 URL 已命中 expect.url_contains、状态新鲜（10 分钟内）。
+  // 本函数只负责「什么时候真正续跑」：
+  //   - 若该步 expect 声明了 cookie_exists（dsp_csrf_token），就按 250ms 细粒度轮询，cookie 一到位立刻续；
+  //   - 未声明 cookie（如 S5 落地 key 页）时，URL 命中后再留 ~300ms 给页面 SPA 起手，即续；
+  //   - 页面重新可见（用户切到该标签页）或 pageshow 时立即再查一次，避免后台节流拖慢；
+  //   - 超过 MAX_WAIT 仍未就绪 → 降级为提示手动点「执行」，绝不静默挂死。
+  // 续跑函数 resumeAfterNavigate 内部仍会二次校验 url_contains / cookie，本函数只是把等待提前、做细。
+  function armNavResumeReady(st0) {
+    const needCookie = (st0.navExpect && st0.navExpect.cookie_exists) || '';
+    const MAX_WAIT = 15000;
+    const SETTLE = 300;               // 无 cookie 可等时，给 SPA 的起手缓冲
+    const started = Date.now();
+    let fired = false, iv = null, settleT = null;
+
+    function cleanup() {
+      if (iv) { clearInterval(iv); iv = null; }
+      if (settleT) { clearTimeout(settleT); settleT = null; }
+      try {
+        window.removeEventListener('pageshow', wake);
+        document.removeEventListener('visibilitychange', onVis);
+      } catch (e) {}
+    }
+    function stillLive() {
+      const s = RunState.get();
+      return !!(s && s.phase === 'await_nav_check' && s.navStepId === st0.navStepId);
+    }
+    function cookieReady() { return !needCookie || !!ENGINE.readCookie(document.cookie, needCookie); }
+
+    function doResume(src) {
+      if (fired) return;
+      if (!stillLive()) { cleanup(); return; }
+      fired = true; cleanup();
+      try {
+        sessionStorage.setItem('masrRole', 'helper');
+        if (st0.runId) sessionStorage.setItem('masrRunId', st0.runId);
+      } catch (e) {}
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '⏩ ' + st0.navStepId + ' 落地就绪（' + ((Date.now() - started) / 1000).toFixed(1) + 's' + (src ? '·' + src : '') + '），续跑' });
+      UI.doRun();
+    }
+    // 首次就绪 → 按是否等过 cookie 决定是否留一点点缓冲
+    function fireWhenReady(src) {
+      if (!stillLive() || !cookieReady()) { if (!stillLive()) cleanup(); return; }
+      if (needCookie) doResume(src);              // cookie 到位本身就是强就绪信号，立即续
+      else if (!settleT) settleT = setTimeout(function () { doResume(src); }, SETTLE);
+    }
+    function wake() { fireWhenReady('事件'); }
+    function onVis() { if (document.visibilityState === 'visible') fireWhenReady('可见'); }
+
+    // 已经就绪：下一拍起飞（不阻塞 boot 其余逻辑）
+    if (cookieReady()) { settleT = setTimeout(function () { doResume('已就绪'); }, needCookie ? 0 : SETTLE); return; }
+
+    window.addEventListener('pageshow', wake, { passive: true });
+    document.addEventListener('visibilitychange', onVis);
+    UI.appendLog({ t: Date.now(), level: 'info', msg: '⏩ ' + st0.navStepId + ' 等 cookie「' + needCookie + '」就位，到位即续跑（不再固定等 2.5s）' });
+    iv = setInterval(function () {
+      if (!stillLive()) { cleanup(); return; }
+      if (cookieReady()) { doResume('轮询'); return; }
+      if (Date.now() - started > MAX_WAIT) {
+        cleanup();
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '⚠️ ' + st0.navStepId + ' 等 cookie 超时（' + (MAX_WAIT / 1000) + 's），请切到该页点「执行」手动校验' });
+      }
+    }, 250);
+  }
+
   function boot() {
     UI.mount();
     UI.renderTasks();
@@ -2939,8 +3004,7 @@
           sessionStorage.setItem('masrRole', 'helper');
           if (st.runId) sessionStorage.setItem('masrRunId', st.runId);
         } catch (e) {}
-        UI.appendLog({ t: Date.now(), level: 'info', msg: '⏩ ' + st.navStepId + ' 落地校验已排队：2.5 秒后自动续跑（无需点击）' });
-        setTimeout(function () { UI.doRun(); }, 2500);
+        armNavResumeReady(st);   // 就绪即续：不再盲等固定 2.5s（快页面省 2s，慢链路按 cookie 到位触发）
       } else {
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到未完成的导航续跑（' + st.navStepId + '）：本页不匹配落地条件或状态过旧，点「执行」手动校验' });
       }
