@@ -1,13 +1,13 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "file": "mas-runner.user.js",
-  "sha256": "1421234917a7efe9166efa859e893dad25a0c4d8da2bdd3c5de8f80692de0e1d",
-  "bytes": 143786,
-  "published_at": "2026-10-30T23:03:39+08:00",
+  "sha256": "7e3da6c3e46794749b7efe239510675f11c217d4663d8c9b2f9fbf8b441942d3",
+  "bytes": 144100,
+  "published_at": "2026-10-30T23:11:08+08:00",
   "install_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "v0.4.5: 回写提速（归属改用 /tasks 结果缓存，省掉 2~20s 的整条记录读；跑流程时预热任务表）；回写开始即打日志；出站 15s 超时"
+  "notes": "v0.4.6: 回写零查表——拉待办时服务端签发 write_token（HMAC+12h），回写只验签 + 一次 PUT（不再读整条记录，实测 0.9s）"
 }

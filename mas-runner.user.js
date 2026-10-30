@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.5
+// @version      0.4.6
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -303,7 +303,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.5',
+    RUNNER_VERSION: '0.4.6',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -893,7 +893,7 @@
       <div id="masr-head">
         <div class="h-row">
           <span class="brand">MAS <i>Runner</i></span>
-          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.5</span>
+          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.6</span>
           <span class="grow"></span>
           <span class="masr-upd" id="masr-update-out"></span>
           <button class="masr-mini" id="masr-check-update" title="检查解释器有没有新版本">检查更新</button>
@@ -2161,6 +2161,8 @@
       UI.currentTask = {
         record_id: task.record_id, account_id: task.account_id,
         table_id: task.table_id, script_id: task.script_id || '',
+        // 回写凭据：拉待办时服务端签好的，回写时原样带回 → 服务端零查表
+        write_token: task.write_token || '',
       };
       // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
       if (SVC.mode() === 'svc') {
@@ -2221,6 +2223,8 @@
     if (!task || !task.record_id) return;
     const payload = {
       record_id: task.record_id,
+      // 透传：这条记录从 /tasks 下来就带着凭据，回写只做一次 PUT，服务端不再回读记录
+      write_token: task.write_token || '',
       ok: !!ok,
       elapsed_ms: Date.now() - (st.startedAt || Date.now()),
       runner_version: GV.RUNNER_VERSION,
