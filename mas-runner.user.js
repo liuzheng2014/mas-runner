@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.6
+// @version      0.4.7
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -51,6 +51,13 @@
  *     2026-10-30 17:22 实测 permission 请求被 WAF 挂起 2 分 10 秒）
  *   - v0.1.12：pageFetch 加 AbortController 快速失败（默认 25s）——WAF 挂起时 fetch 原本
  *     要挂 ~100s 才被断连，再兜底 GM_xhr 30s，一次挂死白等 2 分多钟；现在 ~55s 内出结果
+ *   - v0.4.7：多跳链条收摊修复（2026-10-30 用户实测：子客门户跳过去、密钥页关了，子客首页留着）。
+ *     根因：关闭时机挂在 RunState.final.consumed 上，而发起页一收到结果就把 consumed 置 true 并清掉运行态，
+ *     上游辅助页（第一个被打开的标签页）轮询到时提前 return，永远等不到关闭 → 只关了最后一页。
+ *     改为独立的一次性「收摊信号」CloseSig（masr_close_v1，带 runId + 5 分钟时效），
+ *     任何非发起页只要 runId 对得上就自毁；且"等落地"的中间页会把自己标记成 helper，
+ *     跑完一起收摊。发起页（代理页）永不关闭。
+ *
  *   - v0.1.13：单点击全自动（业务可用性修复，2026-10-30 用户验收指出三宗罪：
  *     两次人工续跑 / 辅助标签页不自毁 / 不回代理页）。①落地页 boot 检测到 await_nav_check
  *     且 URL 匹配 expect、状态新鲜（10 分钟内）时自动续跑（2.5s 后），无需点击；
@@ -303,7 +310,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.6',
+    RUNNER_VERSION: '0.4.7',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -318,6 +325,16 @@
     get() { try { return JSON.parse(GM_getValue(GV.RUN_KEY, 'null')); } catch (e) { return null; } },
     set(st) { GM_setValue(GV.RUN_KEY, JSON.stringify(st)); },
     clear() { GM_deleteValue(GV.RUN_KEY); },
+  };
+  /* 收摊信号：一次流程结束只广播一次，所有「脚本打开的标签页」看到它都自毁。
+   * 为什么单独存而不是复用 RunState.final：发起页收到结果后会把 final.consumed 置 true 并很快清掉运行态，
+   * 上游辅助页（比如先被打开的子客门户）轮询到 consumed 就提前 return，永远等不到关闭时机——
+   * 2026-10-30 实测：密钥页关了、子客首页留着。所以关闭与否只认这个一次性标记。 */
+  const CloseSig = {
+    KEY: 'masr_close_v1',
+    mark(runId) { try { GM_setValue(this.KEY, JSON.stringify({ runId: runId || '', at: Date.now() })); } catch (e) {} },
+    get() { try { return JSON.parse(GM_getValue(this.KEY, 'null')); } catch (e) { return null; } },
+    clear() { try { GM_deleteValue(this.KEY); } catch (e) {} },
   };
   const StepCache = {
     all() { try { return JSON.parse(GM_getValue(GV.CACHE_KEY, '{}')); } catch (e) { return {}; } },
@@ -893,7 +910,7 @@
       <div id="masr-head">
         <div class="h-row">
           <span class="brand">MAS <i>Runner</i></span>
-          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.6</span>
+          <span class="masr-chip runner" id="masr-runner-ver" title="解释器版本（Tampermonkey 里安装的这个脚本）">v0.4.7</span>
           <span class="grow"></span>
           <span class="masr-upd" id="masr-update-out"></span>
           <button class="masr-mini" id="masr-check-update" title="检查解释器有没有新版本">检查更新</button>
@@ -2662,6 +2679,7 @@
       UI.saveParams(spec.spec_id, params); // 记住这次填的值，下次自动回填
       // 角色标记：发起页（通常为代理页）永不自毁，负责展示最终结果
       try { sessionStorage.setItem('masrRole', 'origin'); } catch (e) {}
+      CloseSig.clear();   // 新一次流程：抹掉上一轮的收摊信号，避免误关本次打开的标签页
     }
     UI.spec = spec;
     UI.setSpecBadge(spec);
@@ -2675,6 +2693,7 @@
       RunState.set({
         phase: 'running', specId: spec.spec_id, specVersion: spec.version,
         specJson: JSON.stringify(spec), params, log: [], startedAt: Date.now(),
+        runId: 'r' + Date.now(),   // 一次流程的唯一标识：收摊信号只认它，避免误关别的流程的标签页
         runnerVersion: GV.RUNNER_VERSION,
         task: UI.currentTask || null,
       });
@@ -2686,6 +2705,14 @@
       else result = await runSpec(spec, params, hooks);
       UI.lastResult = result;
       if (result.navInitiated) {
+        // 这一页接下来只是"等落地"的中间页（脚本打开的）：标记成辅助页，链条跑完它也要一起关掉
+        try {
+          if ((sessionStorage.getItem('masrRole') || '') !== 'origin') {
+            sessionStorage.setItem('masrRole', 'helper');
+            const stn = RunState.get() || {};
+            if (stn.runId) sessionStorage.setItem('masrRunId', stn.runId);
+          }
+        } catch (e) {}
         const tip = result.openedTab
           ? '=== ' + result.stepId + ' 已在新标签页打开。落地页会自动续跑（约 2.5 秒），若未自动续跑再切过去点「执行」 ==='
           : '=== ' + result.stepId + ' 导航已发起。落地页会自动续跑（约 2.5 秒），本页无需操作 ===';
@@ -2702,6 +2729,7 @@
         stc.phase = 'done';
         stc.final = { ok: true, outputs: result.outputs || {}, at: Date.now(), specId: spec.spec_id };
         RunState.set(stc);
+        CloseSig.mark(stc.runId);   // 广播收摊：链条上所有辅助页（含上游的子客门户）自毁，发起页留
         if (role !== 'origin') {
           UI.appendLog({ t: Date.now(), level: 'info', msg: '⏪ 本页为辅助标签页，2 秒后自动关闭；结果将回到发起页展示' });
           setTimeout(function () { try { window.close(); } catch (e) {} }, 2000);
@@ -2719,6 +2747,7 @@
         if (stc.phase) {
           stc.phase = 'done';
           stc.final = { ok: false, error: code, message: e.message, at: Date.now() };
+          CloseSig.mark(stc.runId);   // 失败也收摊：上游辅助页别留着，出错的那一页自己保留现场
           if (role === 'origin') {
             // 本页直接展示过，轮询器不再重复播报；但「失败」同样要回写（错误类型要进飞书表）
             stc.final.consumed = true;
@@ -2783,7 +2812,10 @@
       const urlOk = !st.navExpect || !st.navExpect.url_contains ||
                     location.href.indexOf(st.navExpect.url_contains) >= 0;
       if (fresh && urlOk) {
-        try { sessionStorage.setItem('masrRole', 'helper'); } catch (e) {}
+        try {
+          sessionStorage.setItem('masrRole', 'helper');
+          if (st.runId) sessionStorage.setItem('masrRunId', st.runId);
+        } catch (e) {}
         UI.appendLog({ t: Date.now(), level: 'info', msg: '⏩ ' + st.navStepId + ' 落地校验已排队：2.5 秒后自动续跑（无需点击）' });
         setTimeout(function () { UI.doRun(); }, 2500);
       } else {
@@ -2791,6 +2823,19 @@
       }
       console.log('[MASR] await_nav_check:', st.navStepId, 'expect=', st.navExpect, 'auto=', fresh && urlOk);
     }
+    // 辅助页收摊：监听一次性「流程结束」信号，与本页所属的 runId 对上就自毁。
+    // 这条独立于发起页是否已消费结果——否则上游页会被 final.consumed 卡住永远不关。
+    setInterval(function () {
+      let role, myRun;
+      try { role = sessionStorage.getItem('masrRole') || ''; myRun = sessionStorage.getItem('masrRunId') || ''; } catch (e) { return; }
+      if (!role || role === 'origin') return;
+      const sig = CloseSig.get();
+      if (!sig || Date.now() - sig.at > 5 * 60 * 1000) return;
+      // runId 必须对上（任一为空则保守不关，宁可留着也不误杀别的流程的页面）
+      if (!sig.runId || !myRun || sig.runId !== myRun) return;
+      try { window.close(); } catch (e) {}
+    }, 800);
+
     // 发起页轮询：接收其他标签页广播的最终结果；辅助页收到后自毁（兜底，主路径见 doRun）
     setInterval(function () {
       let s, role;
