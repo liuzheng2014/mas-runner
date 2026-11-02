@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.16
+// @version      0.4.17
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -15,6 +15,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_setClipboard
 // @connect      svc-drcn.ads.huawei.com
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
@@ -313,7 +314,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.16',
+    RUNNER_VERSION: '0.4.17',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -904,6 +905,7 @@
       <div class="row" id="masr-params"></div>
       <div class="row">
         <button id="masr-cancel-run" title="续跑卡住时用：清掉本机的续跑进度（不影响线上数据）">清除续跑状态</button>
+        <button id="masr-copy-logs" title="把全部日志（含历史，带时间戳）复制为纯文本，方便贴给同事或发群里排查">复制日志</button>
         <button id="masr-clear-logs">清空日志</button>
       </div>
       <div class="row"><b>步骤时间线</b><div id="masr-steps"></div></div>
@@ -963,6 +965,7 @@
     document.getElementById('masr-cancel-run').addEventListener('click', () => {
       RunState.clear(); UI.appendLog({ t: Date.now(), level: 'warn', msg: '续跑状态已清除' });
     });
+    document.getElementById('masr-copy-logs').addEventListener('click', UI.copyLogs);
     document.getElementById('masr-clear-logs').addEventListener('click', UI.clearLogs);
     document.getElementById('masr-check-update').addEventListener('click', function () {
       if (UI._newVer) UI.startUpdate(); else UI.checkUpdate();
@@ -1681,6 +1684,10 @@
     UI.appendLog({ t: batchStart, level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
     SVC.warmStart(120000); // 顺手把飞书任务表捂热：首条回写可省 1~2s（失败静默，不影响流程）
 
+    // 在途回写：批量里回写不阻塞下一条任务（回写走服务端→飞书，与 ADS 会话无关，天然可并行），
+    // 收尾前统一等全部落定再出报告 —— 账目口径不变，只是把 3~4s/条 的干等挪到了后台。
+    const writeSettles = [];
+
     // 等本条回写拿到飞书接口的真实结果：'written'（已落表）/ 'queued'（进待写队列）/ 'unknown'（等不到）
     // 回写 job 由发起页轮询器触发（1.5s 一个周期），所以先等它登记，再直接 await 那个 promise。
     async function settleWrite(rid) {
@@ -1732,14 +1739,15 @@
         if (/E_SESSION|E_AUTH|NO_AGENCY_CSRF|101133/.test(r.error || '')) sessFail++; else sessFail = 0;
       } else { unknownN++; sessFail = 0; } // 运行态提前清空，状态未知 → 不计入失败/连错
       done++; setProg();
-      // 回写定态了再记账：不等就会漏掉「密钥取到了但没写进表」这种最危险的情况
-      const w = await settleWrite(task.record_id);
-      rec.write = w.status; rec.writeMsg = w.msg || '';
-      if (rec.write === 'queued') {
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ ' + keyOf(task) + ' 回写未成功，已入本地待写队列（收尾点「重试回写」）' });
-      } else if (rec.write === 'unknown') {
-        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '↳ ' + keyOf(task) + ' 未检测到回写结果，需人工核对是否已落表' });
-      }
+      // 回写异步定态（不阻塞下一条）；「密钥取到了但没写进表」仍会在收尾报告前被抓住
+      writeSettles.push(settleWrite(task.record_id).then(function (w) {
+        rec.write = w.status; rec.writeMsg = w.msg || '';
+        if (rec.write === 'queued') {
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ [' + rec.idx + '/' + total + '] ' + keyOf(task) + ' 回写未成功，已入本地待写队列（收尾点「重试回写」）' });
+        } else if (rec.write === 'unknown') {
+          UI.appendLog({ t: Date.now(), level: 'fatal', msg: '↳ [' + rec.idx + '/' + total + '] ' + keyOf(task) + ' 未检测到回写结果，需人工核对是否已落表' });
+        }
+      }));
       // 连续 2 条会话类失败 → 疑似登录态失效，硬停（避免把失败刷满、也避免反复触发登出）
       if (sessFail >= 2) {
         UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⛔ 连续 2 条会话类失败，疑似登录态失效；已停止批量。请检查登录态后单独跑一条验证。' });
@@ -1753,6 +1761,11 @@
     if (runBtn) runBtn.style.display = '';
     if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
     rows.forEach(function (b) { b.disabled = false; });
+    // 等所有在途回写落定，再出收尾报告（报告里的落表数必须是飞书的真实结果，不允许带猜）
+    if (writeSettles.length) {
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '⏳ 等待全部回写落定（' + writeSettles.length + ' 条在途）…' });
+      await Promise.allSettled(writeSettles);
+    }
     UI.renderBatchReport(recs, { total: total, skipN: skipN, okN: okN, failN: failN, unknownN: unknownN, batchStart: batchStart, view: view });
   };
 
@@ -2187,6 +2200,29 @@
     const el = document.getElementById('masr-log');
     if (el) el.innerHTML = '';
     UI.appendLog({ t: Date.now(), level: 'warn', msg: '日志已清空' });
+  };
+
+  // 复制日志为纯文本（从 LogStore 取权威数据：含跨页历史，不带 HTML 标记）
+  UI.copyLogs = function () {
+    const entries = LogStore.get();
+    if (!entries.length) { alert('暂无日志可复制'); return; }
+    const text = entries.map(function (e) {
+      const d = new Date(e.t);
+      const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+      return '[' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '] ' + e.msg;
+    }).join('\n');
+    const done = function () { UI.appendLog({ t: Date.now(), level: 'ok', msg: '已复制 ' + entries.length + ' 条日志到剪贴板' }); };
+    // GM_setClipboard 不受页面 CSP/焦点限制，最可靠；没有时退回 execCommand 方案
+    if (typeof GM_setClipboard === 'function') { GM_setClipboard(text); done(); return; }
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    if (ok) done(); else alert('复制失败：请手动选中日志区文本复制');
   };
 
   // ---------- 自更新 ----------
