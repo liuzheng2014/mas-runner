@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.4.17",
+  "version": "0.4.18",
   "file": "mas-runner.user.js",
-  "sha256": "7fe4924908f9e54fd56d973509b6f289e162814c2ec98f1686506163af0bf48c",
-  "bytes": 147645,
-  "published_at": "2026-11-02T16:26:01+08:00",
+  "sha256": "aaf8a68106aeb140e6ea3b80ae3164afabc6e710d098fa3d601a02a80b08cf5f",
+  "bytes": 149185,
+  "published_at": "2026-11-02T16:48:51+08:00",
   "install_url": "https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "v0.4.17: 新增「复制日志」按钮；批量回写异步化（不阻塞下一条任务，收尾统一落定后再出报告），每条省 3~4s"
+  "notes": "v0.4.18: 引擎支持断言项级 on_fail（对象形式）+ 失败消息响应模板；回写错误类型列改人话——配合 spec v0.9.0 的「未查询到账户/账户状态：<实际值>」回写"
 }

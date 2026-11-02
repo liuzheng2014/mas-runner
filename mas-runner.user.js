@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.17
+// @version      0.4.18
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -305,6 +305,27 @@
     return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
   };
 
+  // ---------- 断言项级 on_fail + 消息模板 ----------
+  // 断言项两种形式：字符串（用步骤级 on_fail）或对象 {assert, on_fail:{error,message}}（项级优先）。
+  // on_fail.message 支持 {{响应路径}} 模板（如 "账户状态：{{data.data[0].corpStatus}}"），
+  // 对当前步响应 json 解析；路径不存在时保留原样（宁可带着 {{...}} 上屏，也不静默吞掉）。
+  ENGINE.assertOnFail = function (item, step, json) {
+    const base = (item && typeof item === 'object' && item.on_fail) ? item.on_fail : (step.on_fail || {});
+    if (!base.message || base.message.indexOf('{{') < 0) return base;
+    const msg = base.message.replace(/\{\{(.+?)\}\}/g, function (_, p) {
+      const v = ENGINE.resolvePath(json, p.trim());
+      return (v === undefined || v === null) ? '{{' + p.trim() + '}}' : String(v);
+    });
+    return Object.assign({}, base, { message: msg });
+  };
+
+  // 回写「错误类型」列用人话：取失败消息第一段（'｜'前），没有则退回错误码；上限 120 字符。
+  // 错误码仍完整保留在 runner 日志与批量报告的错误码分布里。
+  ENGINE.failReason = function (err) {
+    const seg = String((err && err.message) || '').split('｜')[0].trim();
+    return (seg || (err && err.code) || 'E_UNKNOWN').slice(0, 120);
+  };
+
   /* ==================== ENGINE-END ==================== */
 
   const GV = {
@@ -314,7 +335,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.17',
+    RUNNER_VERSION: '0.4.18',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -656,19 +677,20 @@
   }
 
   function applyResponse(spec, step, json, scope, extracted, stepLogs, log, onStep, fromCache) {
-    // 断言
+    // 断言（项可字符串或 {assert, on_fail} 对象——项级 on_fail 优先于步骤级，message 支持响应模板）
     const assertResults = [];
     for (const a of step.assert || []) {
+      const expr = (a && typeof a === 'object') ? a.assert : a;
       let r;
-      try { r = ENGINE.evalAssert(a, json, scope); }
+      try { r = ENGINE.evalAssert(expr, json, scope); }
       catch (e) { r = { pass: false, detail: e.message }; }
-      assertResults.push({ assert: a, pass: r.pass, detail: r.detail });
+      assertResults.push({ assert: expr, pass: r.pass, detail: r.detail });
       if (!r.pass) {
-        const of = step.on_fail || {};
+        const of = ENGINE.assertOnFail(a, step, json);
         onStep(step.id, 'failed');
-        log({ t: Date.now(), level: 'fatal', msg: step.id + ' 断言失败: ' + a + '（' + r.detail + '）' });
+        log({ t: Date.now(), level: 'fatal', msg: step.id + ' 断言失败: ' + expr + '（' + r.detail + '）' });
         log({ t: Date.now(), level: 'info', msg: step.id + ' 响应快照: ' + JSON.stringify(ENGINE.redact(json)).slice(0, 600) });
-        throw new RunnerError(of.error || 'E_ASSERT', (of.message || '断言失败: ' + a) + '｜' + r.detail);
+        throw new RunnerError(of.error || 'E_ASSERT', (of.message || '断言失败: ' + expr) + '｜' + r.detail);
       }
     }
     // 抽取
@@ -1991,7 +2013,7 @@
         spec_version: st.specVersion || '',
       };
       if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
-      else payload.error_type = (err && err.code) || 'E_UNKNOWN';
+      else payload.error_type = ENGINE.failReason(err);
       const t0 = Date.now();
       UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
       try {
