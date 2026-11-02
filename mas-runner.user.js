@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.14
+// @version      0.4.15
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -313,7 +313,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.14',
+    RUNNER_VERSION: '0.4.15',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -886,15 +886,24 @@
       <div class="row" id="masr-conn" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
       <div class="row" id="masr-spec-box" style="display:none"><b>spec.json（开发调试用，正常不用碰）</b><br></div>
       <div class="row" id="masr-dev-tools" style="display:none">
-        <button class="primary" id="masr-load">加载 spec</button>
-        <button id="masr-hash">计算 SHA-256</button>
-        <span id="masr-hash-out"></span>
+        <div class="row" style="margin-bottom:6px">
+          <button class="primary" id="masr-load">加载 spec</button>
+          <button id="masr-hash">计算 SHA-256</button>
+          <span id="masr-hash-out"></span>
+        </div>
+        <div class="row" style="margin-bottom:6px">
+          <button class="primary" id="masr-run" title="手工重跑当前加载的 spec（调试用；正常走任务区的「执行」）">重跑当前 spec</button>
+          <button id="masr-export" title="把上次运行结果导出为 JSON（调试排查用）">导出结果 JSON</button>
+        </div>
+        <div class="row" id="masr-dev-conn" style="border:1px dashed #d6e4ff;border-radius:8px;padding:6px 8px"></div>
+        <div class="row" style="margin-top:6px">
+          <button id="masr-dev-unbind" title="换人/换电脑用：接入码、身份缓存、授权码一起清掉，回到首次绑定状态">解除绑定（换人用这台电脑）</button>
+          <span style="font-size:11px;color:#8f959e">清除本机绑定信息，不影响已回写的结果</span>
+        </div>
       </div>
       <div class="row" id="masr-params"></div>
       <div class="row">
-        <button class="primary" id="masr-run">重跑当前 spec</button>
-        <button id="masr-export">导出结果 JSON</button>
-        <button id="masr-cancel-run">清除续跑状态</button>
+        <button id="masr-cancel-run" title="续跑卡住时用：清掉本机的续跑进度（不影响线上数据）">清除续跑状态</button>
         <button id="masr-clear-logs">清空日志</button>
       </div>
       <div class="row"><b>步骤时间线</b><div id="masr-steps"></div></div>
@@ -918,7 +927,17 @@
       const on = box.style.display === 'none';
       box.style.display = on ? '' : 'none';
       tools.style.display = on ? '' : 'none';
+      UI.devOn = on;
       this.style.background = on ? '#e8f3ff' : '';
+      if (on) UI.renderConn(); // dev 展开时把后端地址编辑区一并渲染出来
+    });
+
+    document.getElementById('masr-dev-unbind').addEventListener('click', function () {
+      if (!confirm('解除绑定：接入码、身份缓存、授权码全部清除（换人用这台电脑时用）。\\n确定继续？')) return;
+      GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY);
+      clearAuthCode();
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '已解除绑定（本机绑定信息已清除），回到首次绑定状态' });
+      UI.renderTasks();
     });
 
     document.getElementById('masr-load').addEventListener('click', () => {
@@ -1058,6 +1077,38 @@
     SCENE_BY_TABLE: { tblvQkpB9o2ovRiR: 'huawei_ads_get_key' },
     DEFAULT_SCRIPT: 'huawei_ads_get_key',
     TASKS_TABLE: 'tblvQkpB9o2ovRiR',
+    // 场景视图注册表：加新场景 = 这里加一行（与 SCENE_BY_TABLE 同一模式）。
+    //   name：待办/批量报告里的场景名；columns：待办表格列（field=任务表字段名）；
+    //   emptyHint：空待办提示；requireField：缺了就跳过该条的必填字段（缺省只要求 record_id）。
+    // 没登记的场景走 sceneView() 的保守缺省，UI 不会白屏。
+    SCENE_VIEW: {
+      huawei_ads_get_key: {
+        name: '取密钥',
+        columns: [
+          { field: 'account_id', label: '账户ID' },
+          { field: 'account_name', label: '名称' },
+          { field: 'client', label: '客户' },
+        ],
+        emptyHint: '没有待处理的记录（需同时满足：创建人是你、状态为空、账户ID已填）',
+        requireField: 'account_id',
+      },
+      // 华为ADS 开户建好后加一行（示例）：
+      // huawei_ads_open_account: {
+      //   name: '开户',
+      //   columns: [{ field: 'corp_name', label: '公司名' }, { field: 'client', label: '客户' }],
+      //   emptyHint: '没有待开户的记录（创建人是你、状态为空、公司名已填）',
+      //   requireField: 'corp_name',
+      // },
+    },
+  };
+  SVC.sceneView = function (scriptId) {
+    const v = SVC.SCENE_VIEW[scriptId] || {};
+    return {
+      name: v.name || String(scriptId || '未指定场景').replace(/_/g, ' '),
+      columns: v.columns || [{ field: 'account_id', label: '账户ID' }, { field: 'account_name', label: '名称' }],
+      emptyHint: v.emptyHint || '没有待处理的记录（创建人是你、状态为空）',
+      requireField: v.requireField || '',
+    };
   };
   SVC.base = function () {
     const v = String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, '');
@@ -1223,54 +1274,70 @@
   }
   const connEsc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+  UI.devOn = false; // dev 工具区展开态（由面板的 dev 按钮切换）
+
+  /* 常规模式：连接行只读（后端地址 + 状态，一眼可辨）；
+   * 编辑/覆盖能力全部收进 dev 区（masr-dev-conn，仅 dev 展开时渲染）。 */
   UI.renderConn = function () {
     const box = document.getElementById('masr-conn');
     if (!box) return;
     const base = SVC.base();
 
-    if (connEditing) {
-      box.innerHTML = '<b>连接</b> ' + connTag() +
-        '<div class="row" style="margin-top:4px"><input id="masr-conn-in" value="' + connEsc(base) +
-        '" placeholder="http://127.0.0.1:8787" style="width:100%"></div>' +
-        '<div class="row"><button class="primary" id="masr-conn-save">保存并测试</button>' +
-        '<button id="masr-conn-cancel">取消</button></div>' +
-        '<div id="masr-conn-out" style="font-size:11px;color:#8f959e;line-height:1.6">' + connOut + '</div>';
+    box.innerHTML = '<b>连接</b> ' + connTag() +
+      ' <span style="font-size:11px;color:#4e5969">' + connEsc(base) + '</span>' +
+      (!connEditing && connOut ? '<div style="font-size:11px;color:#8f959e;margin-top:2px;line-height:1.6">' + connOut + '</div>' : '');
 
-      document.getElementById('masr-conn-save').addEventListener('click', function () {
-        const v = (document.getElementById('masr-conn-in').value || '').trim();
-        if (!v) { connOut = '请先填服务地址。'; UI.renderConn(); return; }
-        const had = !!SVC.code();
-        SVC.setBase(v);
-        connOut = '正在测试 ' + connEsc(v) + ' …';
-        UI.renderConn();
-        SVC.ping().then(function (r) {
-          connEditing = false;
-          connOut = '<span style="color:#1a7f45">已连上后端 v' + connEsc(r.version) + '</span>' +
-            (had ? ' · 换端点了，需要重新绑一次身份' : '');
-          UI.renderTasks();
-        }).catch(function (e) {
-          connOut = '<span style="color:#c02a2a">' + connEsc(e.message) + '</span><br>地址已存下，服务起来后点「改地址」再存一次即可。';
-          UI.renderConn();
-        });
+    const dev = document.getElementById('masr-dev-conn');
+    if (!dev || !UI.devOn) return;
+
+    if (!connEditing) {
+      dev.innerHTML = '<b>后端地址</b> <span style="font-size:11px;color:#8f959e">调试用：默认地址已内置，一般不用动</span>' +
+        '<div style="font-size:11px;color:#4e5969;margin-top:2px">' + connEsc(base) + '</div>' +
+        '<div class="row" style="margin-top:4px"><button id="masr-conn-edit" style="font-size:11px;padding:1px 6px">改地址</button>' +
+        (base !== SVC.DEFAULT_BASE ? '<button id="masr-conn-reset" style="font-size:11px;padding:1px 6px">恢复默认</button>' : '') + '</div>' +
+        (connOut ? '<div style="font-size:11px;color:#8f959e;line-height:1.6">' + connOut + '</div>' : '');
+
+      document.getElementById('masr-conn-edit').addEventListener('click', function () {
+        connEditing = true; connOut = ''; UI.renderConn();
       });
-
-      document.getElementById('masr-conn-cancel').addEventListener('click', function () {
-        connEditing = false;
-        connOut = '';
-        UI.renderConn();
+      const rst = document.getElementById('masr-conn-reset');
+      if (rst) rst.addEventListener('click', function () {
+        SVC.setBase(''); // 清掉覆盖值 → base() 回落到内置默认
+        connOut = '已恢复内置默认地址。';
+        UI.renderConn(); UI.renderTasks();
       });
       return;
     }
 
-    box.innerHTML = '<b>连接</b> ' + connTag() +
-      ' <span style="font-size:11px;color:#4e5969">' + connEsc(base) + '</span> ' +
-      '<button id="masr-conn-edit" style="font-size:11px;padding:1px 6px">改地址</button>' +
-      '<div style="font-size:11px;color:#8f959e;margin-top:2px;line-height:1.6">' +
-      (connOut || '') +
-      '</div>';
+    dev.innerHTML = '<b>后端地址</b> <span style="font-size:11px;color:#8f959e">保存后重新测试；换端点需重新绑定身份</span>' +
+      '<div class="row" style="margin-top:4px"><input id="masr-conn-in" value="' + connEsc(base) +
+      '" placeholder="https://mas.wankahuanju.top 或 http://127.0.0.1:8787" style="width:100%"></div>' +
+      '<div class="row"><button class="primary" id="masr-conn-save">保存并测试</button>' +
+      '<button id="masr-conn-cancel">取消</button></div>' +
+      '<div id="masr-conn-out" style="font-size:11px;color:#8f959e;line-height:1.6">' + connOut + '</div>';
 
-    document.getElementById('masr-conn-edit').addEventListener('click', function () {
-      connEditing = true; connOut = ''; UI.renderConn();
+    document.getElementById('masr-conn-save').addEventListener('click', function () {
+      const v = (document.getElementById('masr-conn-in').value || '').trim();
+      if (!v) { connOut = '请先填服务地址。'; UI.renderConn(); return; }
+      const had = !!SVC.code();
+      SVC.setBase(v);
+      connOut = '正在测试 ' + connEsc(v) + ' …';
+      UI.renderConn();
+      SVC.ping().then(function (r) {
+        connEditing = false;
+        connOut = '<span style="color:#1a7f45">已连上后端 v' + connEsc(r.version) + '</span>' +
+          (had ? ' · 换端点了，需要重新绑一次身份' : '');
+        UI.renderTasks();
+      }).catch(function (e) {
+        connOut = '<span style="color:#c02a2a">' + connEsc(e.message) + '</span><br>地址已存下，服务起来后再试一次。';
+        UI.renderConn();
+      });
+    });
+
+    document.getElementById('masr-conn-cancel').addEventListener('click', function () {
+      connEditing = false;
+      connOut = '';
+      UI.renderConn();
     });
   };
 
@@ -1456,20 +1523,8 @@
         '<span style="flex:1 1 auto"></span>' +
         '<button class="primary" id="masr-task-pull">拉我的待办</button>' +
       '</div>' +
-      '<div style="display:flex;align-items:center;gap:8px;margin-top:4px;font-size:10.5px;color:#8f959e;flex-wrap:wrap">' +
-        '<span title="换人用这台电脑：接入码、身份缓存、授权码一起清掉">' +
-          '<button id="masr-task-unbind" class="masr-mini" title="换人用这台电脑：接入码、身份缓存、授权码一起清掉">解除绑定</button>' +
-          ' 换人用这台电脑' +
-        '</span>' +
-        (pend.length ? '<span style="flex:1 1 auto"></span><button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button>' : '') +
-      '</div>' +
+      (pend.length ? '<div style="display:flex;justify-content:flex-end;margin-top:4px"><button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button></div>' : '') +
       '<div id="masr-task-list" style="margin-top:4px"></div>';
-
-    document.getElementById('masr-task-unbind').addEventListener('click', function () {
-      // 换人用这台电脑：接入码、身份缓存、授权码一起清掉
-      GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY);
-      clearAuthCode(); UI.renderTasks();
-    });
 
     const rw = document.getElementById('masr-retry-writes');
     if (rw) rw.addEventListener('click', function () { UI.retryWrites(rw); });
@@ -1479,22 +1534,36 @@
       try {
         const j = await SVC.tasks();
         if (!j.total) {
-          list.innerHTML = '<div style="font-size:11px;color:#8f959e">没有待处理的记录（需同时满足：创建人是你、状态为空、账户ID已填）</div>';
+          list.innerHTML = '<div style="font-size:11px;color:#8f959e">' + SVC.sceneView(SVC.scriptFor({})).emptyHint + '</div>';
           return;
         }
+        // 场景视图：待办列定义、空提示都来自 SCENE_VIEW（加场景=加一行，UI 零改动）
+        const scenes = [];
+        j.items.forEach(function (t) {
+          const sid = t.script_id || SVC.scriptFor(t);
+          if (scenes.indexOf(sid) < 0) scenes.push(sid);
+        });
+        const view = SVC.sceneView(scenes[0]);
+        // 混场景不批量：两种流程的中间页、失败语义不同，混跑收尾报告会对不上
+        const mixed = scenes.length > 1;
         const totalShown = j.items.length;
         list.innerHTML =
           '<div style="font-size:11px;color:#8f959e;margin-bottom:2px">共 ' + j.total + ' 条待办：点「执行」单条跑，或点「批量执行」一次性串行跑完（ADS 会话全局，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
+          (mixed ? '<div style="font-size:11px;color:#b26a00;margin-bottom:2px">⚠ 待办里有 ' + scenes.length + ' 种场景（' +
+            scenes.map(function (s2) { return SVC.sceneView(s2).name; }).join('、') +
+            '）：批量一次只跑一种，请按场景分批；单条「执行」不受影响。</div>' : '') +
+          (!mixed ?
           '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
             '<input id="masr-batch-n" type="number" min="1" max="' + totalShown + '" value="' + totalShown + '" style="width:58px">' +
             '<button class="primary" id="masr-batch-run">批量执行（前 <span id="masr-batch-n-lab">' + totalShown + '</span> 条）</button>' +
             '<button id="masr-batch-stop" style="display:none">停止</button>' +
             '<span id="masr-batch-prog" style="font-size:11px;color:#1a7f45"></span>' +
-          '</div>' +
-          '<table><tr><th>账户ID</th><th>名称</th><th>客户</th><th></th></tr>' +
+          '</div>' : '') +
+          '<table><tr>' + view.columns.map(function (c) { return '<th>' + c.label + '</th>'; }).join('') + '<th></th></tr>' +
           j.items.map(function (t, i) {
-            return '<tr><td>' + (t.account_id || '-') + '</td><td>' + (t.account_name || '-') + '</td>' +
-              '<td>' + (t.client || '-') + '</td><td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
+            return '<tr>' + view.columns.map(function (c) {
+              return '<td>' + (t[c.field] || '-') + '</td>';
+            }).join('') + '<td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
           }).join('') + '</table>' +
           '<div id="masr-batch-report"></div>';
         const nEl = document.getElementById('masr-batch-n');
@@ -1572,12 +1641,12 @@
         }
       }
       const scene = SVC.scriptFor(UI.currentTask);
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：账户 ' + (task.account_id || '') + '（' + task.record_id + '）· 场景 ' + scene });
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：' + SVC.sceneView(scene).name + ' · ' + (task.account_id || task.account_name || task.record_id || '') + '（' + task.record_id + '）' });
       SVC.warmStart(90000); // 跑流程的十几秒里顺手把任务表捂热，回写时就快了
       const s = await SVC.spec(scene);
       UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '，账户ID 已从任务带入' });
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '（任务参数已带入）' });
       await UI.doRun({ keepLog: true });
     } catch (e) {
       UI.appendLog({ t: Date.now(), level: 'fatal', msg: '执行失败（载入阶段）：' + e.message });
@@ -1598,6 +1667,9 @@
     const rows = Array.prototype.slice.call(document.querySelectorAll('#masr-task-list button[data-idx]'));
     rows.forEach(function (b) { b.disabled = true; });
     const total = tasks.length;
+    // 场景视图：批量混场景在待办层已拦截，这里按首条定视图（列/场景名/必填字段）
+    const view = SVC.sceneView((tasks[0] && tasks[0].script_id) || '');
+    const keyOf = function (t) { return t ? (t[view.columns[0].field] || '-') : '-'; };
     let okN = 0, failN = 0, skipN = 0, unknownN = 0, sessFail = 0, done = 0;
     const recs = [];
     const setProg = function () {
@@ -1634,16 +1706,18 @@
       if (UI._batchStop) { UI.appendLog({ t: Date.now(), level: 'warn', msg: '⏹ 用户中止，已处理 ' + done + '/' + total }); break; }
       const task = tasks[i];
       const rec = {
-        idx: i + 1, account_id: (task && task.account_id) || '', account_name: (task && task.account_name) || '',
+        idx: i + 1,
+        keys: view.columns.map(function (c) { return { label: c.label, val: (task && task[c.field]) || '' }; }),
         record_id: (task && task.record_id) || '', ok: null, error: '', message: '', ms: 0, write: 'notrun', writeMsg: ''
       };
       recs.push(rec);
-      if (!task || !task.account_id) {
+      const reqField = view.requireField || 'record_id';
+      if (!task || !task[reqField]) {
         skipN++; done++; rec.ok = 'skip'; rec.write = 'skip'; setProg();
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '[' + rec.idx + '/' + total + '] 跳过：无账户ID（' + (rec.record_id || '无记录ID') + '）' });
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '[' + rec.idx + '/' + total + '] 跳过：必填字段为空（' + reqField + '，' + (rec.record_id || '无记录ID') + '）' });
         continue;
       }
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '▶ [' + rec.idx + '/' + total + '] ' + task.account_id + '（' + task.record_id + '）' });
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '▶ [' + rec.idx + '/' + total + '] ' + keyOf(task) + '（' + (task.record_id || '') + '）' });
       const t0 = Date.now();
       let r = { ok: null, error: '' };
       try { r = await runOneTask(task); }
@@ -1660,9 +1734,9 @@
       const w = await settleWrite(task.record_id);
       rec.write = w.status; rec.writeMsg = w.msg || '';
       if (rec.write === 'queued') {
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ ' + task.account_id + ' 回写未成功，已入本地待写队列（收尾点「重试回写」）' });
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ ' + keyOf(task) + ' 回写未成功，已入本地待写队列（收尾点「重试回写」）' });
       } else if (rec.write === 'unknown') {
-        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '↳ ' + task.account_id + ' 未检测到回写结果，需人工核对是否已落表' });
+        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '↳ ' + keyOf(task) + ' 未检测到回写结果，需人工核对是否已落表' });
       }
       // 连续 2 条会话类失败 → 疑似登录态失效，硬停（避免把失败刷满、也避免反复触发登出）
       if (sessFail >= 2) {
@@ -1677,7 +1751,7 @@
     if (runBtn) runBtn.style.display = '';
     if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
     rows.forEach(function (b) { b.disabled = false; });
-    UI.renderBatchReport(recs, { total: total, skipN: skipN, okN: okN, failN: failN, unknownN: unknownN, batchStart: batchStart });
+    UI.renderBatchReport(recs, { total: total, skipN: skipN, okN: okN, failN: failN, unknownN: unknownN, batchStart: batchStart, view: view });
   };
 
   // 批次收尾报告：失败清单（可一键复制）+ 对账 + 耗时/错误码分布
@@ -1709,6 +1783,8 @@
     const errLine = Object.keys(byErr).sort(function (a, b) { return byErr[b] - byErr[a]; })
       .map(function (k) { return k + ' ×' + byErr[k]; }).join('、');
     const totalMs = Date.now() - s.batchStart;
+    const view = s.view || { name: '批量', columns: [{ field: 'account_id', label: '账户ID' }, { field: 'account_name', label: '名称' }] }; // 兼容旧调用：没传 view 时走保守缺省
+    const keyLabels = view.columns.map(function (c) { return c.label; });
 
     // 结论只看一件事：实跑的每条，结果有没有真进飞书表
     let verdict, vColor;
@@ -1725,7 +1801,7 @@
     let html = '<div style="margin-top:8px;padding:8px;border:1px solid #d9dde3;border-radius:6px;background:#fafbfc;font-size:11px;line-height:1.7">' +
       '<div style="font-weight:600;margin-bottom:4px">' + esc(head) + '</div>' +
       '<div>对账：选中 <b>' + s.total + '</b> · 实跑 <b>' + execN + '</b> · 跳过 <b>' + skipRecs.length + '</b></div>' +
-      '<div>取密钥：成功 <b style="color:#1a7f45">' + s.okN + '</b> / 失败 <b style="color:#c02a2a">' + s.failN + '</b>' + (s.unknownN ? ' / 状态未知 <b>' + s.unknownN + '</b>' : '') + '</div>' +
+      '<div>' + esc(view.name) + '：成功 <b style="color:#1a7f45">' + s.okN + '</b> / 失败 <b style="color:#c02a2a">' + s.failN + '</b>' + (s.unknownN ? ' / 状态未知 <b>' + s.unknownN + '</b>' : '') + '</div>' +
       '<div>回写飞书：已落表 <b>' + writtenN + '</b> / 待补写 <b>' + queuedN + '</b> / 未落账 <b style="color:' + (lostN ? '#c02a2a' : '#1a7f45') + '">' + lostN + '</b></div>' +
       '<div style="color:' + vColor + ';font-weight:600;margin:3px 0">' + esc(verdict) + '</div>' +
       '<div style="color:#5c6672">耗时：总 ' + fmtDur(totalMs) + ' · 平均 ' + (avgMs / 1000).toFixed(1) + 's/条' +
@@ -1736,17 +1812,17 @@
     const needRows = failRecs.concat(lostRecs.filter(function (r) { return r.ok !== false && r.ok !== 'skip'; }));
     if (needRows.length) {
       html += '<div style="margin-top:6px"><b>需处理明细（' + needRows.length + ' 条）</b>' +
-        '<table style="margin-top:3px"><tr><th>#</th><th>账户ID</th><th>名称</th><th>结论</th><th>原因</th></tr>' +
+        '<table style="margin-top:3px"><tr><th>#</th>' + keyLabels.map(function (lb) { return '<th>' + esc(lb) + '</th>'; }).join('') + '<th>结论</th><th>原因</th></tr>' +
         needRows.map(function (r) {
-          const what = r.ok === false ? '取密钥失败' : '未落账';
+          const what = r.ok === false ? esc(view.name) + '失败' : '未落账';
           const why = r.ok === false ? (r.error + (r.message ? '：' + r.message : ''))
             : (r.write === 'norecord' ? '缺少 record_id，无法回写' : ('回写状态未确认' + (r.writeMsg ? '（' + r.writeMsg + '）' : '')));
-          return '<tr><td>' + r.idx + '</td><td>' + esc(r.account_id || '-') + '</td><td>' + esc((r.account_name || '-').slice(0, 18)) + '</td>' +
+          return '<tr><td>' + r.idx + '</td>' + (r.keys || []).map(function (k) { return '<td>' + esc(k.val || '-') + '</td>'; }).join('') +
             '<td style="color:' + (r.ok === false ? '#c02a2a' : '#b8860b') + '">' + what + '</td><td>' + esc(why.slice(0, 90)) + '</td></tr>';
         }).join('') + '</table></div>';
     }
     if (skipRecs.length) {
-      html += '<div style="margin-top:4px;color:#8f959e">跳过 ' + skipRecs.length + ' 条（无账户ID）：' +
+      html += '<div style="margin-top:4px;color:#8f959e">跳过 ' + skipRecs.length + ' 条（必填字段缺失）：' +
         skipRecs.map(function (r) { return esc(r.record_id || '-'); }).join('、') + '</div>';
     }
     html += '<div style="margin-top:6px"><button id="masr-batch-copy">复制结果清单</button>' +
@@ -1758,9 +1834,9 @@
     // 复制用纯文本：直接粘到群里/文档里就能交接
     const buildText = function () {
       const L = [];
-      L.push('华为ADS 取密钥 · 批量结果  ' + new Date().toLocaleString('zh-CN'));
+      L.push('华为ADS ' + view.name + ' · 批量结果  ' + new Date().toLocaleString('zh-CN'));
       L.push('对账：选中 ' + s.total + ' · 实跑 ' + execN + ' · 跳过 ' + skipRecs.length);
-      L.push('取密钥：成功 ' + s.okN + ' / 失败 ' + s.failN + (s.unknownN ? ' / 状态未知 ' + s.unknownN : ''));
+      L.push(view.name + '：成功 ' + s.okN + ' / 失败 ' + s.failN + (s.unknownN ? ' / 状态未知 ' + s.unknownN : ''));
       L.push('回写飞书：已落表 ' + writtenN + ' / 待补写 ' + queuedN + ' / 未落账 ' + lostN);
       if (notYetN > 0) L.push('未处理：' + notYetN + ' 条（批次中止，未执行）');
       L.push('耗时：总 ' + fmtDur(totalMs) + ' · 平均 ' + (avgMs / 1000).toFixed(1) + 's/条');
@@ -1771,10 +1847,10 @@
         needRows.forEach(function (r) {
           const why = r.ok === false ? (r.error + (r.message ? ' ' + r.message : ''))
             : ('未落账 ' + (r.write === 'norecord' ? '缺 record_id' : (r.writeMsg || '')));
-          L.push(r.idx + '. ' + (r.account_id || '-') + '\t' + (r.account_name || '-') + '\t' + why);
+          L.push(r.idx + '. ' + (r.keys || []).map(function (k) { return k.val || '-'; }).join('\t') + '\t' + why);
         });
       }
-      if (skipRecs.length) L.push('跳过（无账户ID）：' + skipRecs.map(function (r) { return r.record_id || '-'; }).join('、'));
+      if (skipRecs.length) L.push('跳过（必填字段缺失）：' + skipRecs.map(function (r) { return r.record_id || '-'; }).join('、'));
       return L.join('\n');
     };
     const cp = document.getElementById('masr-batch-copy');
@@ -1802,7 +1878,7 @@
         ' · 总耗时 ' + fmtDur(totalMs) + ' ===' });
     if (needRows.length) {
       UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ 需处理 ' + needRows.length + ' 条：' +
-        needRows.map(function (r) { return (r.account_id || '-') + '(' + (r.ok === false ? r.error : '未落账') + ')'; }).join('、') });
+        needRows.map(function (r) { return ((r.keys && r.keys[0].val) || '-') + '(' + (r.ok === false ? r.error : '未落账') + ')'; }).join('、') });
     }
   };
 
