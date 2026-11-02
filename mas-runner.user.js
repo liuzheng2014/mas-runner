@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.18
+// @version      0.4.19
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -326,6 +326,13 @@
     return (seg || (err && err.code) || 'E_UNKNOWN').slice(0, 120);
   };
 
+  // 简易字符串哈希（djb2 变体，hex 输出）——仅用于缓存键去重，不做安全用途。
+  ENGINE.strHash = function (s) {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) { h = ((h << 5) + h + s.charCodeAt(i)) >>> 0; }
+    return h.toString(16);
+  };
+
   /* ==================== ENGINE-END ==================== */
 
   const GV = {
@@ -335,7 +342,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.18',
+    RUNNER_VERSION: '0.4.19',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -624,7 +631,9 @@
     const bodyText = step.request.body !== undefined
       ? JSON.stringify(ENGINE.resolvePlaceholders(step.request.body, scope)) : undefined;
     const noRetry = isNoRetryPath(spec, url);
-    const bodyKey = (bodyText || '').length + ':' + url;
+    // 缓存键必须含完整请求体内容（哈希）。2026-11-02 事故：旧键用 bodyText.length，
+    // 两个不同 corpId 长度相同 → A 户的 S1 响应被 B 户命中（串户级）。
+    const bodyKey = ENGINE.strHash((bodyText || '') + '\u0001' + url);
 
     // 步骤缓存
     if (step.cache_ttl_sec) {
@@ -668,9 +677,16 @@
     if (res.status !== 200) {
       // 三要素：状态码 + 响应体快照（脱敏），否则服务端错误无从诊断
       let snippet = res.text.slice(0, 200);
-      try { snippet = JSON.stringify(ENGINE.redact(JSON.parse(res.text))).slice(0, 200); } catch (e) { /* 非 JSON 原样截断 */ }
-      if (res.status === 401 || res.status === 403) throw new RunnerError('E_SESSION', 'HTTP ' + res.status + '，会话可能已失效｜响应: ' + snippet);
-      throw new RunnerError('E_NETWORK', 'HTTP ' + res.status + '｜响应: ' + snippet);
+      // 业务错误信息优先（errorMsg/message）——回写「错误类型」列才能给出人话而不是裸 "HTTP 500"
+      let bizMsg = '';
+      try {
+        const j = JSON.parse(res.text);
+        bizMsg = String(j.errorMsg || j.message || '').trim();
+        snippet = JSON.stringify(ENGINE.redact(j)).slice(0, 200);
+      } catch (e) { /* 非 JSON 原样截断 */ }
+      const head = 'HTTP ' + res.status + (bizMsg ? '（' + bizMsg.slice(0, 80) + '）' : '');
+      if (res.status === 401 || res.status === 403) throw new RunnerError('E_SESSION', head + '，会话可能已失效｜响应: ' + snippet);
+      throw new RunnerError('E_NETWORK', head + '｜响应: ' + snippet);
     }
     if (step.cache_ttl_sec) StepCache.put(spec.spec_id, step.id, bodyKey, json, step.cache_ttl_sec);
     return applyResponse(spec, step, json, scope, extracted, stepLogs, log, onStep, false);
