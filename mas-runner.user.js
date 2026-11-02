@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.12
+// @version      0.4.13
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -18,7 +18,6 @@
 // @connect      svc-drcn.ads.huawei.com
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
-// @connect      open.feishu.cn
 // @connect      *
 // @connect      self
 // @run-at       document-start
@@ -51,6 +50,10 @@
  *     2026-10-30 17:22 实测 permission 请求被 WAF 挂起 2 分 10 秒）
  *   - v0.1.12：pageFetch 加 AbortController 快速失败（默认 25s）——WAF 挂起时 fetch 原本
  *     要挂 ~100s 才被断连，再兜底 GM_xhr 30s，一次挂死白等 2 分多钟；现在 ~55s 内出结果
+ *   - v0.4.13：直连模式整体移除（安全收口）——持口令者即能解出 app_secret，双轨只留攻击面。
+ *     删除 ENC 凭证块/口令解锁/FL 直连飞书模块/dev「从飞书拉 spec」旁路，脚本内不再含任何凭证材料；
+ *     面板第一步=填服务地址（→ 表单绑定 → 拉待办），app_secret 只在服务端（wrangler secret）。
+ *
  *   - v0.4.7：多跳链条收摊修复（2026-10-30 用户实测：子客门户跳过去、密钥页关了，子客首页留着）。
  *     根因：关闭时机挂在 RunState.final.consumed 上，而发起页一收到结果就把 consumed 置 true 并清掉运行态，
  *     上游辅助页（第一个被打开的标签页）轮询到时提前 return，永远等不到关闭 → 只关了最后一页。
@@ -310,7 +313,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.12',
+    RUNNER_VERSION: '0.4.13',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -360,52 +363,6 @@
    * 永远换不到 user_access_token。身份一律走「填表单登记 → 创建人 = 本人」那条路。
    * 这里只留一个 GM_xhr 封装：OpenAPI 无 CORS 头，页面内 fetch 会被拦。
    */
-  // OpenAPI 无 CORS 头，必须走 GM_xhr（服务端与直连共用）
-  function fsHttp(method, url, opts) {
-    const o = opts || {};
-    return new Promise((resolve, reject) => {
-      const req = {
-        method,
-        url,
-        headers: o.headers || {},
-        timeout: o.timeout || 20000,
-        onload: (r) => resolve({ status: r.status, text: r.responseText || '' }),
-        onerror: () => reject(new Error('E_NETWORK ' + method + ' ' + url.replace(/\?.*/, ''))),
-        ontimeout: () => reject(new Error('E_TIMEOUT ' + method + ' ' + url.replace(/\?.*/, ''))),
-      };
-      if (o.body) req.data = o.body;
-      GM_xmlhttpRequest(req);
-    });
-  }
-
-  /* ---------- 业务表只读（拉 spec 用） ----------
-   * 只保留读：应用身份可以读，但按项目铁律，应用身份不得对业务表做写操作。
-   * 回写一律走 SVC.writeResult / FL.writeResult（后者还带 record_id 白名单守卫）。
-   */
-  const FS_BIZ = {
-    APP: 'OC2LbUsiLaRyhcse8P2cZyXintf',
-    SPEC_TABLE: 'tblKAlQwYgLT3fys',
-  };
-
-  async function fsApi(method, path, body) {
-    const access = await FL.token();
-    const res = await fsHttp(method, FL.API + path, {
-      headers: { Authorization: 'Bearer ' + access, 'Content-Type': 'application/json; charset=utf-8' },
-      body: body ? JSON.stringify(body) : null,
-    });
-    let j;
-    try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FS_PARSE ' + res.text.slice(0, 120)); }
-    if (j.code !== 0) throw new Error('E_FS_API ' + j.code + ' ' + (j.msg || '') + ' path=' + path);
-    return j.data;
-  }
-
-  /* ---------- 业务表读写（复用既有 Base，只写约定字段，不改表结构） ---------- */
-  async function fsSearchRecords(tableId, payload) {
-    const d = await fsApi('POST', '/bitable/v1/apps/' + FS_BIZ.APP + '/tables/' + tableId + '/records/search',
-      Object.assign({ page_size: 100 }, payload || {}));
-    return (d && d.items) || [];
-  }
-
   // ---------- 风控限速器 ----------
   function makeLimiter(rateLimit) {
     const rl = rateLimit || {};
@@ -930,7 +887,6 @@
       <div class="row" id="masr-spec-box" style="display:none"><b>spec.json（开发调试用，正常不用碰）</b><br></div>
       <div class="row" id="masr-dev-tools" style="display:none">
         <button class="primary" id="masr-load">加载 spec</button>
-        <button id="masr-fs-pull">从飞书拉 spec</button>
         <button id="masr-hash">计算 SHA-256</button>
         <span id="masr-hash-out"></span>
       </div>
@@ -967,30 +923,6 @@
 
     document.getElementById('masr-load').addEventListener('click', () => {
       UI.applySpec(UI.getSpecText(), {});
-    });
-    document.getElementById('masr-fs-pull').addEventListener('click', async () => {
-      const btn = document.getElementById('masr-fs-pull');
-      const old = btn.textContent;
-      btn.textContent = '拉取中…'; btn.disabled = true;
-      try {
-        const rows = await fsSearchRecords(FS_BIZ.SPEC_TABLE);
-        const cands = rows.filter(r => r.fields && r.fields.spec_json);
-        if (!cands.length) throw new Error('飞书表里没有带 spec_json 的登记行');
-        const isActive = (v) => (Array.isArray(v) ? v.indexOf('active') >= 0 : v === 'active');
-        const actives = cands.filter(r => isActive(r.fields.spec_status));
-        const pick = (actives.length ? actives : cands).sort((a, b) =>
-          String(b.fields.version || '').localeCompare(String(a.fields.version || ''), 'zh-CN', { numeric: true }))[0];
-        UI.applySpec(pick.fields.spec_json, {});
-        UI.appendLog({
-          t: Date.now(), level: 'ok',
-          msg: '已从飞书拉取 spec：' + (pick.fields.name || pick.fields.script_id) + ' v' + (pick.fields.version || '?') +
-            '（' + cands.length + ' 条候选，取 ' + (actives.length ? 'active' : '任意') + ' 最新）'
-        });
-      } catch (e) {
-        UI.appendLog({ t: Date.now(), level: 'fatal', msg: '拉取 spec 失败：' + e.message });
-      } finally {
-        btn.textContent = old; btn.disabled = false;
-      }
     });
     document.getElementById('masr-hash').addEventListener('click', async () => {
       const txt = UI.getSpecText();
@@ -1106,468 +1038,13 @@
     }
   };
 
-  /* ==================== 直连模式（v0.4：Runner 自己调飞书开放 API） ====================
-   * 目标：不依赖任何后端，也能「拉任务 → 执行 → 回写」跑通。
-   *
-   * 凭证不再明文/混淆放在脚本里，而是 AES-256-GCM 密文（下面 ENC）。
-   * 解它的钥匙由 PKDF2-SHA256(口令, 60 万轮) 现场派生 —— 口令不在脚本里，
-   * 由管理员私下发放，脚本首次使用时人工输入一次。
-   *
-   * 这道防线拦得住什么：脚本公开挂在网上 = 只泄露一段密文，没有口令打不开。
-   * 拦不住什么：拿到口令的人（也就是所有正式使用者）能解出 app_secret；
-   *   口令若太弱，拿到密文的人可以离线穷举。所以口令必须够长（≥16 位随机）。
-   * 真要「连使用者都碰不到密钥」，只有服务端代持一条路（面板填服务地址即可切换）。
-   *
-   * 切回服务端：面板里填上服务地址即可 —— SVC.mode() 变成 'svc'，本模块不再被调用。
-   */
-  const ENC = {
-    v: 1,
-    kdf: 'PBKDF2-SHA256',
-    iter: 600000,
-    salt: '/uh49taz9B3WjbOsxjHymw==',
-    iv: 'NH9L7UajUnCrkMo0',
-    ct: 'bcfMO7KlPEVBJZaoDSeaCfeE4ctE5/BndwT2ok3cuzGDE8Yi5K417EzMSRT4ZKi24b+Ya61R5Dpi/mrDP8Kj9bwk7wdYL42A2LVyXKhEhntpF30BNlk=',
-  };
-  const KEK_KEY = 'masr_kek_v1';   // 派生出来的钥匙（base64），存了就不用每次输口令
-  const CRED_KEY = 'masr_cred_v1'; // 解出来的凭证，仅本次会话内存使用
-
-  function b64ToBytes(s) {
-    const bin = atob(String(s || ''));
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-  function bytesToB64(u) {
-    let s = '';
-    for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]);
-    return btoa(s);
-  }
-
-  async function deriveKek(pass, salt, iter) {
-    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
-    return crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt: salt, iterations: iter, hash: 'SHA-256' },
-      base, { name: 'AES-GCM', length: 256 }, true, ['decrypt']
-    );
-  }
-
-  // AES-GCM 的认证标签会替我验口令：口令错 → 直接抛 OperationError
-  async function openWith(kek) {
-    const buf = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: b64ToBytes(ENC.iv) }, kek, b64ToBytes(ENC.ct)
-    );
-    const o = JSON.parse(new TextDecoder().decode(buf));
-    if (!o || !o.id || !o.sec) throw new Error('E_ENC_SHAPE');
-    return { id: String(o.id), sec: String(o.sec) };
-  }
-
-  const FL = {
-    API: 'https://open.feishu.cn/open-apis',
-    APP_TOKEN: 'OC2LbUsiLaRyhcse8P2cZyXintf',
-    T_TASKS: 'tblvQkpB9o2ovRiR',
-    T_SPECS: 'tblKAlQwYgLT3fys',
-    T_REG: 'tblXzPlk6NLPxsNS',
-    FORM_URL: 'https://scnzhojz10ln.feishu.cn/share/base/form/shrcn1WrOocHO5cG8cHrorhXJJe',
-    TTL_MIN: 30,
-    TOK_KEY: 'masr_fl_token_v1',
-  };
-
-  // 字段名（与服务端 mas-service.mjs 的 F 保持一致）
-  const FF = {
-    SCENE: '场景ID',
-    ACCOUNT_ID: '账户ID', ACCOUNT_NAME: '账户名称', CLIENT: '客户主体', STATUS: '状态',
-    SECRET: '秘钥', ERROR_TYPE: '错误类型', ELAPSED: '耗时ms',
-    RUNNER_VER: 'runner版本', SPEC_VER: 'spec版本', CREATOR: '创建人',
-    REG_NAME: '姓名', REG_DEPT: '部门', REG_CODE: '授权码', REG_DEVICE: '身份ID', REG_CREATED: '创建时间',
-  };
-  const WRITABLE = [FF.STATUS, FF.SECRET, FF.ERROR_TYPE, FF.ELAPSED, FF.RUNNER_VER, FF.SPEC_VER];
-  const ST = { OK: '获取成功', FAIL: '获取失败' };
-
-  /* --- 值归一化：文本可能是字符串 / 富文本分段数组；人员字段是 {id,name} 数组 --- */
-  function flPlain(v) {
-    if (v == null) return '';
-    if (typeof v === 'string') return v;
-    if (typeof v === 'number') return String(v);
-    if (Array.isArray(v)) {
-      return v.map(function (x) {
-        if (x == null) return '';
-        if (typeof x === 'string') return x;
-        return x.text != null ? x.text : (x.name || x.en_name || '');
-      }).join('');
-    }
-    if (typeof v === 'object') {
-      if (v.text != null) return String(v.text);
-      if (v.value != null) return flPlain(v.value);
-      return v.name || '';
-    }
-    return String(v);
-  }
-  function flPeople(v) {
-    if (!v) return [];
-    const arr = Array.isArray(v) ? v : [v];
-    return arr.map(function (x) {
-      return { open_id: (x && (x.id || x.open_id)) || '', name: (x && (x.name || x.en_name)) || '' };
-    }).filter(function (p) { return p.open_id; });
-  }
-
-  /* --- 凭证：口令解锁 → 内存缓存；没解锁就发不出任何请求 --- */
-  FL._c = null;
-  FL.lockedReason = 'need-pass'; // '' | 'need-pass' | 'bad-pass' | 'no-crypto' | 'no-blob'
-
-  FL.unlocked = function () { return !!FL._c; };
-
-  FL.unlock = async function (pass, remember) {
-    if (!ENC.salt || String(ENC.salt).indexOf('__') === 0) {
-      FL.lockedReason = 'no-blob';
-      throw new Error('E_ENC 这个构建没有内嵌凭证');
-    }
-    if (typeof crypto === 'undefined' || !crypto.subtle) {
-      FL.lockedReason = 'no-crypto';
-      throw new Error('E_CRYPTO 当前页面不支持 WebCrypto（必须 https）');
-    }
-    const salt = b64ToBytes(ENC.salt);
-    const kek = await deriveKek(pass, salt, ENC.iter);
-    let cred;
-    try {
-      cred = await openWith(kek);
-    } catch (e) {
-      FL.lockedReason = 'bad-pass';
-      throw new Error('E_PASS 口令不对');
-    }
-    FL._c = cred;
-    FL.lockedReason = '';
-    if (remember !== false) {
-      try {
-        const raw = new Uint8Array(await crypto.subtle.exportKey('raw', kek));
-        GM_setValue(KEK_KEY, bytesToB64(raw));
-      } catch (e) {}
-    }
-    return cred;
-  };
-
-  // 开机静默解锁：只有本机存过钥匙时成立（换浏览器 / 清数据 / 换口令后都会要求重输）
-  FL.boot = async function () {
-    if (FL._c) return true;
-    let saved = '';
-    try { saved = GM_getValue(KEK_KEY, ''); } catch (e) {}
-    if (!saved) { FL.lockedReason = 'need-pass'; return false; }
-    try {
-      const kek = await crypto.subtle.importKey('raw', b64ToBytes(saved), { name: 'AES-GCM' }, true, ['decrypt']);
-      FL._c = await openWith(kek);
-      FL.lockedReason = '';
-      return true;
-    } catch (e) {
-      try { GM_deleteValue(KEK_KEY); } catch (e2) {}
-      FL.lockedReason = 'need-pass';
-      return false;
-    }
-  };
-
-  // 所有走直连的调用统一从这里取凭证
-  FL.ensure = async function () {
-    if (FL._c) return FL._c;
-    if (await FL.boot()) return FL._c;
-    throw new Error('E_LOCKED 需要先输入接入口令');
-  };
-
-  // 换人用这台机器 / 口令轮换：清掉本机钥匙
-  FL.lock = function () {
-    FL._c = null; FL.lockedReason = 'need-pass';
-    try { GM_deleteValue(KEK_KEY); } catch (e) {}
-  };
-
-  FL.token = async function (force) {
-    if (!force) {
-      let c = null;
-      try { c = JSON.parse(GM_getValue(FL.TOK_KEY, 'null')); } catch (e) {}
-      if (c && c.v && Date.now() < c.exp - 120000) return c.v;
-    }
-    const cr = await FL.ensure();
-    const res = await fsHttp('POST', FL.API + '/auth/v3/tenant_access_token/internal', {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify({ app_id: cr.id, app_secret: cr.sec }),
-    });
-    let j = {};
-    try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FL_PARSE http=' + res.status); }
-    if (j.code !== 0 || !j.tenant_access_token) throw new Error('E_FL_TOKEN ' + j.code + ' ' + (j.msg || ''));
-    GM_setValue(FL.TOK_KEY, JSON.stringify({ v: j.tenant_access_token, exp: Date.now() + (j.expire || 3000) * 1000 }));
-    return j.tenant_access_token;
-  };
-
-  // 统一调用：token 过期（99991661/99991663）自动换一次再重试
-  FL.api = async function (method, path, body, retried) {
-    const tok = await FL.token();
-    const res = await fsHttp(method, FL.API + path, {
-      headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json; charset=utf-8' },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    let j = {};
-    try { j = JSON.parse(res.text); } catch (e) { throw new Error('E_FL_PARSE http=' + res.status); }
-    if (!retried && (j.code === 99991661 || j.code === 99991663)) {
-      await FL.token(true);
-      return FL.api(method, path, body, true);
-    }
-    if (j.code !== 0) {
-      if (j.code === 1254043) { const e = new Error('E_NOT_FOUND 记录不存在'); e.status = 404; throw e; }
-      throw new Error('E_FL ' + j.code + ' ' + (j.msg || '') + ' ' + String(path).split('?')[0]);
-    }
-    return j.data || {};
-  };
-
-  const flTab = function (t) { return '/bitable/v1/apps/' + FL.APP_TOKEN + '/tables/' + t; };
-  // 注意：不传 field_names —— 实测会让文本字段变成分段数组、长文本被吞
-  FL.search = function (table, filter, size, auto) {
-    return FL.api('POST', flTab(table) + '/records/search?page_size=' + (size || 50), {
-      filter: filter, automatic_fields: auto !== false,
-    });
-  };
-
-  /* 回写守卫：只认「以本人身份查询到的待办」里的 record_id。
-   * 用途是防止误传/构造 id 去改别的行 —— 线上数据只允许改自己刚查出来的那几条。
-   * 名单落 GM（最多 80 条），页面刷新后仍可回写，但永远不会扩大到你没查过的记录。
-   */
-  FL.CLAIM_KEY = 'masr_fl_claims_v1';
-  FL._mine = (function () {
-    try { return JSON.parse(GM_getValue('masr_fl_claims_v1', '{}')) || {}; } catch (e) { return {}; }
-  })();
-  FL.claim = function (recordId) {
-    if (!recordId) return;
-    FL._mine[String(recordId)] = Date.now();
-    try {
-      const ks = Object.keys(FL._mine);
-      if (ks.length > 80) ks.slice(0, ks.length - 80).forEach(function (k) { delete FL._mine[k]; });
-      GM_setValue(FL.CLAIM_KEY, JSON.stringify(FL._mine));
-    } catch (e) {}
-  };
-  FL.claimed = function (recordId) { return !!FL._mine[String(recordId || '')]; };
-
-  /* --- 设备码：本地 HMAC 签名（服务端版本用 app_secret 做同样的事，切过去无缝） --- */
-  function flB64uEncode(str) {
-    const u = new TextEncoder().encode(str);
-    let bin = '';
-    for (let i = 0; i < u.length; i++) bin += String.fromCharCode(u[i]);
-    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  }
-  function flB64uDecode(s) {
-    const b = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
-    const bin = atob(b + '='.repeat((4 - b.length % 4) % 4));
-    const u = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
-    return new TextDecoder().decode(u);
-  }
-  async function flHmac16(text) {
-    const enc = new TextEncoder();
-    const cr = await FL.ensure();
-    const k = await crypto.subtle.importKey('raw', enc.encode(cr.sec), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const sig = await crypto.subtle.sign('HMAC', k, enc.encode(String(text)));
-    let hex = '';
-    new Uint8Array(sig).forEach(function (b) { hex += (b < 16 ? '0' : '') + b.toString(16); });
-    return hex.slice(0, 16);
-  }
-  async function flSign(openId) { return 'd_' + flB64uEncode(String(openId)) + '.' + (await flHmac16(openId)); }
-  async function flVerify(code) {
-    const m = /^d_([A-Za-z0-9_-]+)\.([0-9a-f]{16})$/.exec(String(code || ''));
-    if (!m) return '';
-    let openId = '';
-    try { openId = flB64uDecode(m[1]); } catch (e) { return ''; }
-    if (!openId) return '';
-    return (await flHmac16(openId)) === m[2] ? openId : '';
-  }
-
-  function flIdentity(rec) {
-    const f = rec.fields || {};
-    const c = flPeople(f[FF.CREATOR])[0];
-    if (!c) return null;
-    return {
-      name: flPlain(f[FF.REG_NAME]) || c.name,
-      open_id: c.open_id,
-      dept: flPlain(f[FF.REG_DEPT]),
-      record_id: rec.record_id,
-    };
-  }
-
-  /* --- 业务：待办 / spec / 回写 --- */
-  FL.tasks = async function (limit) {
-    const code = SVC.code();
-    const openId = code ? await flVerify(code) : '';
-    if (!openId) throw new Error('E_AUTH 设备码无效，请重新绑定');
-    const size = Math.min(Math.max(Number(limit) || 50, 1), 200);
-    const data = await FL.search(FL.T_TASKS, {
-      conjunction: 'and',
-      conditions: [
-        { field_name: FF.CREATOR, operator: 'is', value: [openId] },
-        { field_name: FF.STATUS, operator: 'isEmpty', value: [] },
-        { field_name: FF.ACCOUNT_ID, operator: 'isNotEmpty', value: [] },
-      ],
-    }, size, false);
-    const items = (data.items || []).map(function (r) {
-      const f = r.fields || {};
-      return {
-        record_id: r.record_id,
-        account_id: flPlain(f[FF.ACCOUNT_ID]),
-        account_name: flPlain(f[FF.ACCOUNT_NAME]),
-        client: flPlain(f[FF.CLIENT]),
-        // 行内「场景ID」优先（这一列现在还不存在，读不到就是空 → 回落到任务表默认场景）
-        script_id: flPlain(f[FF.SCENE]),
-        table_id: FL.T_TASKS,
-      };
-    });
-    // 登记「本次查到的是哪几条」——回写时只认这些 id
-    items.forEach(function (t) { FL.claim(t.record_id); });
-    return { total: data.total != null ? data.total : items.length, items: items };
-  };
-
-  FL.spec = async function (scriptId) {
-    const data = await FL.api('POST', flTab(FL.T_SPECS) + '/records/search?page_size=200', { automatic_fields: false });
-    const rows = (data.items || []).filter(function (r) {
-      const f = r.fields || {};
-      return flPlain(f.script_id) === scriptId && flPlain(f.spec_json);
-    });
-    const pick = rows.sort(function (a, b) {
-      return flPlain((b.fields || {}).version).localeCompare(flPlain((a.fields || {}).version), 'zh-CN', { numeric: true });
-    })[0];
-    if (!pick) throw new Error('E_NOT_FOUND 没有找到可用的 spec：' + scriptId);
-    const f = pick.fields || {};
-    let spec = flPlain(f.spec_json);
-    try { spec = JSON.parse(spec); } catch (e) {}
-    return { spec_id: scriptId, version: flPlain(f.version), status: flPlain(f.spec_status), spec: spec };
-  };
-
-  FL.writeResult = async function (payload) {
-    const recordId = String(payload.record_id || '').trim();
-    if (!recordId) throw new Error('E_PARAM 缺少 record_id');
-    // 只允许回写「本次以本人身份查询到的待办」，别的一律拒绝（含手传/构造的 id）
-    if (!FL.claimed(recordId)) {
-      throw new Error('E_GUARD 这个 record_id 不在你刚查到的待办里，拒绝回写');
-    }
-    const code = SVC.code();
-    const openId = code ? await flVerify(code) : '';
-    if (!openId) throw new Error('E_AUTH 设备码无效');
-
-    const rec = (await FL.api('GET', flTab(FL.T_TASKS) + '/records/' + encodeURIComponent(recordId))).record;
-    if (!rec) throw new Error('E_NOT_FOUND 记录不存在');
-    const creators = flPeople((rec.fields || {})[FF.CREATOR]);
-    if (!creators.some(function (p) { return p.open_id === openId; })) {
-      throw new Error('E_FORBIDDEN 这条记录不是你创建的，拒绝回写');
-    }
-
-    const fields = {};
-    fields[FF.STATUS] = payload.ok ? ST.OK : ST.FAIL;
-    if (payload.secret != null) fields[FF.SECRET] = String(payload.secret);
-    if (payload.error_type) fields[FF.ERROR_TYPE] = String(payload.error_type);
-    if (payload.elapsed_ms != null && isFinite(Number(payload.elapsed_ms))) fields[FF.ELAPSED] = Number(payload.elapsed_ms);
-    if (payload.runner_version) fields[FF.RUNNER_VER] = String(payload.runner_version);
-    if (payload.spec_version) fields[FF.SPEC_VER] = String(payload.spec_version);
-    Object.keys(fields).forEach(function (k) { if (WRITABLE.indexOf(k) < 0) delete fields[k]; });
-
-    await FL.api('PUT', flTab(FL.T_TASKS) + '/records/' + encodeURIComponent(recordId), { fields: fields });
-    return { record_id: recordId, written: Object.keys(fields) };
-  };
-
-  /* --- 业务：绑定 --- */
-  FL.bindMeta = function () {
-    return { form_url: FL.FORM_URL, form_field: FF.REG_CODE, expires_min: FL.TTL_MIN, code_len: 6 };
-  };
-
-  FL.bindPoll = async function (opts) {
-    const code = String(opts.code || '').trim().toUpperCase();
-    const since = Number(opts.since || 0);
-    const recId = String(opts.record_id || '').trim();
-
-    let rec = null;
-    let how = '';
-
-    if (recId) {
-      const d = await FL.api('GET', flTab(FL.T_REG) + '/records/' + encodeURIComponent(recId) + '?automatic_fields=true');
-      rec = d.record || null;
-      how = 'record_id';
-    } else if (/^[A-Z0-9]{4,12}$/.test(code)) {
-      const d = await FL.search(FL.T_REG, {
-        conjunction: 'and',
-        conditions: [{ field_name: FF.REG_CODE, operator: 'is', value: [code] }],
-      }, 5);
-      rec = (d.items || [])[0] || null;
-      how = 'code';
-    }
-
-    if (!rec) {
-      const d = await FL.search(FL.T_REG, {
-        conjunction: 'and',
-        conditions: [
-          { field_name: FF.REG_DEVICE, operator: 'isEmpty', value: [] },
-          { field_name: FF.REG_NAME, operator: 'isNotEmpty', value: [] },
-        ],
-      }, 50);
-      let cands = d.items || [];
-      if (since) {
-        const floor = since - 120000;
-        cands = cands.filter(function (r) {
-          const c = Number(flPlain((r.fields || {})[FF.REG_CREATED]) || 0);
-          return !c || c >= floor;
-        });
-      }
-      if (cands.length === 1 && since > 0) { rec = cands[0]; how = 'time-window'; }
-      else if (cands.length >= 1) {
-        return {
-          state: 'choose',
-          hint: '检测到 ' + cands.length + ' 条未绑定的登记，请选你自己那条',
-          candidates: cands.slice(0, 10).map(function (r) {
-            const f = r.fields || {};
-            return {
-              record_id: r.record_id,
-              name: flPlain(f[FF.REG_NAME]),
-              dept: flPlain(f[FF.REG_DEPT]),
-              created: Number(flPlain(f[FF.REG_CREATED]) || 0),
-            };
-          }),
-        };
-      } else return { state: 'pending' };
-    }
-
-    const fields = rec.fields || {};
-    const created = Number(flPlain(fields[FF.REG_CREATED]) || 0);
-    if (created && Date.now() - created > FL.TTL_MIN * 60000) {
-      return { state: 'expired', hint: '这条登记已超过 ' + FL.TTL_MIN + ' 分钟，请换一个授权码再提交一次' };
-    }
-
-    const me = flIdentity(rec);
-    if (!me) return { state: 'pending', hint: '记录已找到但取不到创建人，请确认表单已关闭匿名提交' };
-
-    const existing = flPlain(fields[FF.REG_DEVICE]);
-    if (existing && existing !== me.open_id) {
-      return { state: 'pending', hint: '这条登记已被其他人绑定，请联系管理员' };
-    }
-    if (!existing) {
-      await FL.api('PUT', flTab(FL.T_REG) + '/records/' + encodeURIComponent(rec.record_id), {
-        fields: { [FF.REG_DEVICE]: me.open_id },
-      });
-    }
-    const device = await flSign(me.open_id);
-    return { state: 'bound', matched_by: how, device_code: device, name: me.name, dept: me.dept, open_id: me.open_id };
-  };
-
-  /** 校验设备码 + 回表确认未被撤销（等价服务端 /me） */
-  FL.me = async function () {
-    const code = SVC.code();
-    if (!code) return null;
-    const openId = await flVerify(code);
-    if (!openId) return null;
-    const d = await FL.search(FL.T_REG, {
-      conjunction: 'and',
-      conditions: [{ field_name: FF.REG_DEVICE, operator: 'is', value: [openId] }],
-    }, 5);
-    const rec = (d.items || [])[0];
-    if (!rec) return null;
-    const me = flIdentity(rec);
-    if (!me || me.open_id !== openId) return null;
-    GM_setValue(SVC.M_KEY, JSON.stringify({ name: me.name, open_id: me.open_id, dept: me.dept }));
-    return me;
-  };
-
-  /* ==================== 任务服务（v0.2 主路径） ====================
+  /* ==================== 任务服务（v0.4.13 起唯一路径） ====================
    * 业务同学的飞书账号都是外部号，进不了自建应用可用范围 → 客户端拿不到 user_access_token。
-   * 改为：身份留在服务端（应用身份代持），客户端只持一个可撤销的「接入码」。
+   * 身份留在服务端（应用身份代持），客户端只持一个可撤销的「接入码」；
+   * app_secret 只存在于服务端（wrangler secret / 环境变量），脚本内不含任何凭证材料。
    * 端点据接入码识别是谁，并强制只返回/只允许改 创建人 = 本人的行。
+   * v0.4.13：直连模式（脚本内 ENC 凭证 + 口令解锁）已整体移除——
+   *   持口令者即能解出 app_secret，双轨只留攻击面不留价值。
    */
   const SVC = {
     B_KEY: 'masr_svc_base_v1',
@@ -1610,8 +1087,7 @@
     });
   };
 
-  /* 两种模式：填了服务地址走服务端（安全），没填就跑直连（无依赖，先能用） */
-  SVC.mode = function () { return SVC.base() ? 'svc' : 'direct'; };
+  /* v0.4.13 起只有一种模式：填了服务地址走服务端，直连已整体移除（app_secret 只在服务端） */
 
   /* 改后端地址 = 改身份来源：旧设备码可能不是这个端点签的，一并清掉重走绑定 */
   SVC.setBase = function (url) {
@@ -1622,10 +1098,10 @@
     return v;
   };
 
-  /* 探活：直连模式不发请求；后端模式打 /health，顺便核对版本 */
+  /* 探活：打 /health，顺便核对版本。没填地址时由调用方引导填写，不会走到这里 */
   SVC.ping = function () {
     const base = SVC.base();
-    if (!base) return Promise.resolve({ mode: 'direct' });
+    if (!base) return Promise.reject(new Error('E_SVC 还没填服务地址'));
     return new Promise(function (resolve, reject) {
       GM_xmlhttpRequest({
         method: 'GET', url: base + '/health', timeout: 8000,
@@ -1643,12 +1119,7 @@
   };
 
   SVC.bind = async function () {
-    let me;
-    if (SVC.mode() === 'svc') me = (await SVC.call('GET', '/me')).me;
-    else {
-      me = await FL.me();
-      if (!me) throw new Error('E_AUTH 设备码无效，或已在登记表里被撤销');
-    }
+    const me = (await SVC.call('GET', '/me')).me;
     GM_setValue(SVC.M_KEY, JSON.stringify(me));
     return me;
   };
@@ -1659,8 +1130,7 @@
   };
 
   SVC.tasks = function () {
-    const p = SVC.mode() === 'svc' ? SVC.call('GET', '/tasks', { limit: 50 }) : FL.tasks(50);
-    return p.then(function (j) {
+    return SVC.call('GET', '/tasks', { limit: 50 }).then(function (j) {
       (j.items || []).forEach(function (t) {
         if (!t.table_id) t.table_id = SVC.TASKS_TABLE;
       });
@@ -1669,11 +1139,11 @@
   };
   SVC.spec = function (scriptId) {
     const id = scriptId || SVC.scriptFor();
-    return SVC.mode() === 'svc' ? SVC.call('GET', '/spec', { script_id: id }) : FL.spec(id);
+    return SVC.call('GET', '/spec', { script_id: id });
   };
   SVC.writeResult = function (payload) {
     // 45s：服务端对飞书是 15s 硬超时 + 重试一次，客户端预算必须比它大，否则会把"正在重试"误判成失败
-    return SVC.mode() === 'svc' ? SVC.call('POST', '/result', null, payload, { timeout: 45000 }) : FL.writeResult(payload);
+    return SVC.call('POST', '/result', null, payload, { timeout: 45000 });
   };
   /* 预热任务表：飞书侧对某张表的**第一次**访问很慢（实测 15~20s，热了 2s）。
    * 流程跑一趟要十几秒，正好用来把表捂热，等真回写时就是热路径。
@@ -1687,17 +1157,16 @@
       .then(function () { _warming = false; });
   };
   SVC.warmStart = function (ms) {
-    if (SVC.mode() !== 'svc') return null;
+    if (!SVC.base()) return null;
     SVC.warm();
     const t = setInterval(function () { SVC.warm(); }, 6000);
     setTimeout(function () { clearInterval(t); }, ms || 90000);
     return t;
   };
 
-  SVC.bindMeta = function () {    return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/meta') : Promise.resolve(FL.bindMeta());
-  };
+  SVC.bindMeta = function () { return SVC.call('GET', '/bind/meta'); };
   SVC.bindPoll = function (q) {
-    return SVC.mode() === 'svc' ? SVC.call('GET', '/bind/poll', q || {}) : FL.bindPoll(q || {});
+    return SVC.call('GET', '/bind/poll', q || {});
   };
 
   /* ---------- 授权码：本地随机生成，不经过服务端 ----------
@@ -1735,22 +1204,20 @@
   /* ---------- 任务面板 v0.2.1：自助绑定（用户全程不接触任何 ID） ---------- */
 
   function modeTag() {
-    return SVC.mode() === 'svc'
-      ? '<span style="font-size:10px;color:#1a7f45;border:1px solid #b7e0c8;border-radius:3px;padding:0 4px;margin-left:4px">后端</span>'
-      : '<span style="font-size:10px;color:#8f959e;border:1px solid #dcdfe6;border-radius:3px;padding:0 4px;margin-left:4px">直连</span>';
+    return '<span style="font-size:10px;color:#1a7f45;border:1px solid #b7e0c8;border-radius:3px;padding:0 4px;margin-left:4px">后端</span>';
   }
 
   /* ---------- 连接方式：常驻一行，不随任务面板重绘消失 ----------
-   * 直连 = 用脚本内凭证（口令解锁）；后端 = 填一个地址，密钥只在服务端。
-   * 用户要能自己填地址，所以这里给一个永远可见的入口。
+   * v0.4.13 起只有后端一条路：密钥只在服务端，客户端持可撤销接入码。
+   * 用户要能自己填/换地址，所以这里给一个永远可见的入口。
    */
   let connEditing = false;
   let connOut = '';
 
   function connTag() {
-    return SVC.mode() === 'svc'
+    return SVC.base()
       ? '<span style="font-size:10px;color:#1a7f45;border:1px solid #b7e0c8;border-radius:3px;padding:0 4px">后端</span>'
-      : '<span style="font-size:10px;color:#8f959e;border:1px solid #dcdfe6;border-radius:3px;padding:0 4px">直连</span>';
+      : '<span style="font-size:10px;color:#b26a00;border:1px solid #f3d19e;border-radius:3px;padding:0 4px">未配置</span>';
   }
   const connEsc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -1764,13 +1231,12 @@
         '<div class="row" style="margin-top:4px"><input id="masr-conn-in" value="' + connEsc(base) +
         '" placeholder="http://127.0.0.1:8787" style="width:100%"></div>' +
         '<div class="row"><button class="primary" id="masr-conn-save">保存并测试</button>' +
-        '<button id="masr-conn-direct">改回直连</button>' +
         '<button id="masr-conn-cancel">取消</button></div>' +
         '<div id="masr-conn-out" style="font-size:11px;color:#8f959e;line-height:1.6">' + connOut + '</div>';
 
       document.getElementById('masr-conn-save').addEventListener('click', function () {
         const v = (document.getElementById('masr-conn-in').value || '').trim();
-        if (!v) { connOut = '留空就等于直连。要保存请先填地址。'; UI.renderConn(); return; }
+        if (!v) { connOut = '请先填服务地址。'; UI.renderConn(); return; }
         const had = !!SVC.code();
         SVC.setBase(v);
         connOut = '正在测试 ' + connEsc(v) + ' …';
@@ -1786,13 +1252,6 @@
         });
       });
 
-      document.getElementById('masr-conn-direct').addEventListener('click', function () {
-        SVC.setBase('');
-        connEditing = false;
-        connOut = '已切回直连。';
-        UI.renderTasks();
-      });
-
       document.getElementById('masr-conn-cancel').addEventListener('click', function () {
         connEditing = false;
         connOut = '';
@@ -1803,29 +1262,23 @@
 
     box.innerHTML = '<b>连接</b> ' + connTag() +
       ' <span style="font-size:11px;color:#4e5969">' +
-      (base ? connEsc(base) : '直连（用脚本内凭证，不经后端）') + '</span> ' +
-      '<button id="masr-conn-edit" style="font-size:11px;padding:1px 6px">' + (base ? '改地址' : '填后端地址') + '</button>' +
-      (base ? '<button id="masr-conn-off" style="font-size:11px;padding:1px 6px">切回直连</button>' : '') +
+      (base ? connEsc(base) : '还没填服务地址 —— 脚本必须连后端才能拉任务/回写') + '</span> ' +
+      '<button id="masr-conn-edit" style="font-size:11px;padding:1px 6px">' + (base ? '改地址' : '填服务地址') + '</button>' +
       '<div style="font-size:11px;color:#8f959e;margin-top:2px;line-height:1.6">' +
-      (connOut || (base ? '' : '要验证后端就点「填后端地址」，本机起好服务后填 http://127.0.0.1:8787')) +
+      (connOut || (base ? '' : '向管理员要服务地址（形如 https://mas.xxx.com），点「填服务地址」输入')) +
       '</div>';
 
     document.getElementById('masr-conn-edit').addEventListener('click', function () {
       connEditing = true; connOut = ''; UI.renderConn();
     });
-    const off = document.getElementById('masr-conn-off');
-    if (off) off.addEventListener('click', function () {
-      SVC.setBase(''); connOut = '已切回直连。'; UI.renderTasks();
-    });
   };
 
-  // ① 还没配服务地址（只在直连不可用时出现）
-  function renderSvcSetup(box, reason) {
-    const head = reason === 'nokey'
-      ? '内嵌凭证不可用，请填服务端地址'
-      : '未配置服务地址';
-    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">' + head + '</span>' +
-      '<div style="margin-top:4px;font-size:11px;color:#8f959e">正常情况下不需要填 —— 脚本自带直连；填写后改为走后端（更安全）</div>' +
+  // ① 还没配服务地址 → 面板第一步（唯一前置）
+  function renderSvcSetup(box) {
+    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未配置服务地址</span>' +
+      '<div style="margin-top:4px;font-size:11px;color:#4e5969;line-height:1.7">' +
+      '向管理员要<b>服务地址</b>（形如 https://mas.xxx.com），填到下面或上方「连接」一行。<br>' +
+      '填好后会让你绑定身份（飞书表单，30 秒），之后就能拉待办了。</div>' +
       '<div class="row" style="margin-top:4px"><input id="masr-svc-base" placeholder="https://..." style="width:240px"> ' +
       '<button class="primary" id="masr-svc-save">保存</button></div>' +
       '<div id="masr-task-out" style="font-size:11px;color:#8f959e"></div>';
@@ -1835,62 +1288,6 @@
       GM_setValue(SVC.B_KEY, v);
       UI.renderTasks();
     });
-  }
-
-  // ② 未解锁 → 输入接入口令（凭证是密文，没有口令什么都做不了）
-  function renderUnlock(box) {
-    const bad = FL.lockedReason === 'bad-pass';
-    const broken = FL.lockedReason === 'no-blob' || FL.lockedReason === 'no-crypto';
-    if (broken) {
-      box.innerHTML = '<b>任务</b> <span style="color:#c02a2a">凭证不可用</span>' +
-        '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
-        (FL.lockedReason === 'no-blob'
-          ? '这个构建没有内嵌凭证（发布版故意留空），请填服务端地址。'
-          : '当前页面不支持 WebCrypto，请在 https 的飞书页面使用。') + '</div>' +
-        '<div class="row" style="margin-top:6px"><input id="masr-svc-base" placeholder="https://..." style="width:240px"> ' +
-        '<button class="primary" id="masr-svc-save">保存服务地址</button></div>';
-      document.getElementById('masr-svc-save').addEventListener('click', function () {
-        const v = document.getElementById('masr-svc-base').value.trim();
-        if (!v) return;
-        GM_setValue(SVC.B_KEY, v);
-        UI.renderTasks();
-      });
-      return;
-    }
-    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未解锁</span>' +
-      (lockNotice ? '<div style="margin-top:4px;font-size:10.5px;color:#b26a00">' + lockNotice + '</div>' : '') +
-      '<div style="margin-top:6px;font-size:11px;color:#4e5969;line-height:1.7">' +
-      '首次使用请输入管理员发给你的<b>接入口令</b>。只需一次，本机记住。<br>' +
-      '口令只用来解开脚本里的加密凭证，不会发往任何服务器。</div>' +
-      '<div class="row" style="margin-top:6px">' +
-      '<input id="masr-pass" type="password" placeholder="接入口令" autocomplete="off" style="width:230px"> ' +
-      '<button class="primary" id="masr-pass-go">解锁</button></div>' +
-      '<div id="masr-pass-out" style="margin-top:6px;font-size:11px;color:' + (bad ? '#c02a2a' : '#8f959e') + '">' +
-      (bad ? '口令不对，再试一次' : '') + '</div>';
-
-    const inp = document.getElementById('masr-pass');
-    const out = document.getElementById('masr-pass-out');
-    const go = document.getElementById('masr-pass-go');
-    async function submit() {
-      const p = inp.value;
-      if (!p) { out.textContent = '请输入口令'; return; }
-      go.disabled = true; go.textContent = '解锁中…'; out.textContent = '正在派生密钥（约 1 秒）…';
-      try {
-        await FL.unlock(p);
-        out.textContent = '口令正确，正在校验凭证…';
-        await FL.token(true);          // 真发一次换 token，确认凭证可用
-        inp.value = '';
-        lockNotice = '';
-        UI.renderTasks();
-      } catch (e) {
-        go.disabled = false; go.textContent = '解锁';
-        out.style.color = '#c02a2a';
-        out.textContent = /E_PASS/.test(e.message) ? '口令不对，再试一次' : ('解锁失败：' + e.message.replace(/^E_\w+\s*/, ''));
-      }
-    }
-    go.addEventListener('click', submit);
-    inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') submit(); });
-    setTimeout(function () { try { inp.focus(); } catch (e) {} }, 60);
   }
 
   // ③ 未绑定 → 自助绑定
@@ -2076,31 +1473,18 @@
         '<button class="primary" id="masr-task-pull">拉我的待办</button>' +
       '</div>' +
       '<div style="display:flex;align-items:center;gap:8px;margin-top:4px;font-size:10.5px;color:#8f959e;flex-wrap:wrap">' +
-        '<span title="只清掉本机记住的口令钥匙：下次打开要重新输口令。不解绑身份，不影响已回写的结果">' +
-          '<button id="masr-task-lock" class="masr-mini" title="清掉本机记住的口令钥匙；下次打开需重新输入口令（用于共用电脑或轮换口令）。不解绑身份、不影响已回写的结果">锁定凭证</button>' +
-          ' 共用电脑时点这个' +
-        '</span>' +
-        '<span title="换人用这台电脑：设备码、授权码、可回写名单一起清掉">' +
-          '<button id="masr-task-unbind" class="masr-mini" title="换人用这台电脑：设备码、授权码、可回写名单一起清掉">解除绑定</button>' +
+        '<span title="换人用这台电脑：接入码、身份缓存、授权码一起清掉">' +
+          '<button id="masr-task-unbind" class="masr-mini" title="换人用这台电脑：接入码、身份缓存、授权码一起清掉">解除绑定</button>' +
           ' 换人用这台电脑' +
         '</span>' +
         (pend.length ? '<span style="flex:1 1 auto"></span><button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button>' : '') +
       '</div>' +
-      (lockNotice ? '<div style="margin-top:4px;font-size:10.5px;color:#b26a00">' + lockNotice + '</div>' : '') +
       '<div id="masr-task-list" style="margin-top:4px"></div>';
 
-    document.getElementById('masr-task-lock').addEventListener('click', function () {
-      FL.lock();
-      lockNotice = '已锁定：本机记住的口令钥匙已删除，下次打开需重新输入口令。身份绑定与已回写的结果都不受影响。';
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '已锁定凭证：本机口令钥匙已删除（下次打开需重新输入口令）' });
-      UI.renderTasks();
-    });
-
     document.getElementById('masr-task-unbind').addEventListener('click', function () {
-      // 换人用这台电脑：设备码、授权码、可回写名单一起清掉
+      // 换人用这台电脑：接入码、身份缓存、授权码一起清掉
       GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY);
-      try { GM_deleteValue(FL.CLAIM_KEY); FL._mine = {}; } catch (e) {}
-      clearAuthCode(); lockNotice = ''; UI.renderTasks();
+      clearAuthCode(); UI.renderTasks();
     });
 
     const rw = document.getElementById('masr-retry-writes');
@@ -2151,23 +1535,11 @@
     });
   }
 
-  let flBootTried = false;
-  let lockNotice = ''; // 「锁定凭证」后的说明，只在当次会话显示
   UI.renderTasks = function () {
     const box = document.getElementById('masr-tasks');
     if (!box) return;
-    // 直连模式：先尝试静默解锁（本机存过钥匙才成立），不成再要口令
-    if (!SVC.base() && !FL.unlocked()) {
-      if (!flBootTried) {
-        flBootTried = true;
-        box.innerHTML = '<b>任务</b> <span style="color:#8f959e">检查凭证…</span>';
-        FL.boot().then(function (ok) { if (ok) UI.renderTasks(); else renderUnlock(box); })
-          .catch(function () { renderUnlock(box); });
-        return;
-      }
-      renderUnlock(box);
-      return;
-    }
+    // 第一步永远是服务地址（v0.4.13 起没有别的路径）
+    if (!SVC.base()) { renderSvcSetup(box); return; }
     if (!SVC.code()) { renderBind(box); return; }
     const me = SVC.me();
     if (!me) {
@@ -2207,7 +1579,7 @@
         write_token: task.write_token || '',
       };
       // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
-      if (SVC.mode() === 'svc') {
+      {
         try { await SVC.ping(); }
         catch (e) {
           connOut = '<span style="color:#c02a2a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
@@ -2460,7 +1832,7 @@
       table_id: task.table_id, script_id: task.script_id || '',
       write_token: task.write_token || '',
     };
-    if (SVC.mode() === 'svc') {
+    {
       try { await SVC.ping(); }
       catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），中止批量' }); throw e; }
     }
