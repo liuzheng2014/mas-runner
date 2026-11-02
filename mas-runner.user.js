@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.15
+// @version      0.4.16
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -313,7 +313,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.15',
+    RUNNER_VERSION: '0.4.16',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1670,6 +1670,7 @@
     // 场景视图：批量混场景在待办层已拦截，这里按首条定视图（列/场景名/必填字段）
     const view = SVC.sceneView((tasks[0] && tasks[0].script_id) || '');
     const keyOf = function (t) { return t ? (t[view.columns[0].field] || '-') : '-'; };
+    const specCache = {}; // 批内 spec 缓存：同批同场景只拉一次（省每条 2~4s 的飞书全表读）
     let okN = 0, failN = 0, skipN = 0, unknownN = 0, sessFail = 0, done = 0;
     const recs = [];
     const setProg = function () {
@@ -1678,6 +1679,7 @@
     const batchStart = Date.now();
     setProg();
     UI.appendLog({ t: batchStart, level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
+    SVC.warmStart(120000); // 顺手把飞书任务表捂热：首条回写可省 1~2s（失败静默，不影响流程）
 
     // 等本条回写拿到飞书接口的真实结果：'written'（已落表）/ 'queued'（进待写队列）/ 'unknown'（等不到）
     // 回写 job 由发起页轮询器触发（1.5s 一个周期），所以先等它登记，再直接 await 那个 promise。
@@ -1720,7 +1722,7 @@
       UI.appendLog({ t: Date.now(), level: 'info', msg: '▶ [' + rec.idx + '/' + total + '] ' + keyOf(task) + '（' + (task.record_id || '') + '）' });
       const t0 = Date.now();
       let r = { ok: null, error: '' };
-      try { r = await runOneTask(task); }
+      try { r = await runOneTask(task, specCache); }
       catch (e) { r = { ok: false, error: 'E_BATCH', message: e.message }; UI.appendLog({ t: Date.now(), level: 'fatal', msg: '[' + rec.idx + '/' + total + '] 异常：' + e.message }); }
       rec.ms = Date.now() - t0;
       rec.ok = r.ok; rec.error = r.error || ''; rec.message = r.message || '';
@@ -1884,8 +1886,10 @@
 
   function delay(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
 
-  // 跑单条任务（与 runTask 同流程，但可 await 完成，并回传结果），供批量串行复用
-  async function runOneTask(task) {
+  // 跑单条任务（与 runTask 同流程，但可 await 完成，并回传结果），供批量串行复用。
+  // specCache（可选）：批内 spec 缓存 {scene, s} —— 同批同场景只拉一次，
+  // 省掉每条 2~4s 的「服务端→飞书全表读」；spec 中途发版只会影响下一个批次（版本已锁定在日志里）。
+  async function runOneTask(task, specCache) {
     UI.currentTask = {
       record_id: task.record_id, account_id: task.account_id,
       table_id: task.table_id, script_id: task.script_id || '',
@@ -1896,10 +1900,16 @@
       catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），中止批量' }); throw e; }
     }
     const scene = SVC.scriptFor(UI.currentTask);
-    const s = await SVC.spec(scene);
+    let s = specCache && specCache.scene === scene ? specCache.s : null;
+    if (s) {
+      UI.appendLog({ t: Date.now(), level: 'info', msg: 'spec 命中批内缓存：' + s.spec_id + ' v' + s.version + '（跳过服务端拉取）' });
+    } else {
+      s = await SVC.spec(scene);
+      if (specCache) { specCache.scene = scene; specCache.s = s; }
+    }
     UI.currentTask.spec_version = s.version;
     UI.applySpec(JSON.stringify(s.spec), { persist: true });
-    UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '，账户ID 已从任务带入' });
+    UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '（任务参数已带入）' });
     await UI.doRun({ keepLog: true });
     return await waitRunDone();
   }
