@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.4.13",
+  "version": "0.4.14",
   "file": "mas-runner.user.js",
-  "sha256": "52a0bffe185109ac9b8e05950f16c6ce2d23c630e914b09cfc78b8bc2ba2d53d",
-  "bytes": 140574,
-  "published_at": "2026-11-02T14:46:23+08:00",
+  "sha256": "4f5e637fdb83b695ec1e989fd2ce6a0d7d38fef99ed04dfb54ebf6483f74ef1b",
+  "bytes": 139155,
+  "published_at": "2026-11-02T15:36:19+08:00",
   "install_url": "https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "v0.4.13: 直连模式整体移除（安全收口）——脚本内零凭证材料，app_secret 只在服务端；面板第一步=填服务地址"
+  "notes": "v0.4.14: 内置默认后端 https://mas.wankahuanju.top（Cloudflare Workers），装完即用进绑定流程，无需手填服务地址"
 }

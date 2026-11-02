@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.13
+// @version      0.4.14
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -313,7 +313,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.13',
+    RUNNER_VERSION: '0.4.14',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1050,19 +1050,24 @@
     B_KEY: 'masr_svc_base_v1',
     C_KEY: 'masr_svc_code_v1',
     M_KEY: 'masr_svc_me_v1',
+    // 默认后端：随版本发布内置（v0.4.14 起）。装完即用，无需手填地址。
+    // 「改地址」按钮保留为逃生门：服务迁移/本机 temp-up 调试时临时覆盖。
+    DEFAULT_BASE: 'https://mas.wankahuanju.top',
     // 场景 → script_id：按「任务表」给默认值，任务行填了「场景ID」则以行内为准。
     // 将来加场景：新任务表在这里加一行，或在那行任务里填场景ID —— 拉 spec 的代码不用改。
     SCENE_BY_TABLE: { tblvQkpB9o2ovRiR: 'huawei_ads_get_key' },
     DEFAULT_SCRIPT: 'huawei_ads_get_key',
     TASKS_TABLE: 'tblvQkpB9o2ovRiR',
   };
-  SVC.base = function () { return String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, ''); };
+  SVC.base = function () {
+    const v = String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, '');
+    return v || SVC.DEFAULT_BASE;
+  };
   SVC.code = function () { return String(GM_getValue(SVC.C_KEY, '') || ''); };
   SVC.me = function () { try { return JSON.parse(GM_getValue(SVC.M_KEY, 'null')); } catch (e) { return null; } };
 
   SVC.call = function (method, path, query, body, opts) {
     const base = SVC.base();
-    if (!base) return Promise.reject(new Error('E_SVC 还没填服务地址'));
     let url = base + path;
     const q = query || {};
     const ks = Object.keys(q);
@@ -1101,7 +1106,6 @@
   /* 探活：打 /health，顺便核对版本。没填地址时由调用方引导填写，不会走到这里 */
   SVC.ping = function () {
     const base = SVC.base();
-    if (!base) return Promise.reject(new Error('E_SVC 还没填服务地址'));
     return new Promise(function (resolve, reject) {
       GM_xmlhttpRequest({
         method: 'GET', url: base + '/health', timeout: 8000,
@@ -1215,9 +1219,7 @@
   let connOut = '';
 
   function connTag() {
-    return SVC.base()
-      ? '<span style="font-size:10px;color:#1a7f45;border:1px solid #b7e0c8;border-radius:3px;padding:0 4px">后端</span>'
-      : '<span style="font-size:10px;color:#b26a00;border:1px solid #f3d19e;border-radius:3px;padding:0 4px">未配置</span>';
+    return '<span style="font-size:10px;color:#1a7f45;border:1px solid #b7e0c8;border-radius:3px;padding:0 4px">后端</span>';
   }
   const connEsc = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -1261,34 +1263,16 @@
     }
 
     box.innerHTML = '<b>连接</b> ' + connTag() +
-      ' <span style="font-size:11px;color:#4e5969">' +
-      (base ? connEsc(base) : '还没填服务地址 —— 脚本必须连后端才能拉任务/回写') + '</span> ' +
-      '<button id="masr-conn-edit" style="font-size:11px;padding:1px 6px">' + (base ? '改地址' : '填服务地址') + '</button>' +
+      ' <span style="font-size:11px;color:#4e5969">' + connEsc(base) + '</span> ' +
+      '<button id="masr-conn-edit" style="font-size:11px;padding:1px 6px">改地址</button>' +
       '<div style="font-size:11px;color:#8f959e;margin-top:2px;line-height:1.6">' +
-      (connOut || (base ? '' : '向管理员要服务地址（形如 https://mas.xxx.com），点「填服务地址」输入')) +
+      (connOut || '') +
       '</div>';
 
     document.getElementById('masr-conn-edit').addEventListener('click', function () {
       connEditing = true; connOut = ''; UI.renderConn();
     });
   };
-
-  // ① 还没配服务地址 → 面板第一步（唯一前置）
-  function renderSvcSetup(box) {
-    box.innerHTML = '<b>任务</b> <span style="color:#8f959e">未配置服务地址</span>' +
-      '<div style="margin-top:4px;font-size:11px;color:#4e5969;line-height:1.7">' +
-      '向管理员要<b>服务地址</b>（形如 https://mas.xxx.com），填到下面或上方「连接」一行。<br>' +
-      '填好后会让你绑定身份（飞书表单，30 秒），之后就能拉待办了。</div>' +
-      '<div class="row" style="margin-top:4px"><input id="masr-svc-base" placeholder="https://..." style="width:240px"> ' +
-      '<button class="primary" id="masr-svc-save">保存</button></div>' +
-      '<div id="masr-task-out" style="font-size:11px;color:#8f959e"></div>';
-    document.getElementById('masr-svc-save').addEventListener('click', function () {
-      const v = document.getElementById('masr-svc-base').value.trim();
-      if (!v) { document.getElementById('masr-task-out').textContent = '请填服务地址'; return; }
-      GM_setValue(SVC.B_KEY, v);
-      UI.renderTasks();
-    });
-  }
 
   // ③ 未绑定 → 自助绑定
   function renderBind(box) {
@@ -1539,7 +1523,6 @@
     const box = document.getElementById('masr-tasks');
     if (!box) return;
     // 第一步永远是服务地址（v0.4.13 起没有别的路径）
-    if (!SVC.base()) { renderSvcSetup(box); return; }
     if (!SVC.code()) { renderBind(box); return; }
     const me = SVC.me();
     if (!me) {
