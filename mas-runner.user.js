@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.11
+// @version      0.4.12
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
 // @supportURL   https://github.com/liuzheng2014/mas-runner/issues
-// @updateURL    https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
-// @downloadURL  https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
+// @updateURL    https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
+// @downloadURL  https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
 // @match        https://ads.huawei.com/*
 // @match        https://*.ads.huawei.com/*
 // @match        https://*.feishu.cn/*
@@ -310,14 +310,17 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.11',
-    // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
-    // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
+    RUNNER_VERSION: '0.4.12',
+    // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
+    // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
+    // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
+    // 此处的 manifest 列表只用于「检查更新」按钮与启动静默自检的显式查询（按序尝试）。
     UPDATE_MANIFEST: [
+      'https://gitee.com/dahan_2014/mas-runner/raw/main/manifest.json',
       'https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/manifest.json',
       'https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/manifest.json'
     ],
-    INSTALL_URL: 'https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js',
+    INSTALL_URL: 'https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js',
   };
 
   // ---------- 运行态存取（GM 存储跨域共享，导航后由新页面恢复） ----------

@@ -8,9 +8,15 @@
 1. 浏览器装 **Tampermonkey**（油猴）扩展；
 2. 打开下面这个地址，油猴会弹出安装页，点「安装」：
 
-   https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
+   https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
 
 3. 之后**不需要再手动重装**：脚本头部声明了 `@updateURL`，油猴会定期自动检查并静默升级到新版本。
+
+   安装/更新主源是 Gitee（国内直连稳定）；GitHub raw 与 jsDelivr 是镜像备份，
+   面板「检查更新」会按 Gitee → GitHub → jsDelivr 顺序尝试：
+
+   - 镜像 1（GitHub raw）：https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js
+   - 镜像 2（jsDelivr）：https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js
 
 ## 确认版本 / 手动更新
 

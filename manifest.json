@@ -1,13 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.4.11",
+  "version": "0.4.12",
   "file": "mas-runner.user.js",
-  "sha256": "c012873c70d2f0794713f85ae2f0cdf01a3d9c28412d34fee01651b16be93c87",
-  "bytes": 168791,
-  "published_at": "2026-11-02T10:47:52+08:00",
-  "install_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
-  "mirror_url": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
-  "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js",
+  "sha256": "837bff113c34c4c2d4f81e340c88772f53e4608f026d6c56e90bb9578f315d74",
+  "bytes": 169010,
+  "published_at": "2026-11-02T12:40:18+08:00",
+  "install_url": "https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js",
+  "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
+  "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
+  "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "v0.4.11: 批量对账改用回写 API 的真实返回——pushTaskResult 返回 Promise 并登记 _writeJobs，settleWrite 直接 await 该 promise（原为轮询状态变量猜测，正常要多等 8s）；失败时带回飞书返回的错误原因；去掉冗余 _batchHook；新增 test_settle_write.mjs"
+  "notes": "v0.4.12: 自更新通道多源化——@updateURL 主源改 Gitee raw（国内无代理可达），UPDATE_MANIFEST 变 Gitee→GitHub→jsDelivr 三源按序尝试；publish_runner.py 双仓推送并各自回读校验"
 }
