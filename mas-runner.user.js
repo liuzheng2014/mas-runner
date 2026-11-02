@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.10
+// @version      0.4.11
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -310,7 +310,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.10',
+    RUNNER_VERSION: '0.4.11',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库）。raw 为主，jsDelivr 为备——
     // 油猴自身按 @updateURL 静默更新，此处的 manifest 只用于「检查更新」按钮的显式查询与版本提示。
     UPDATE_MANIFEST: [
@@ -2194,7 +2194,6 @@
   UI.runTask = async function (task, btn) {
     if (UI._running) return;
     UI._running = true;
-    UI._batchHook = null; // 单条跑：清掉批量的回写钩子，避免残留串账
     const old = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
     try {
@@ -2243,9 +2242,6 @@
     const total = tasks.length;
     let okN = 0, failN = 0, skipN = 0, unknownN = 0, sessFail = 0, done = 0;
     const recs = [];
-    const writeMap = {};
-    // 回写是异步的（不阻塞主流程），靠钩子把每条的回写结果收上来，批量收尾才能对账
-    UI._batchHook = function (rid, status, msg) { if (rid) writeMap[rid] = { status: status, msg: msg || '' }; };
     const setProg = function () {
       if (prog) prog.textContent = '进度 ' + done + '/' + total + ' · 成功 ' + okN + ' / 失败 ' + failN + (skipN ? ' / 跳过 ' + skipN : '');
     };
@@ -2253,15 +2249,27 @@
     setProg();
     UI.appendLog({ t: batchStart, level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
 
-    // 等某条回写定态：'written'（已落表）/ 'queued'（进待写队列）/ 'unknown'（没等到，需人工核对）
-    async function settleWrite(rid, timeoutMs) {
-      if (!rid) return 'norecord';
-      const st = Date.now();
-      while (Date.now() - st < timeoutMs) {
-        if (writeMap[rid]) return writeMap[rid].status;
-        await delay(200);
+    // 等本条回写拿到飞书接口的真实结果：'written'（已落表）/ 'queued'（进待写队列）/ 'unknown'（等不到）
+    // 回写 job 由发起页轮询器触发（1.5s 一个周期），所以先等它登记，再直接 await 那个 promise。
+    async function settleWrite(rid) {
+      if (!rid) return { status: 'norecord', msg: '' };
+      if (!UI._writeJobs) UI._writeJobs = {};
+      const jDeadline = Date.now() + 4000; // 等登记：轮询器周期 1.5s + 余量
+      while (Date.now() < jDeadline && !UI._writeJobs[rid]) await delay(100);
+      const job = UI._writeJobs[rid];
+      if (!job) return { status: 'unknown', msg: '本轮未发起回写' };
+      let r = null, tid = null;
+      const timeoutP = new Promise(function (res) { tid = setTimeout(function () { res(null); }, 45000); });
+      try {
+        r = await Promise.race([job, timeoutP]);
+      } catch (e) {
+        r = { written: false, msg: String((e && e.message) || e) };
+      } finally {
+        if (tid) clearTimeout(tid);
       }
-      return 'unknown';
+      delete UI._writeJobs[rid]; // 消费后删，避免堆积
+      if (!r) return { status: 'unknown', msg: '回写 45s 未返回' };
+      return { status: r.written ? 'written' : 'queued', msg: r.msg || '' };
     }
 
     for (let i = 0; i < total; i++) {
@@ -2291,8 +2299,8 @@
       } else { unknownN++; sessFail = 0; } // 运行态提前清空，状态未知 → 不计入失败/连错
       done++; setProg();
       // 回写定态了再记账：不等就会漏掉「密钥取到了但没写进表」这种最危险的情况
-      rec.write = await settleWrite(task.record_id, 8000);
-      if (writeMap[task.record_id]) rec.writeMsg = writeMap[task.record_id].msg || '';
+      const w = await settleWrite(task.record_id);
+      rec.write = w.status; rec.writeMsg = w.msg || '';
       if (rec.write === 'queued') {
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '↳ ' + task.account_id + ' 回写未成功，已入本地待写队列（收尾点「重试回写」）' });
       } else if (rec.write === 'unknown') {
@@ -2308,7 +2316,6 @@
 
     UI._running = false;
     UI._batchStop = false;
-    UI._batchHook = null;
     if (runBtn) runBtn.style.display = '';
     if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
     rows.forEach(function (b) { b.disabled = false; });
@@ -2511,50 +2518,59 @@
     throw lastErr;
   }
 
-  async function pushTaskResult(st, ok, outputs, err) {
+  // 回写一条任务结果。返回 Promise<{written, msg}> —— 批量直接 await 这个真实结果，不用轮询猜状态。
+  // 原有调用方（发起页轮询器 / 失败分支）不 await，行为与之前一致。
+  function pushTaskResult(st, ok, outputs, err) {
     const task = st && st.task;
-    if (!task || !task.record_id) return;
-    const payload = {
-      record_id: task.record_id,
-      // 透传：这条记录从 /tasks 下来就带着凭据，回写只做一次 PUT，服务端不再回读记录
-      write_token: task.write_token || '',
-      ok: !!ok,
-      elapsed_ms: Date.now() - (st.startedAt || Date.now()),
-      runner_version: GV.RUNNER_VERSION,
-      spec_version: st.specVersion || '',
-    };
-    if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
-    else payload.error_type = (err && err.code) || 'E_UNKNOWN';
-    const t0 = Date.now();
-    UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
-    try {
-      await writeWithRetry(payload);
-      UI.appendLog({
-        t: Date.now(), level: 'ok',
-        msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') +
-          '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
-      });
-      if (UI._batchHook) UI._batchHook(task.record_id, 'written');
-      if (!UI._running) UI.renderTasks();
-    } catch (e) {
-      pwAdd(payload);
-      const msg = String((e && e.message) || e);
-      const local = /127\.0\.0\.1|localhost/.test(SVC.base() || '');
-      // 分清是谁的问题：后端连不上飞书 ≠ 本机服务没跑 ≠ 结果本身有问题
-      let hint;
-      if (/E_FS_TIMEOUT|E_FS_NET/.test(msg)) hint = '（后端连飞书超时/被网络掐了，与结果本身无关）';
-      else if (/E_FS_TOKEN|E_FS_API|E_FS_PARSE/.test(msg)) hint = '（飞书接口报错，看括号里的错误码）';
-      else if (/E_SVC_NET|E_SVC_TIMEOUT/.test(msg)) hint = local ? '（本机验证服务没在跑？起来后点「重试回写」即可）' : '（连不上后端，恢复后点「重试回写」）';
-      else hint = '';
-      UI.appendLog({
-        t: Date.now(), level: 'fatal',
-        msg: '⚠️ 回写飞书失败：' + msg + hint +
-          ' —— 该结果已存本地待写队列，不会丢'
-      });
-      if (UI._batchHook) UI._batchHook(task.record_id, 'queued', msg);
-      if (!UI._running) UI.renderTasks();
-      updResultWarn(pwList().length);
-    }
+    if (!task || !task.record_id) return Promise.resolve({ written: false, msg: 'no-record' });
+    const job = (async function () {
+      const payload = {
+        record_id: task.record_id,
+        // 透传：这条记录从 /tasks 下来就带着凭据，回写只做一次 PUT，服务端不再回读记录
+        write_token: task.write_token || '',
+        ok: !!ok,
+        elapsed_ms: Date.now() - (st.startedAt || Date.now()),
+        runner_version: GV.RUNNER_VERSION,
+        spec_version: st.specVersion || '',
+      };
+      if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
+      else payload.error_type = (err && err.code) || 'E_UNKNOWN';
+      const t0 = Date.now();
+      UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
+      try {
+        await writeWithRetry(payload);
+        UI.appendLog({
+          t: Date.now(), level: 'ok',
+          msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') +
+            '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
+        });
+        if (!UI._running) UI.renderTasks();
+        return { written: true, msg: '' };
+      } catch (e) {
+        pwAdd(payload);
+        const msg = String((e && e.message) || e);
+        const local = /127\.0\.0\.1|localhost/.test(SVC.base() || '');
+        // 分清是谁的问题：后端连不上飞书 ≠ 本机服务没跑 ≠ 结果本身有问题
+        let hint;
+        if (/E_FS_TIMEOUT|E_FS_NET/.test(msg)) hint = '（后端连飞书超时/被网络掐了，与结果本身无关）';
+        else if (/E_FS_TOKEN|E_FS_API|E_FS_PARSE/.test(msg)) hint = '（飞书接口报错，看括号里的错误码）';
+        else if (/E_SVC_NET|E_SVC_TIMEOUT/.test(msg)) hint = local ? '（本机验证服务没在跑？起来后点「重试回写」即可）' : '（连不上后端，恢复后点「重试回写」）';
+        else hint = '';
+        UI.appendLog({
+          t: Date.now(), level: 'fatal',
+          msg: '⚠️ 回写飞书失败：' + msg + hint +
+            ' —— 该结果已存本地待写队列，不会丢'
+        });
+        if (!UI._running) UI.renderTasks();
+        updResultWarn(pwList().length);
+        return { written: false, msg: msg };
+      }
+    })();
+    // 登记 job：批量收尾用 UI._writeJobs[record_id] 直接 await 到飞书接口的真实返回
+    if (!UI._writeJobs) UI._writeJobs = {};
+    if (Object.keys(UI._writeJobs).length > 200) UI._writeJobs = {}; // 兜底，正常每条消费后即删
+    UI._writeJobs[task.record_id] = job;
+    return job;
   }
   function updResultWarn(n) {
     const el = document.getElementById('masr-result');
