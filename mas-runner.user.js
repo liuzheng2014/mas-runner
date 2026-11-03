@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.6.1
+// @version      0.6.2
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -159,6 +159,51 @@
     };
     scan(tpl);
     return acc;
+  };
+
+  // ---------- UI 填充原语（v0.6.2：Automa 式「引擎填表单、人点提交」） ----------
+  // 引擎只认三个动作：click（点元素）/ type（设输入框值并派发 input+change，兼容 Vue/ElementUI）/
+  // wait（等待）。定位一律 XPath；选择器与取值属于业务知识，全部由 spec 步骤的 ui.actions 声明，
+  // 引擎不内置任何业务页面知识。{{param}} 占位符按 scope 解析，解析为空即报错（禁止静默填空值）。
+  ENGINE.uiFindByXPath = function (xp) {
+    if (typeof document === 'undefined') throw new Error('E_ENV ui 步骤需要 DOM 环境');
+    const r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    return r.singleNodeValue;
+  };
+  ENGINE.uiSetValue = function (el, val) {
+    const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, val); else el.value = val; // 用原生 setter 绕过 Vue 重写的 value
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  ENGINE.execUiActions = async function (actions, scope, opts) {
+    opts = opts || {};
+    const gap = Number(opts.gap_ms) || 400;
+    const log = opts.log || function () {};
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    for (let i = 0; i < (actions || []).length; i++) {
+      const a = actions[i] || {};
+      const act = String(a.do || '');
+      if (act === 'wait') { await sleep(Number(a.ms) || gap); continue; }
+      const target = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
+      const el = ENGINE.uiFindByXPath(target);
+      if (!el) throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '') + '——页面可能改版，或表单尚未渲染完');
+      if (act === 'click') {
+        log('点击 ' + (a.name || target));
+        el.click();
+      } else if (act === 'type') {
+        const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
+        if (!String(val).length) throw new Error('E_UI_VALUE 填充值解析为空: ' + (a.name || a.target) + '——查任务参数或表字段值');
+        log('填写 ' + (a.name || target) + ' = ' + (String(val).length > 28 ? String(val).slice(0, 28) + '…' : val));
+        ENGINE.uiSetValue(el, val);
+      } else {
+        throw new Error('E_SPEC 未知 ui 动作: ' + act);
+      }
+      await sleep(gap);
+    }
+    return {};
   };
 
   // ---------- cookie 派生变量 ----------
@@ -345,7 +390,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.6.1',
+    RUNNER_VERSION: '0.6.2',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -595,6 +640,11 @@
           }
           continue;
         }
+        if (step.mode === 'ui') {
+          await execUi(spec, step, scope, stepLogs, log, onStep, i);
+          scope = buildScope(spec, params, extracted, vars);
+          continue;
+        }
         if (step.mode !== 'api') {
           throw new RunnerError('E_SPEC', '未知步骤 mode: ' + step.mode);
         }
@@ -626,6 +676,28 @@
 
   function RunnerError(code, message) { this.code = code; this.message = message; }
   RunnerError.prototype = Object.create(Error.prototype);
+
+  /* UI 步骤执行：纯页面填充（click/type/wait），无网络请求、无写操作。
+   * 选择器与取值全部来自 spec 的 step.ui.actions（业务知识在 spec，引擎只做原语）。 */
+  async function execUi(spec, step, scope, stepLogs, log, onStep, idx) {
+    onStep(step.id, 'running');
+    const ui = step.ui || {};
+    const t0 = Date.now();
+    log({ t: t0, level: 'info', msg: step.id + ' → 页面填充（' + ((ui.actions) || []).length + ' 个动作，间隔 ' + (Number(ui.gap_ms) || 400) + 'ms）' });
+    try {
+      await ENGINE.execUiActions(ui.actions || [], scope, {
+        gap_ms: ui.gap_ms,
+        log: function (m) { log({ t: Date.now(), level: 'info', msg: step.id + ' · ' + m }); },
+      });
+    } catch (e) {
+      onStep(step.id, 'fail');
+      stepLogs.push({ id: step.id, ms: Date.now() - t0, error: e.message });
+      throw e; // 交给 runSpec 的 catch 走 on_fail / RunnerError 通道
+    }
+    stepLogs.push({ id: step.id, ms: Date.now() - t0 });
+    onStep(step.id, 'done');
+    log({ t: Date.now(), level: 'ok', msg: step.id + ' ✓ 页面填充完成（共 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's）' });
+  }
 
   async function execApi(spec, step, scope, extracted, stepLogs, log, onStep, idx, gate) {
     onStep(step.id, 'running');
@@ -837,6 +909,7 @@
       ensureStepVars(spec, step, vars);
       scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域
       if (step.write === true) throw new RunnerError('E_PERM', 'v0.1 不执行写操作: ' + step.id);
+      if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i); continue; }
       if (step.mode === 'navigate') {
         const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i);
         if (nav && nav.initiated) return { ok: true, navInitiated: true, stepId: step.id, stepLogs, extracted, resumed: true };
@@ -2668,6 +2741,41 @@
     });
   };
 
+  /* 回写模式：auto=跑完自动回写（默认，兼容全部老场景）；manual=人确认后才回写。
+   * manual 用于「引擎填表单、人点提交」的场景：提交动作在人手里，成功/失败都轮不到引擎自动判定——
+   * 填完表不等于已发送，填失败也不该把记录写死成失败态（保持"未邀请"下次还能触发）。 */
+  function wbModeOf(spec) {
+    return (spec && spec.scene && spec.scene.writeback && spec.scene.writeback.mode) || 'auto';
+  }
+  UI.renderManualWriteback = function (spec) {
+    const old = document.getElementById('masr-manual-wb'); if (old) old.remove();
+    const host = document.getElementById('masr-trigger-box') || document.getElementById('masr-result');
+    if (!host) return;
+    const outputs = (UI.lastResult && UI.lastResult.outputs) || {};
+    const box = document.createElement('div');
+    box.id = 'masr-manual-wb';
+    box.style.cssText = 'margin-top:8px;padding:8px 10px;border:1px solid #b7d8b0;background:#f0f8ee;border-radius:8px;font-size:12px;line-height:1.7';
+    box.innerHTML = '<b>表单已自动填充。请人工核对页面后点击「发送邀请」</b><br>' +
+      '<span style="color:#5a6b58">发送成功后回来点「已发送」；本次不发就点「暂不发送」（记录保持"未邀请"，下次可重新触发）</span><br>' +
+      '<button id="masr-wb-ok" class="primary" style="margin-top:6px">已发送，回写</button>' +
+      '<button id="masr-wb-skip" style="margin-left:8px">暂不发送</button>';
+    host.appendChild(box);
+    const st = function () { return { task: UI.currentTask, startedAt: UI._runStartedAt || Date.now(), specVersion: spec.version }; };
+    document.getElementById('masr-wb-ok').addEventListener('click', function () {
+      box.innerHTML = '⏳ 正在回写…';
+      const job = pushTaskResult(st(), true, outputs);
+      Promise.resolve(job).then(function (r) {
+        box.innerHTML = (r && r.written) ? '✅ 已按「已发送」回写成功，本条流程结束' : '⚠️ 回写未落表：' + ((r && r.msg) || '') + '（结果已存本地，可稍后「重试回写」）';
+      }).catch(function (e) {
+        box.innerHTML = '⚠️ 回写失败：' + e.message + '（结果已存本地待写队列，稍后「重试回写」）';
+      });
+    });
+    document.getElementById('masr-wb-skip').addEventListener('click', function () {
+      box.innerHTML = '已跳过回写，记录保持「未邀请」';
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '人工选择暂不发送：不回写，记录保持"未邀请"，下次可重新触发' });
+    });
+  };
+
   UI.doRun = async function (opts) {
     opts = opts || {};
     // 续跑优先：落地页上 spec/参数从运行态恢复，不要求本页先粘贴 spec
@@ -2744,6 +2852,17 @@
           ? '<b style="color:#b8860b">⏳ 新标签页已打开</b>：落地后自动续跑，全部跑完辅助标签页会自动关闭、结果回到本页。'
           : '<b style="color:#b8860b">⏳ 等待导航落地</b>：落地后自动续跑；若 8 秒后未自动续跑，切到落地页点「执行」。';
       } else {
+        // manual 回写模式：填充≠已发送，不广播 final（发起页轮询器就不会自动写表），改出人工确认按钮
+        if (wbModeOf(spec) === 'manual' && UI.currentTask && UI.currentTask.record_id) {
+          const stm = RunState.get() || {};
+          UI._runStartedAt = stm.startedAt || Date.now();
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 表单填充完成（manual 回写：是否已发送由人工确认，不自动写表）===' });
+          renderOutputs(result.outputs || {});
+          RunState.clear();
+          UI.renderManualWriteback(spec);
+          console.log('[MASR] result =', result);
+          return;
+        }
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 执行完成 ===' });
         renderOutputs(result.outputs || {});
         // 广播最终结果：辅助标签页自毁，发起页弹窗展示
@@ -2775,8 +2894,14 @@
             // 本页直接展示过，轮询器不再重复播报；但「失败」同样要回写（错误类型要进飞书表）
             stc.final.consumed = true;
             if (stc.task && stc.task.record_id && !stc.final.written) {
-              stc.final.written = true;
-              pushTaskResult(stc, false, null, { code: code, message: e.message });
+              if (wbModeOf(spec) === 'manual') {
+                // manual 模式：填充失败不写表（记录保持原状态，可重试）；提示人现场处置
+                stc.final.manual = true;
+                UI.appendLog({ t: Date.now(), level: 'warn', msg: 'manual 回写模式：填充失败，不自动写表，记录保持原状态；可排查后重新触发' });
+              } else {
+                stc.final.written = true;
+                pushTaskResult(stc, false, null, { code: code, message: e.message });
+              }
             }
           }
           RunState.set(stc);
@@ -3143,8 +3268,8 @@
         } else {
           UI.appendLog({ t: Date.now(), level: 'fatal', msg: '=== 流程在某个后续页面终止: [' + (s.final.error || 'E_UNKNOWN') + '] ' + (s.final.message || '') + ' ===' });
         }
-        // 回写飞书（只有带任务上下文时才写；服务端会再校验归属）
-        if (!s.final.written) {
+        // 回写飞书（只有带任务上下文时才写；服务端会再校验归属；manual 模式的 final 不自动写）
+        if (!s.final.written && !s.final.manual) {
           s.final.written = true; RunState.set(s);
           pushTaskResult(s, s.final.ok, s.final.outputs, { code: s.final.error, message: s.final.message });
         }
