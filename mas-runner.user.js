@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.4.19
+// @version      0.5.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -342,7 +342,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.4.19',
+    RUNNER_VERSION: '0.5.0',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1113,43 +1113,85 @@
     // 默认后端：随版本发布内置（v0.4.14 起）。装完即用，无需手填地址。
     // 「改地址」按钮保留为逃生门：服务迁移/本机 temp-up 调试时临时覆盖。
     DEFAULT_BASE: 'https://mas.wankahuanju.top',
-    // 场景 → script_id：按「任务表」给默认值，任务行填了「场景ID」则以行内为准。
-    // 将来加场景：新任务表在这里加一行，或在那行任务里填场景ID —— 拉 spec 的代码不用改。
-    SCENE_BY_TABLE: { tblvQkpB9o2ovRiR: 'huawei_ads_get_key' },
-    DEFAULT_SCRIPT: 'huawei_ads_get_key',
-    TASKS_TABLE: 'tblvQkpB9o2ovRiR',
-    // 场景视图注册表：加新场景 = 这里加一行（与 SCENE_BY_TABLE 同一模式）。
-    //   name：待办/批量报告里的场景名；columns：待办表格列（field=任务表字段名）；
-    //   emptyHint：空待办提示；requireField：缺了就跳过该条的必填字段（缺省只要求 record_id）。
-    // 没登记的场景走 sceneView() 的保守缺省，UI 不会白屏。
-    SCENE_VIEW: {
-      huawei_ads_get_key: {
-        name: '取密钥',
-        columns: [
-          { field: 'account_id', label: '账户ID' },
-          { field: 'account_name', label: '名称' },
-          { field: 'client', label: '客户' },
-        ],
-        emptyHint: '没有待处理的记录（需同时满足：创建人是你、状态为空、账户ID已填）',
-        requireField: 'account_id',
-      },
-      // 华为ADS 开户建好后加一行（示例）：
-      // huawei_ads_open_account: {
-      //   name: '开户',
-      //   columns: [{ field: 'corp_name', label: '公司名' }, { field: 'client', label: '客户' }],
-      //   emptyHint: '没有待开户的记录（创建人是你、状态为空、公司名已填）',
-      //   requireField: 'corp_name',
-      // },
-    },
+    // v0.5.0：Runner 不再登记任何业务场景。
+    // 场景名、待办列、触发规则全部由服务端 /scenes 下发（服务端从 spec.scene 读），
+    // 加新场景 = 加一份 spec —— 这里一行不改，也不认识任何表 ID / 业务列名。
+    SCENES_KEY: 'masr_scenes_v1',
+    SCENES_TTL_MS: 10 * 60 * 1000,
   };
+  /* 场景元数据缓存（进程内 + GM 存储双份，跨页/重开不用重拉）。
+   * _scenePending 做在途去重：启动与点「拉待办」几乎同时发生时只打一次 /scenes。 */
+  SVC._sceneCache = null;
+  SVC._scenePending = null;
+  SVC.scenes = function (force) {
+    const now = Date.now();
+    if (!force && SVC._sceneCache && now - SVC._sceneCache.at < SVC.SCENES_TTL_MS) {
+      return Promise.resolve(SVC._sceneCache.list);
+    }
+    if (!force && SVC._scenePending) return SVC._scenePending;
+    if (!force) {
+      try {
+        const c = JSON.parse(GM_getValue(SVC.SCENES_KEY, '') || 'null');
+        if (c && c.at && now - c.at < SVC.SCENES_TTL_MS) {
+          SVC._sceneCache = c;
+          return Promise.resolve(c.list || []);
+        }
+      } catch (e) {}
+    }
+    SVC._scenePending = SVC.call('GET', '/scenes').then(function (j) {
+      const c = { at: Date.now(), list: j.scenes || [] };
+      SVC._sceneCache = c;
+      SVC._scenePending = null;
+      try { GM_setValue(SVC.SCENES_KEY, JSON.stringify(c)); } catch (e) {}
+      return c.list;
+    }).catch(function () {
+      SVC._scenePending = null;
+      return (SVC._sceneCache && SVC._sceneCache.list) || [];
+    });
+    return SVC._scenePending;
+  };
+  SVC.sceneById = function (scriptId) {
+    const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+    for (let i = 0; i < list.length; i++) if (list[i].script_id === scriptId) return list[i];
+    return null;
+  };
+  /* 展示视图：服务端下发的 display 为准；拿不到就保守缺省（不猜业务列名） */
   SVC.sceneView = function (scriptId) {
-    const v = SVC.SCENE_VIEW[scriptId] || {};
+    const s = SVC.sceneById(scriptId);
+    const cols = (s && Array.isArray(s.display)) ? s.display : [];
     return {
-      name: v.name || String(scriptId || '未指定场景').replace(/_/g, ' '),
-      columns: v.columns || [{ field: 'account_id', label: '账户ID' }, { field: 'account_name', label: '名称' }],
-      emptyHint: v.emptyHint || '没有待处理的记录（创建人是你、状态为空）',
-      requireField: v.requireField || '',
+      name: (s && s.name) || String(scriptId || '未指定场景').replace(/_/g, ' '),
+      columns: cols.length
+        ? cols.map(function (d) { return { field: d.param, label: d.label || d.param }; })
+        : [{ field: 'record_id', label: '记录' }],
+      emptyHint: '没有待处理的记录（筛选条件由该场景的 spec 声明，通常为「创建人是你 + 状态为空」）',
+      requireField: '',
     };
+  };
+  /* URL 触发：打开某页面时该用哪个场景 —— 规则同样来自 spec.scene.trigger */
+  SVC.matchTrigger = function (url) {
+    const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+    const href = String(url || location.href);
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i];
+      const tr = s.trigger;
+      if (!tr || !Array.isArray(tr.url_patterns)) continue;
+      for (let k = 0; k < tr.url_patterns.length; k++) {
+        let re = null;
+        try { re = new RegExp(tr.url_patterns[k]); } catch (e) { continue; }
+        if (!re.test(href)) continue;
+        let rid = '';
+        const q = tr.record_id_query;
+        if (q) {
+          try { rid = new URLSearchParams((href.split('#')[1] || '').split('?')[1] || '').get(q) || ''; } catch (e) {}
+          if (!rid) {
+            try { rid = new URLSearchParams(href.split('?')[1] || '').get(q) || ''; } catch (e) {}
+          }
+        }
+        return { script_id: s.script_id, name: s.name, record_id: rid };
+      }
+    }
+    return null;
   };
   SVC.base = function () {
     const v = String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, '');
@@ -1220,21 +1262,26 @@
     return me;
   };
   /* 这条任务该用哪个场景的 spec：行内「场景ID」> 任务表默认 > 全局默认 */
+  /* 这条任务该用哪个场景：行内 script_id 优先（服务端按 scene 下发时必有）；
+   * 没有且全场只有一个场景 → 用它；否则返回空，由调用方提示「该行未指定场景」，绝不猜。 */
   SVC.scriptFor = function (task) {
     const t = task || (typeof UI !== 'undefined' && UI.currentTask) || {};
-    return String(t.script_id || SVC.SCENE_BY_TABLE[t.table_id || SVC.TASKS_TABLE] || SVC.DEFAULT_SCRIPT);
+    if (t.script_id) return String(t.script_id);
+    const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+    return list.length === 1 ? list[0].script_id : '';
   };
 
-  SVC.tasks = function () {
-    return SVC.call('GET', '/tasks', { limit: 50 }).then(function (j) {
+  SVC.tasks = function (scriptId) {
+    return SVC.call('GET', '/tasks', scriptId ? { script_id: scriptId } : {}).then(function (j) {
       (j.items || []).forEach(function (t) {
-        if (!t.table_id) t.table_id = SVC.TASKS_TABLE;
+        if (!t.script_id) t.script_id = scriptId || '';
       });
       return j;
     });
   };
   SVC.spec = function (scriptId) {
     const id = scriptId || SVC.scriptFor();
+    if (!id) return Promise.reject(new Error('E_SCENE 未能确定场景：该行没有 script_id，且当前不止一个场景'));
     return SVC.call('GET', '/spec', { script_id: id });
   };
   SVC.writeResult = function (payload) {
@@ -1245,17 +1292,19 @@
    * 流程跑一趟要十几秒，正好用来把表捂热，等真回写时就是热路径。
    * 失败一律忽略——预热只是加速，不是依赖。 */
   let _warming = false;
-  SVC.warm = function () {
+  SVC.warm = function (scriptId) {
     if (!SVC.base() || _warming) return;
     _warming = true;
-    SVC.call('GET', '/health', { warm: 1 }, null, { timeout: 25000 })
+    const q = { warm: 1 };
+    if (scriptId) q.script_id = scriptId;   // 让服务端预热该场景的表（场景表 ID 只有服务端从 spec 里知道）
+    SVC.call('GET', '/health', q, null, { timeout: 25000 })
       .catch(function () {})
       .then(function () { _warming = false; });
   };
-  SVC.warmStart = function (ms) {
+  SVC.warmStart = function (ms, scriptId) {
     if (!SVC.base()) return null;
-    SVC.warm();
-    const t = setInterval(function () { SVC.warm(); }, 6000);
+    SVC.warm(scriptId);
+    const t = setInterval(function () { SVC.warm(scriptId); }, 6000);
     setTimeout(function () { clearInterval(t); }, ms || 90000);
     return t;
   };
@@ -1569,27 +1618,39 @@
 
     const rw = document.getElementById('masr-retry-writes');
     if (rw) rw.addEventListener('click', function () { UI.retryWrites(rw); });
+    // 单元格取值：优先 display（服务端按 scene.display 算好的），其次 params，最后原字段
+    function cellOf(t, f) {
+      if (!t) return '';
+      if (t.display && t.display[f] !== undefined) return t.display[f];
+      if (t.params && t.params[f] !== undefined) return t.params[f];
+      return t[f];
+    }
     document.getElementById('masr-task-pull').addEventListener('click', async function () {
       const list = document.getElementById('masr-task-list');
       list.innerHTML = '<span style="font-size:11px;color:#8f959e">正在查询…</span>';
       try {
+        await SVC.scenes();                       // 先拿场景元数据（名称/列/触发都来自 spec）
         const j = await SVC.tasks();
         if (!j.total) {
           list.innerHTML = '<div style="font-size:11px;color:#8f959e">' + SVC.sceneView(SVC.scriptFor({})).emptyHint + '</div>';
           return;
         }
-        // 场景视图：待办列定义、空提示都来自 SCENE_VIEW（加场景=加一行，UI 零改动）
+        // 场景分组：列定义、场景名全部来自 /scenes（服务端从 spec.scene 读），Runner 不登记任何场景
         const scenes = [];
         j.items.forEach(function (t) {
           const sid = t.script_id || SVC.scriptFor(t);
           if (scenes.indexOf(sid) < 0) scenes.push(sid);
         });
         const view = SVC.sceneView(scenes[0]);
-        // 混场景不批量：两种流程的中间页、失败语义不同，混跑收尾报告会对不上
         const mixed = scenes.length > 1;
         const totalShown = j.items.length;
+        // 混场景时不套单一场景的列（各场景列不同），改显示「场景 + 记录」
+        const cols = mixed ? [{ field: '__scene', label: '场景' }, { field: 'record_id', label: '记录' }] : view.columns;
+        const trig = UI._trigger;
         list.innerHTML =
           '<div style="font-size:11px;color:#8f959e;margin-bottom:2px">共 ' + j.total + ' 条待办：点「执行」单条跑，或点「批量执行」一次性串行跑完（ADS 会话全局，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
+          (trig ? '<div style="font-size:11px;color:#1a7f45;margin-bottom:2px">当前页面匹配场景「' + (trig.name || trig.script_id) + '」' +
+            (trig.record_id ? '，记录 ' + trig.record_id + ' 已在列表中标出' : '') + '</div>' : '') +
           (mixed ? '<div style="font-size:11px;color:#b26a00;margin-bottom:2px">⚠ 待办里有 ' + scenes.length + ' 种场景（' +
             scenes.map(function (s2) { return SVC.sceneView(s2).name; }).join('、') +
             '）：批量一次只跑一种，请按场景分批；单条「执行」不受影响。</div>' : '') +
@@ -1600,10 +1661,12 @@
             '<button id="masr-batch-stop" style="display:none">停止</button>' +
             '<span id="masr-batch-prog" style="font-size:11px;color:#1a7f45"></span>' +
           '</div>' : '') +
-          '<table><tr>' + view.columns.map(function (c) { return '<th>' + c.label + '</th>'; }).join('') + '<th></th></tr>' +
+          '<table><tr>' + cols.map(function (c) { return '<th>' + c.label + '</th>'; }).join('') + '<th></th></tr>' +
           j.items.map(function (t, i) {
-            return '<tr>' + view.columns.map(function (c) {
-              return '<td>' + (t[c.field] || '-') + '</td>';
+            const hit = trig && trig.record_id && t.record_id === trig.record_id;
+            return '<tr' + (hit ? ' style="background:#f0fff4"' : '') + '>' + cols.map(function (c) {
+              const v = c.field === '__scene' ? SVC.sceneView(t.script_id).name : cellOf(t, c.field);
+              return '<td>' + (v === null || v === undefined || v === '' ? '-' : v) + (hit && c === cols[0] ? ' ←当前页面' : '') + '</td>';
             }).join('') + '<td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
           }).join('') + '</table>' +
           '<div id="masr-batch-report"></div>';
@@ -1666,9 +1729,12 @@
     if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
     try {
       UI.currentTask = {
-        record_id: task.record_id, account_id: task.account_id,
+        record_id: task.record_id,
         table_id: task.table_id, script_id: task.script_id || '',
-        // 回写凭据：拉待办时服务端签好的，回写时原样带回 → 服务端零查表
+        // 服务端按 spec.scene.task_source.params 映射好的参数（引擎只负责透传，不认识参数含义）
+        params: task.params || null,
+        display: task.display || null,
+        // 回写凭据：拉待办时服务端签好的（含 script_id），回写时原样带回 → 服务端零查表
         write_token: task.write_token || '',
       };
       // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
@@ -1682,8 +1748,11 @@
         }
       }
       const scene = SVC.scriptFor(UI.currentTask);
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：' + SVC.sceneView(scene).name + ' · ' + (task.account_id || task.account_name || task.record_id || '') + '（' + task.record_id + '）' });
-      SVC.warmStart(90000); // 跑流程的十几秒里顺手把任务表捂热，回写时就快了
+      // 任务摘要只取 scene.display 的第一个值（列名是业务侧声明的，Runner 不认识具体含义）
+      const dk = task.display ? Object.keys(task.display) : [];
+      const dv = dk.length ? task.display[dk[0]] : '';
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：' + SVC.sceneView(scene).name + ' · ' + (dv || task.record_id) + '（' + task.record_id + '）' });
+      SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
       const s = await SVC.spec(scene);
       UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
@@ -1710,7 +1779,13 @@
     const total = tasks.length;
     // 场景视图：批量混场景在待办层已拦截，这里按首条定视图（列/场景名/必填字段）
     const view = SVC.sceneView((tasks[0] && tasks[0].script_id) || '');
-    const keyOf = function (t) { return t ? (t[view.columns[0].field] || '-') : '-'; };
+    const keyOf = function (t) {
+      if (!t) return '-';
+      const f = view.columns[0].field;
+      const v = (t.display && t.display[f] !== undefined) ? t.display[f]
+        : (t.params && t.params[f] !== undefined) ? t.params[f] : t[f];
+      return (v === null || v === undefined || v === '') ? '-' : v;
+    };
     const specCache = {}; // 批内 spec 缓存：同批同场景只拉一次（省每条 2~4s 的飞书全表读）
     let okN = 0, failN = 0, skipN = 0, unknownN = 0, sessFail = 0, done = 0;
     const recs = [];
@@ -1720,7 +1795,7 @@
     const batchStart = Date.now();
     setProg();
     UI.appendLog({ t: batchStart, level: 'info', msg: '=== 批量执行开始：共 ' + total + ' 条，串行处理（前台运行，勿切窗）===' });
-    SVC.warmStart(120000); // 顺手把飞书任务表捂热：首条回写可省 1~2s（失败静默，不影响流程）
+    SVC.warmStart(120000, (tasks[0] && tasks[0].script_id) || ''); // 顺手把该场景的表捂热：首条回写可省 1~2s（失败静默）
 
     // 在途回写：批量里回写不阻塞下一条任务（回写走服务端→飞书，与 ADS 会话无关，天然可并行），
     // 收尾前统一等全部落定再出报告 —— 账目口径不变，只是把 3~4s/条 的干等挪到了后台。
@@ -1836,7 +1911,7 @@
     const errLine = Object.keys(byErr).sort(function (a, b) { return byErr[b] - byErr[a]; })
       .map(function (k) { return k + ' ×' + byErr[k]; }).join('、');
     const totalMs = Date.now() - s.batchStart;
-    const view = s.view || { name: '批量', columns: [{ field: 'account_id', label: '账户ID' }, { field: 'account_name', label: '名称' }] }; // 兼容旧调用：没传 view 时走保守缺省
+    const view = s.view || { name: '批量', columns: [{ field: 'record_id', label: '记录' }] }; // 兼容旧调用：没传 view 时走保守缺省
     const keyLabels = view.columns.map(function (c) { return c.label; });
 
     // 结论只看一件事：实跑的每条，结果有没有真进飞书表
@@ -1942,7 +2017,7 @@
   // 省掉每条 2~4s 的「服务端→飞书全表读」；spec 中途发版只会影响下一个批次（版本已锁定在日志里）。
   async function runOneTask(task, specCache) {
     UI.currentTask = {
-      record_id: task.record_id, account_id: task.account_id,
+      record_id: task.record_id,
       table_id: task.table_id, script_id: task.script_id || '',
       write_token: task.write_token || '',
     };
@@ -2019,24 +2094,29 @@
     const task = st && st.task;
     if (!task || !task.record_id) return Promise.resolve({ written: false, msg: 'no-record' });
     const job = (async function () {
+      // v0.5.0：不再拼任何业务字段名。只上报「成功/失败 + outputs」，
+      // 写什么列、写什么值，由服务端按该 spec 的 scene.writeback 渲染（Runner 零场景知识）。
       const payload = {
         record_id: task.record_id,
-        // 透传：这条记录从 /tasks 下来就带着凭据，回写只做一次 PUT，服务端不再回读记录
+        // 透传：这条记录从 /tasks 下来就带着凭据（含 script_id），回写只做一次 PUT，服务端不再回读记录
         write_token: task.write_token || '',
-        ok: !!ok,
+        status: ok ? 'ok' : 'fail',
+        values: outputs || {},
         elapsed_ms: Date.now() - (st.startedAt || Date.now()),
         runner_version: GV.RUNNER_VERSION,
         spec_version: st.specVersion || '',
       };
-      if (ok) payload.secret = (outputs && (outputs.api_key || outputs.secret)) || '';
-      else payload.error_type = ENGINE.failReason(err);
+      if (!ok) {
+        payload.error_type = ENGINE.failReason(err);
+        payload.error_message = (err && (err.message || err.code)) || '';
+      }
       const t0 = Date.now();
       UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
       try {
         await writeWithRetry(payload);
         UI.appendLog({
           t: Date.now(), level: 'ok',
-          msg: '✅ 已回写飞书：' + (ok ? '获取成功' : '获取失败（' + payload.error_type + '）') +
+          msg: '✅ 已回写飞书：' + (ok ? '成功' : '失败（' + payload.error_type + '）') +
             '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
         });
         if (!UI._running) UI.renderTasks();
@@ -2099,14 +2179,13 @@
     UI.renderTasks();
   };
 
-  /* 参数取值：任务行能给的直接给，不再让人手抄账户ID（抄错就会跑到别人账户上） */
+  /* 参数取值：只认服务端按 spec.scene.task_source.params 映射好的 params。
+   * v0.5.0 删掉了「参数名 → 账户ID」那类业务特判——参数名映射属于场景，不该写在引擎里。 */
   UI.taskParamValue = function (name) {
     const t = UI.currentTask || {};
     if (!t.record_id) return '';
-    if (name === 'corp_id' || name === 'account_id' || name === 'sub_account_id' || name === 'customer_id') {
-      return t.account_id || '';
-    }
-    if (t.params && t.params[name] != null) return String(t.params[name]);
+    if (name === 'record_id' || name === '$record_id') return t.record_id;
+    if (t.params && t.params[name] !== undefined && t.params[name] !== null) return String(t.params[name]);
     return '';
   };
 
@@ -2670,6 +2749,21 @@
     UI.mount();
     UI.renderTasks();
     UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
+    // 场景元数据 + URL 触发识别：规则同样来自 spec.scene.trigger（Runner 不登记任何场景）
+    // 本期只做「识别 + 在待办里标出」，不自动开跑——开户这类流程含不可逆步骤，必须人点。
+    if (SVC.code()) {
+      SVC.scenes().then(function () {
+        const hit = SVC.matchTrigger();
+        UI._trigger = hit;
+        if (hit) {
+          UI.appendLog({
+            t: Date.now(), level: 'info',
+            msg: '当前页面匹配场景「' + (hit.name || hit.script_id) + '」' +
+              (hit.record_id ? '，记录 ' + hit.record_id + '（点「拉我的待办」会在列表中标出）' : ''),
+          });
+        }
+      }).catch(function () {});
+    }
     // 版本落点：解释器升级后第一次加载，明确告诉人「现在跑的是哪个版本」
     try {
       const cur = UI.installedVersion();
