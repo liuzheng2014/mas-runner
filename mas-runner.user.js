@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.6.0
+// @version      0.6.1
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -345,7 +345,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.6.0',
+    RUNNER_VERSION: '0.6.1',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1167,7 +1167,7 @@
       columns: cols.length
         ? cols.map(function (d) { return { field: d.param, label: d.label || d.param }; })
         : [{ field: 'record_id', label: '记录' }],
-      emptyHint: '没有待处理的记录（筛选条件由该场景的 spec 声明，通常为「创建人是你 + 状态为空」）',
+      emptyHint: '没有待处理的记录（过滤条件由该场景的 spec 声明，请核对该行是否满足条件，如状态列的值）',
       requireField: '',
     };
   };
@@ -1685,7 +1685,9 @@
     acquire(false);
   }
 
-  // ③ 已绑定 → 我的待办
+  // ③ 已绑定 → 场景选择 → 该场景的待办
+  // 交互（用户 2026-11-03 拍板）：打开面板先选业务场景，选完自动按该场景 spec 声明的
+  // 过滤条件拉记录；不设「拉待办」总按钮。场景列表/列名/空提示全部来自 /scenes（spec）。
   function renderBound(box, me) {
     const pend = pwList();
     box.innerHTML =
@@ -1694,11 +1696,10 @@
         '<span style="color:#1a7f45">' + (me.name || '已绑定') + (me.dept ? ' · ' + me.dept : '') + '</span>' +
         modeTag() +
         '<span style="flex:1 1 auto"></span>' +
-        '<button class="primary" id="masr-task-pull">拉我的待办</button>' +
+        (pend.length ? '<button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button>' : '') +
       '</div>' +
-      (pend.length ? '<div style="display:flex;justify-content:flex-end;margin-top:4px"><button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button></div>' : '') +
       '<div id="masr-trigger-box"></div>' +
-      '<div id="masr-task-list" style="margin-top:4px"></div>';
+      '<div id="masr-scene-body" style="margin-top:4px"></div>';
 
     const rw = document.getElementById('masr-retry-writes');
     if (rw) rw.addEventListener('click', function () { UI.retryWrites(rw); });
@@ -1709,48 +1710,78 @@
       if (t.params && t.params[f] !== undefined) return t.params[f];
       return t[f];
     }
-    document.getElementById('masr-task-pull').addEventListener('click', async function () {
-      const list = document.getElementById('masr-task-list');
-      list.innerHTML = '<span style="font-size:11px;color:#8f959e">正在查询…</span>';
+    function esc(s) {
+      return String(s === undefined || s === null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    const body = document.getElementById('masr-scene-body');
+
+    /* 第 1 页：业务场景选择（列表来自 /scenes，引擎不登记任何场景） */
+    async function renderScenePicker() {
+      body.innerHTML = '<span style="font-size:11px;color:#8f959e">正在加载业务场景…</span>';
       try {
-        await SVC.scenes();                       // 先拿场景元数据（名称/列/触发都来自 spec）
-        const j = await SVC.tasks();
-        if (!j.total) {
-          list.innerHTML = '<div style="font-size:11px;color:#8f959e">' + SVC.sceneView(SVC.scriptFor({})).emptyHint + '</div>';
+        const r = await SVC.scenes();
+        const list = (Array.isArray(r) ? r : (r && r.list) || []).slice();
+        if (!list.length) {
+          body.innerHTML = '<div style="font-size:11px;color:#8f959e">服务端暂无可用业务场景</div>';
           return;
         }
-        // 场景分组：列定义、场景名全部来自 /scenes（服务端从 spec.scene 读），Runner 不登记任何场景
-        const scenes = [];
-        j.items.forEach(function (t) {
-          const sid = t.script_id || SVC.scriptFor(t);
-          if (scenes.indexOf(sid) < 0) scenes.push(sid);
+        body.innerHTML =
+          '<div style="font-size:11px;color:#8f959e;margin:2px 0">选择要处理的业务场景：</div>' +
+          list.map(function (s, i) {
+            const draft = s.status === 'draft';
+            return '<div data-i="' + i + '" style="border:1px solid ' + (draft ? '#e5e5e5' : '#b7d8f5') +
+              ';background:' + (draft ? '#fafafa' : '#f2f8ff') + ';border-radius:6px;padding:6px 9px;margin:4px 0;cursor:' +
+              (draft ? 'not-allowed' : 'pointer') + ';opacity:' + (draft ? 0.55 : 1) + '">' +
+              '<b style="font-size:12px">' + esc(s.name || s.script_id) + '</b>' +
+              (draft ? ' <span style="font-size:11px;color:#b26a00">草稿 · 暂不可执行</span>' : '') +
+              '</div>';
+          }).join('') +
+          '<div style="font-size:11px;color:#8f959e;margin-top:2px">也可以直接点业务表里的按钮：页面会自动识别记录并填充，无需在这里选。</div>';
+        body.querySelectorAll('[data-i]').forEach(function (el) {
+          el.addEventListener('click', function () {
+            const s = list[Number(el.getAttribute('data-i'))];
+            if (!s || s.status === 'draft') return;      // 草稿场景不可执行
+            renderSceneTasks(s.script_id);
+          });
         });
-        const view = SVC.sceneView(scenes[0]);
-        const mixed = scenes.length > 1;
+      } catch (e) {
+        body.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + esc(e.message) + '</div>';
+      }
+    }
+
+    /* 第 2 页：单个场景的待办——过滤条件完全由该场景 spec 声明，服务端执行 */
+    async function renderSceneTasks(sid) {
+      const view = SVC.sceneView(sid);
+      body.innerHTML =
+        '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
+          '<button id="masr-back-picker" class="masr-mini">← 场景</button>' +
+          '<b style="font-size:12px">' + esc(view.name) + '</b>' +
+        '</div>' +
+        '<div id="masr-task-list"><span style="font-size:11px;color:#8f959e">按该场景声明的过滤条件查询中…</span></div>';
+      document.getElementById('masr-back-picker').addEventListener('click', renderScenePicker);
+      const list = document.getElementById('masr-task-list');
+      try {
+        const j = await SVC.tasks(sid);
+        if (!j.total) {
+          list.innerHTML = '<div style="font-size:11px;color:#8f959e">' + esc(view.emptyHint) + '</div>';
+          return;
+        }
         const totalShown = j.items.length;
-        // 混场景时不套单一场景的列（各场景列不同），改显示「场景 + 记录」
-        const cols = mixed ? [{ field: '__scene', label: '场景' }, { field: 'record_id', label: '记录' }] : view.columns;
-        const trig = UI._trigger;
         list.innerHTML =
-          '<div style="font-size:11px;color:#8f959e;margin-bottom:2px">共 ' + j.total + ' 条待办：点「执行」单条跑，或点「批量执行」一次性串行跑完（ADS 会话全局，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
-          (trig ? '<div style="font-size:11px;color:#1a7f45;margin-bottom:2px">当前页面匹配场景「' + (trig.name || trig.script_id) + '」' +
-            (trig.record_id ? '，记录 ' + trig.record_id + ' 已在列表中标出' : '') + '</div>' : '') +
-          (mixed ? '<div style="font-size:11px;color:#b26a00;margin-bottom:2px">⚠ 待办里有 ' + scenes.length + ' 种场景（' +
-            scenes.map(function (s2) { return SVC.sceneView(s2).name; }).join('、') +
-            '）：批量一次只跑一种，请按场景分批；单条「执行」不受影响。</div>' : '') +
-          (!mixed ?
+          '<div style="font-size:11px;color:#8f959e;margin-bottom:2px">共 ' + j.total + ' 条：点「执行」单条跑，或点「批量执行」一次性串行跑完（同一浏览器会话全局共用，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
           '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
             '<input id="masr-batch-n" type="number" min="1" max="' + totalShown + '" value="' + totalShown + '" style="width:58px">' +
             '<button class="primary" id="masr-batch-run">批量执行（前 <span id="masr-batch-n-lab">' + totalShown + '</span> 条）</button>' +
             '<button id="masr-batch-stop" style="display:none">停止</button>' +
             '<span id="masr-batch-prog" style="font-size:11px;color:#1a7f45"></span>' +
-          '</div>' : '') +
-          '<table><tr>' + cols.map(function (c) { return '<th>' + c.label + '</th>'; }).join('') + '<th></th></tr>' +
+          '</div>' +
+          '<table><tr>' + view.columns.map(function (c) { return '<th>' + esc(c.label) + '</th>'; }).join('') + '<th></th></tr>' +
           j.items.map(function (t, i) {
-            const hit = trig && trig.record_id && t.record_id === trig.record_id;
-            return '<tr' + (hit ? ' style="background:#f0fff4"' : '') + '>' + cols.map(function (c) {
-              const v = c.field === '__scene' ? SVC.sceneView(t.script_id).name : cellOf(t, c.field);
-              return '<td>' + (v === null || v === undefined || v === '' ? '-' : v) + (hit && c === cols[0] ? ' ←当前页面' : '') + '</td>';
+            return '<tr>' + view.columns.map(function (c) {
+              const v = cellOf(t, c.field);
+              return '<td>' + (v === null || v === undefined || v === '' ? '-' : esc(v)) + '</td>';
             }).join('') + '<td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
           }).join('') + '</table>' +
           '<div id="masr-batch-report"></div>';
@@ -1771,9 +1802,11 @@
           b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))], b); });
         });
       } catch (e) {
-        list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + e.message + '</div>';
+        list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + esc(e.message) + '</div>';
       }
-    });
+    }
+
+    renderScenePicker();
     if (UI.renderTrigger) UI.renderTrigger();
   }
 
@@ -2863,10 +2896,18 @@
   UI.renderTrigger = function () {
     const box = document.getElementById('masr-trigger-box');
     if (!box) return;
-    const t = UI._triggerTask, err = UI._triggerErr || '';
-    if (!t && !err) { box.innerHTML = ''; return; }
+    const t = UI._triggerTask, err = UI._triggerErr || '', mark = UI._triggerMark;
+    if (!t && !err && !mark) { box.innerHTML = ''; return; }
     const bar = 'margin-top:4px;padding:5px 7px;border-radius:6px;';
-    if (err) {
+    if (!t && !err && mark) {
+      // on_match=mark 的场景：只提示匹配到，不自动取数
+      box.innerHTML = '<div style="' + bar + 'background:#f2f8ff;border:1px solid #b7d8f5;color:#1c5da8;font-size:11px">' +
+        '当前页面匹配场景「' + trigEsc(mark.name || mark.script_id) + '」' +
+        (mark.record_id ? '（记录 ' + trigEsc(mark.record_id) + '）' : '') +
+        '——该场景声明只标注、不自动取数，请从面板选择场景后操作</div>';
+      return;
+    }
+    if (!t && err) {
       box.innerHTML = '<div style="' + bar + 'background:#fff2f0;border:1px solid #ffccc7;color:#c02a2a;font-size:11px">' +
         trigEsc(err) + '</div>';
       return;
@@ -2945,6 +2986,8 @@
         seen[key] = true;
         // 命中后做什么由 spec.scene.trigger.on_match 声明，Runner 不预设业务偏好
         if (hit.on_match === 'mark') {
+          UI._triggerMark = hit;
+          UI.renderTrigger();
           UI.appendLog({ t: Date.now(), level: 'info', msg: '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，记录 ' + hit.record_id + '（该场景声明只标注、不自动取数）' });
           return;
         }
