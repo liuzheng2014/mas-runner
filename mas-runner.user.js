@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.7.0
+// @version      0.8.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -382,27 +382,6 @@
     return h.toString(16);
   };
 
-  // ---------- 页面提交监听（submit_watch）纯函数 ----------
-  // sw 形如 {url_pattern, method?, success_assert: [表达式]}，全部来自 spec 声明，引擎不认识具体业务接口。
-  ENGINE.submitWatchMatch = function (sw, method, url) {
-    if (!sw || !sw.url_pattern) return false;
-    if (sw.method && String(sw.method).toUpperCase() !== String(method || '').toUpperCase()) return false;
-    try { return new RegExp(sw.url_pattern).test(String(url || '')); }
-    catch (e) { return false; }
-  };
-  // 成功判定：逐条跑 success_assert（与步骤断言同一求值器），全过才算成功。
-  ENGINE.submitWatchPass = function (sw, json) {
-    const results = [];
-    for (const expr of (sw && sw.success_assert) || []) {
-      let r;
-      try { r = ENGINE.evalAssert(expr, json, {}); }
-      catch (e) { r = { pass: false, detail: e.message }; }
-      results.push({ assert: expr, pass: !!r.pass, detail: r.detail || '' });
-    }
-    if (!results.length) return { pass: false, results: results };
-    return { pass: results.every(x => x.pass), results: results };
-  };
-
   /* ==================== ENGINE-END ==================== */
 
   const GV = {
@@ -412,7 +391,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.7.0',
+    RUNNER_VERSION: '0.8.0',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1300,10 +1279,20 @@
           if (q(tr.action_query) !== String(tr.action)) continue;
         }
         matched = true;
+        // params_query：spec 声明「哪些参数由页面地址直接带」（省掉查业务表那一步）。
+        // 映射方向：spec 参数名 → URL 里的 query 参数名。引擎只认这份声明，不认识业务含义。
+        const params = {};
+        if (tr.params_query && typeof tr.params_query === 'object') {
+          for (const pname in tr.params_query) {
+            const pv = q(tr.params_query[pname]);
+            if (pv) params[pname] = pv;
+          }
+        }
         hits.push({
           script_id: s.script_id, name: s.name, record_id: q(tr.record_id_query),
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
+          params: params,
         });
       }
     }
@@ -1950,25 +1939,30 @@
         // 回写凭据：拉待办时服务端签好的（含 script_id），回写时原样带回 → 服务端零查表
         write_token: task.write_token || '',
       };
-      // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
-      {
-        try { await SVC.ping(); }
-        catch (e) {
-          connOut = '<span style="color:#c02a2a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
-          UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），本次不执行：先把服务起来（temp-up / Workers），再点「重试连接」' });
-          UI.renderConn();
-          return;
-        }
-      }
       const scene = SVC.scriptFor(UI.currentTask);
       // 任务摘要只取 scene.display 的第一个值（列名是业务侧声明的，Runner 不认识具体含义）
       const dk = task.display ? Object.keys(task.display) : [];
       const dv = dk.length ? task.display[dk[0]] : '';
       UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：' + SVC.sceneView(scene).name + ' · ' + (dv || task.record_id) + '（' + task.record_id + '）' });
-      SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
-      const s = await SVC.spec(scene);
+      // spec 优先复用刚载入的那份（同一轮流程内不会变），省一次往返
+      const cached = (UI._specCache && UI._specCache.script_id === scene) ? UI._specCache : null;
+      const s = cached ? { spec: cached.spec, version: cached.version } : await SVC.spec(scene);
+      UI._specCache = { script_id: scene, spec: s.spec, version: s.version };
       UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
+      // 只有需要往业务表回写的场景才探活后端 + 捂热那张表；纯填表场景两样都不做（少两次往返，也不再被捂表拖慢）
+      const needWrite = wbModeOf(s.spec) === 'auto';
+      if (needWrite) {
+        // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
+        try { await SVC.ping(); }
+        catch (e) {
+          connOut = '<span style="color:#c02a0a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
+          UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），本次不执行：先把服务起来（temp-up / Workers），再点「重试连接」' });
+          UI.renderConn();
+          return;
+        }
+        SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
+      }
       UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '（任务参数已带入）' });
       await UI.doRun({ keepLog: true });
     } catch (e) {
@@ -2396,8 +2390,7 @@
    * v0.5.0 删掉了「参数名 → 账户ID」那类业务特判——参数名映射属于场景，不该写在引擎里。 */
   UI.taskParamValue = function (name) {
     const t = UI.currentTask || {};
-    if (!t.record_id) return '';
-    if (name === 'record_id' || name === '$record_id') return t.record_id;
+    if (name === 'record_id' || name === '$record_id') return t.record_id || '';
     if (t.params && t.params[name] !== undefined && t.params[name] !== null) return String(t.params[name]);
     return '';
   };
@@ -2763,162 +2756,12 @@
     });
   };
 
-  /* 回写模式：auto=跑完自动回写（默认，兼容全部老场景）；manual=人确认后才回写。
-   * manual 用于「引擎填表单、人点提交」的场景：提交动作在人手里，成功/失败都轮不到引擎自动判定——
-   * 填完表不等于已发送，填失败也不该把记录写死成失败态（保持"未邀请"下次还能触发）。 */
+  /* 回写模式：auto=跑完自动回写（默认，老场景用）；none=本场景不回写（只填表，提交与状态由人管）。
+   * 2026-11-03 用户拍板：发邀请场景只要「把表填好」这一段——提交动作在页面按钮上、状态不回写，
+   * 因此引擎不再有 manual 档位，也不做提交监听（submit_watch 已随需求收窄整体移除）。 */
   function wbModeOf(spec) {
     return (spec && spec.scene && spec.scene.writeback && spec.scene.writeback.mode) || 'auto';
   }
-  UI.renderManualWriteback = function (spec) {
-    const old = document.getElementById('masr-manual-wb'); if (old) old.remove();
-    const host = document.getElementById('masr-trigger-box') || document.getElementById('masr-result');
-    if (!host) return;
-    const outputs = (UI.lastResult && UI.lastResult.outputs) || {};
-    const box = document.createElement('div');
-    box.id = 'masr-manual-wb';
-    box.style.cssText = 'margin-top:8px;padding:8px 10px;border:1px solid #b7d8b0;background:#f0f8ee;border-radius:8px;font-size:12px;line-height:1.7';
-    box.innerHTML = '<b>表单已自动填充。请人工核对页面后点击「发送邀请」</b><br>' +
-      '<span style="color:#5a6b58">发送成功后回来点「已发送」；本次不发就点「暂不发送」（记录保持"未邀请"，下次可重新触发）</span><br>' +
-      '<button id="masr-wb-ok" class="primary" style="margin-top:6px">已发送，回写</button>' +
-      '<button id="masr-wb-skip" style="margin-left:8px">暂不发送</button>';
-    host.appendChild(box);
-    const st = function () { return { task: UI.currentTask, startedAt: UI._runStartedAt || Date.now(), specVersion: spec.version }; };
-    document.getElementById('masr-wb-ok').addEventListener('click', function () {
-      box.innerHTML = '⏳ 正在回写…';
-      const job = pushTaskResult(st(), true, outputs);
-      Promise.resolve(job).then(function (r) {
-        box.innerHTML = (r && r.written) ? '✅ 已按「已发送」回写成功，本条流程结束' : '⚠️ 回写未落表：' + ((r && r.msg) || '') + '（结果已存本地，可稍后「重试回写」）';
-      }).catch(function (e) {
-        box.innerHTML = '⚠️ 回写失败：' + e.message + '（结果已存本地待写队列，稍后「重试回写」）';
-      });
-    });
-    document.getElementById('masr-wb-skip').addEventListener('click', function () {
-      box.innerHTML = '已跳过回写，记录保持「未邀请」';
-      UI.appendLog({ t: Date.now(), level: 'warn', msg: '人工选择暂不发送：不回写，记录保持"未邀请"，下次可重新触发' });
-    });
-  };
-
-  /* ---------- 页面提交监听（E5，2026-11-03）：spec.scene.submit_watch 声明后生效 ----------
-   * 表单填充完成后不再只等人点「已发送」：挂网络钩子盯真实提交接口，命中 url_pattern 且响应
-   * 过 success_assert（与步骤断言同一求值器）即视为业务真实成功，自动按 writeback.ok 回写。
-   * 比人眼确认更准（盯的是接口返回，不是页面表象），也少一步手工。
-   * 降级保障：钩子装不上（沙箱/CSP）→ 退回人工确认按钮；命中接口但断言不过 → 不自动写
-   * 「邀请失败」（页面会提示错误，用户修正后可重发，监听继续），写失败态走人工兜底按钮。 */
-  UI._swHooks = false;
-  UI._sw = null;
-  UI.onWatchedResponse = function (method, url, text, status) {
-    const cur = UI._sw;
-    if (!cur || cur.done) return;
-    if (Date.now() - cur.armedAt > 30 * 60 * 1000) { cur.done = true; UI._sw = null; return; } // 30 分钟 TTL
-    if (!ENGINE.submitWatchMatch(cur.sw, method, url)) return;
-    let json = null;
-    try { json = JSON.parse(text); } catch (e) {}
-    const verdict = json
-      ? ENGINE.submitWatchPass(cur.sw, json)
-      : { pass: false, results: [{ assert: '响应为 JSON', pass: false, detail: '响应不是合法 JSON' }] };
-    const httpOk = status === undefined || status === null || (Number(status) >= 200 && Number(status) < 300);
-    if (verdict.pass && httpOk) {
-      cur.done = true;
-      UI._sw = null;
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: '✓ 提交监听命中：接口返回成功（' + verdict.results.map(x => x.assert).join('; ') + '），自动回写「已发邀请」' });
-      watchWrite('接口监听', true);
-    } else {
-      const why = !httpOk ? 'HTTP ' + status : verdict.results.filter(x => !x.pass).map(x => x.assert + '（' + x.detail + '）').join('; ');
-      UI.appendLog({ t: Date.now(), level: 'warn', msg: '提交监听：接口已响应但未满足成功条件（' + why + '），未回写——可在页面修正后重新发送，监听继续' });
-      const el = document.getElementById('masr-watch-status');
-      if (el) el.innerHTML = '⚠️ 提交接口已响应但未成功（' + String(why).slice(0, 120) + '），未回写；可在页面修正后重新发送，监听继续';
-    }
-  };
-  UI.armSubmitWatch = function (spec) {
-    const sw = spec && spec.scene && spec.scene.submit_watch;
-    if (!sw || !sw.url_pattern) return false;
-    const old = document.getElementById('masr-manual-wb'); if (old) old.remove();
-    const oldW = document.getElementById('masr-watch-box'); if (oldW) oldW.remove();
-    const host = document.getElementById('masr-trigger-box') || document.getElementById('masr-result');
-    const outputs = (UI.lastResult && UI.lastResult.outputs) || {};
-    const st = function () { return { task: UI.currentTask, startedAt: UI._runStartedAt || Date.now(), specVersion: spec.version }; };
-    function disarm() { if (UI._sw) { UI._sw.done = true; } UI._sw = null; }
-    function watchWrite(via, ok) {
-      const el = document.getElementById('masr-watch-status');
-      if (el) el.innerHTML = '⏳ 正在回写…（' + via + '）';
-      Promise.resolve(pushTaskResult(st(), ok, outputs)).then(function (r) {
-        if (el) el.innerHTML = (r && r.written)
-          ? '✅ 已回写「已发邀请」，本条流程结束（' + via + '）'
-          : '⚠️ 回写未落表：' + ((r && r.msg) || '') + '（已存本地，可稍后「重试回写」）';
-      }).catch(function (e) {
-        if (el) el.innerHTML = '⚠️ 回写失败：' + e.message + '（已存本地待写队列，稍后「重试回写」）';
-      });
-    }
-    if (host) {
-      const box = document.createElement('div');
-      box.id = 'masr-watch-box';
-      box.style.cssText = 'margin-top:8px;padding:8px 10px;border:1px solid #b7d8b0;background:#f0f8ee;border-radius:8px;font-size:12px;line-height:1.7';
-      box.innerHTML = '<b>表单已自动填充。请在页面核对后点击「发送邀请」</b><br>' +
-        '<span id="masr-watch-status" style="color:#5a6b58">👀 正在监听提交结果：接口返回成功将自动回写「已发邀请」，无需再点按钮</span><br>' +
-        '<button id="masr-wb-ok2" class="primary" style="margin-top:6px">手动标记已发送</button>' +
-        '<button id="masr-wb-skip2" style="margin-left:8px">暂不发送</button>';
-      host.appendChild(box);
-      document.getElementById('masr-wb-ok2').addEventListener('click', function () { disarm(); watchWrite('人工标记', true); });
-      document.getElementById('masr-wb-skip2').addEventListener('click', function () {
-        disarm();
-        const el = document.getElementById('masr-watch-status');
-        if (el) el.innerHTML = '已跳过回写，记录保持「未邀请」';
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '人工选择暂不发送：不回写，记录保持"未邀请"，下次可重新触发' });
-      });
-    }
-    // 网络钩子：优先挂页面真实环境（unsafeWindow），失败则降级为纯人工确认
-    let hooksOk = false;
-    try {
-      const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-      if (w.XMLHttpRequest && w.XMLHttpRequest.prototype && !w.XMLHttpRequest.prototype.__masrPatched) {
-        const proto = w.XMLHttpRequest.prototype;
-        const origOpen = proto.open, origSend = proto.send;
-        proto.open = function (m, u) {
-          try { this.__masr = { m: String(m || ''), u: String(u || '') }; } catch (e) {}
-          return origOpen.apply(this, arguments);
-        };
-        proto.send = function () {
-          const info = this.__masr;
-          if (info) this.addEventListener('load', function () {
-            try { UI.onWatchedResponse(info.m, info.u, this.responseText, this.status); } catch (e) {}
-          });
-          return origSend.apply(this, arguments);
-        };
-        proto.__masrPatched = true;
-        hooksOk = true;
-      } else if (w.XMLHttpRequest && w.XMLHttpRequest.prototype && w.XMLHttpRequest.prototype.__masrPatched) {
-        hooksOk = true;
-      }
-      if (typeof w.fetch === 'function' && !w.fetch.__masrPatched) {
-        const origFetch = w.fetch;
-        const patched = function (input, init) {
-          let u = '', m = '';
-          try {
-            u = (typeof input === 'string') ? input : (input && input.url) || '';
-            m = (init && init.method) || (input && input.method) || 'GET';
-          } catch (e) {}
-          return origFetch.apply(this, arguments).then(function (resp) {
-            try {
-              resp.clone().text().then(function (t) { UI.onWatchedResponse(m, u, t, resp.status); }).catch(function () {});
-            } catch (e) {}
-            return resp;
-          });
-        };
-        patched.__masrPatched = true;
-        try { w.fetch = patched; hooksOk = true; } catch (e) { /* fetch 不可写不算致命 */ }
-      }
-    } catch (e) {
-      UI.appendLog({ t: Date.now(), level: 'warn', msg: '提交监听钩子安装失败（' + e.message + '），已降级为人工确认' });
-      hooksOk = false;
-    }
-    UI._sw = { sw: sw, armedAt: Date.now(), done: false };
-    UI.appendLog({ t: Date.now(), level: 'ok', msg: '提交监听已布防：' + (sw.method || '任意方法') + ' 匹配 ' + sw.url_pattern + (hooksOk ? '' : '（钩子不可用，请用下方按钮人工确认）') });
-    if (!hooksOk) {
-      const el = document.getElementById('masr-watch-status');
-      if (el) el.innerHTML = '⚠️ 自动监听在当前页面不可用，请发送成功后点「手动标记已发送」';
-    }
-    return true;
-  };
 
   UI.doRun = async function (opts) {
     opts = opts || {};
@@ -2996,14 +2839,18 @@
           ? '<b style="color:#b8860b">⏳ 新标签页已打开</b>：落地后自动续跑，全部跑完辅助标签页会自动关闭、结果回到本页。'
           : '<b style="color:#b8860b">⏳ 等待导航落地</b>：落地后自动续跑；若 8 秒后未自动续跑，切到落地页点「执行」。';
       } else {
-        // manual 回写模式：填充≠已发送，不广播 final（发起页轮询器就不会自动写表），改出人工确认按钮
-        if (wbModeOf(spec) === 'manual' && UI.currentTask && UI.currentTask.record_id) {
+        // 回写模式 none：本场景只负责把表填好（提交与状态由人在页面上管），引擎不写表、不出确认按钮。
+        // 仍要广播收摊信号（辅助页自毁），但 final.manual=true 让发起页轮询器跳过回写。
+        if (wbModeOf(spec) === 'none') {
           const stm = RunState.get() || {};
           UI._runStartedAt = stm.startedAt || Date.now();
-          UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 表单填充完成（manual 回写：是否已发送由人工确认，不自动写表）===' });
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 表单填充完成（本场景不回写：请在页面核对后手动提交）===' });
           renderOutputs(result.outputs || {});
-          RunState.clear();
-          if (!UI.armSubmitWatch(spec)) UI.renderManualWriteback(spec);
+          const stcN = RunState.get() || {};
+          stcN.phase = 'done';
+          stcN.final = { ok: true, outputs: result.outputs || {}, at: Date.now(), specId: spec.spec_id, manual: true };
+          RunState.set(stcN);
+          CloseSig.mark(stcN.runId);
           console.log('[MASR] result =', result);
           return;
         }
@@ -3038,10 +2885,10 @@
             // 本页直接展示过，轮询器不再重复播报；但「失败」同样要回写（错误类型要进飞书表）
             stc.final.consumed = true;
             if (stc.task && stc.task.record_id && !stc.final.written) {
-              if (wbModeOf(spec) === 'manual') {
-                // manual 模式：填充失败不写表（记录保持原状态，可重试）；提示人现场处置
+              if (wbModeOf(spec) !== 'auto') {
+                // none 模式：填充失败不写表（记录保持原状态，可重试）；提示人现场处置
                 stc.final.manual = true;
-                UI.appendLog({ t: Date.now(), level: 'warn', msg: 'manual 回写模式：填充失败，不自动写表，记录保持原状态；可排查后重新触发' });
+                UI.appendLog({ t: Date.now(), level: 'warn', msg: '本场景不回写：填充失败不写表，记录保持原状态；可排查后重新触发' });
               } else {
                 stc.final.written = true;
                 pushTaskResult(stc, false, null, { code: code, message: e.message });
@@ -3186,15 +3033,22 @@
     const dk = (t.display ? Object.keys(t.display) : []).filter(function (k) { return k !== 'record_id'; });
     const dv = dk.length ? t.display[dk[0]] : '';
     const draft = String(t.spec_status || '') === 'draft';
+    const fromUrl = !!t.from_url;
+    // fill_and_run 的场景引擎自己就开跑了，卡片上不再放「运行」按钮（免得人以为要点）
+    const autoRun = String(t.on_match || 'fill') === 'fill_and_run';
+    const head = fromUrl
+      ? '已从页面地址读取参数：<b>' + trigEsc(view.name) + '</b>' + (t.record_id ? ' · ' + trigEsc(t.record_id) : '') + '—— 正在自动填充表单'
+      : '已按页面记录取数：<b>' + trigEsc(view.name) + '</b> · ' +
+        trigEsc(dv || t.record_id) + '（' + trigEsc(t.record_id) + '）—— 参数已填充，确认后点「运行」';
     box.innerHTML =
       '<div style="' + bar + 'background:#f0fff4;border:1px solid #b7eb8f">' +
-        '<div style="font-size:11px;color:#1a7f45">已按页面记录取数：<b>' + trigEsc(view.name) + '</b> · ' +
-          trigEsc(dv || t.record_id) + '（' + trigEsc(t.record_id) + '）—— 参数已填充，确认后点「运行」</div>' +
+        '<div style="font-size:11px;color:#1a7f45">' + head + '</div>' +
         (draft ? '<div style="font-size:11px;color:#b26a00;margin-top:2px">⚠ 该场景的 spec 仍是草稿（draft）：流程未全部验证过，运行会真的发请求，请确认参数无误</div>' : '') +
-        '<div class="row" style="margin-top:4px">' +
-          '<button class="primary" id="masr-trigger-run">运行</button>' +
-          '<span style="font-size:11px;color:#8f959e">会真发请求/不可逆的步骤不会自动执行</span>' +
-        '</div>' +
+        (autoRun ? '' :
+          '<div class="row" style="margin-top:4px">' +
+            '<button class="primary" id="masr-trigger-run">运行</button>' +
+            '<span style="font-size:11px;color:#8f959e">会真发请求/不可逆的步骤不会自动执行</span>' +
+          '</div>') +
       '</div>';
     const btn = document.getElementById('masr-trigger-run');
     if (btn) btn.addEventListener('click', function () { UI.runTask(t, btn); });
@@ -3207,9 +3061,12 @@
       params: task.params || null,
       display: task.display || null,
       write_token: task.write_token || '',
+      from_url: !!task.from_url,
+      on_match: task.on_match || '',
     };
     const s = await SVC.spec(task.script_id);
     UI.currentTask.spec_version = s.version;
+    UI._specCache = { script_id: task.script_id, spec: s.spec, version: s.version };
     UI.applySpec(JSON.stringify(s.spec), { persist: true });
     if (UI.spec && UI.restoreSpecText) UI.restoreSpecText();
     UI._triggerTask = task;
@@ -3219,10 +3076,11 @@
     const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
     UI.appendLog({
       t: Date.now(), level: 'ok',
-      msg: '已按页面记录取数 ' + task.record_id + '（' + s.spec_id + ' v' + s.version + '）' +
+      msg: (task.from_url ? '已从页面地址读取参数' : '已按页面记录取数 ' + task.record_id) + '（' + s.spec_id + ' v' + s.version + '）' +
         (keys.length ? '；参数 ' + keys.map(function (k) { return k + '=' + ps[k]; }).join('，') : ''),
     });
-    SVC.warmStart(90000, task.script_id);
+    // 只有「要往业务表回写」的场景才需要捂热那张表；纯填表场景（URL 自带参数）不查表也不写表，捂热纯属浪费。
+    if (!task.from_url) SVC.warmStart(90000, task.script_id);
   };
 
   /* 监听 URL 变化：hashchange / popstate + 1.2s 轮询兜底（SPA 可能用 pushState 静默改地址） */
@@ -3244,13 +3102,14 @@
         const hit = SVC.matchTrigger();
         UI._trigger = hit;
         if (!hit) return;
-        if (!hit.record_id) {
+        const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
+        if (!hit.record_id && !hasUrlParams) {
           UI._triggerTask = null;
           UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
           UI.renderTrigger();
           return;
         }
-        const key = hit.script_id + '|' + hit.record_id;
+        const key = hit.script_id + '|' + (hit.record_id || ENGINE.strHash(JSON.stringify(hit.params)));
         if (seen[key]) return;                 // 同一页面生命周期内一条记录只取一次
         seen[key] = true;
         // 命中后做什么由 spec.scene.trigger.on_match 声明，Runner 不预设业务偏好
@@ -3260,8 +3119,26 @@
           UI.appendLog({ t: Date.now(), level: 'info', msg: '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，记录 ' + hit.record_id + '（该场景声明只标注、不自动取数）' });
           return;
         }
+        // 场景自带 URL 参数（trigger.params_query）：不查业务表，直接用地址里的参数。
+        // 这条路径省掉「按记录回查业务表」整步，也就不需要写回票据（本场景不回写）。
+        if (hasUrlParams) {
+          const task = {
+            record_id: hit.record_id || '', script_id: hit.script_id,
+            params: hit.params, display: null, write_token: '', from_url: true,
+            on_match: hit.on_match,
+          };
+          UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，参数直接取自页面地址（不查业务表）：' +
+            Object.keys(hit.params).map(k => k + '=' + hit.params[k]).join('，') + '（' + reason + '）' });
+          await UI.loadTriggeredTask(task);
+          if (hit.on_match === 'fill_and_run') {
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill_and_run：参数已就位，立即开跑' });
+            await UI.runTask(task, document.getElementById('masr-trigger-run'));
+          }
+          return;
+        }
         UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' });
         const task = await SVC.record(hit.record_id, hit.script_id);
+        task.on_match = hit.on_match;
         // 中转页：当前页只是跳板，取到数就把这个标签页「原地替换」成业务页。
         // 用 replace 而不是 open+close：脚本无权关闭不是自己打开的标签页，close 会被浏览器拒绝；
         // replace 还能保证浏览器历史里不留中转页，用户按后退不会再次触发。
