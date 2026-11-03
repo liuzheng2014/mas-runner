@@ -1,16 +1,19 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.5.0
+// @version      0.6.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
 // @supportURL   https://github.com/liuzheng2014/mas-runner/issues
-// @updateURL    https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
-// @downloadURL  https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js
+// @downloadURL  https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js
 // @match        https://ads.huawei.com/*
 // @match        https://*.ads.huawei.com/*
 // @match        https://*.feishu.cn/*
+// 中转页（业务表按钮打开、URL 带 tableId+recordId 的跳板页）。此域上不挂主面板，
+// 只做「按表 ID 认领场景 → 按记录取数 → 把当前标签页替换成业务页」。
+// @match        https://www.baidu.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -342,7 +345,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.5.0',
+    RUNNER_VERSION: '0.6.0',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1168,31 +1171,85 @@
       requireField: '',
     };
   };
-  /* URL 触发：打开某页面时该用哪个场景 —— 规则同样来自 spec.scene.trigger */
-  SVC.matchTrigger = function (url) {
-    const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+  /* URL 触发匹配（纯函数）：规则全部来自 spec.scene.trigger，引擎不认识任何具体网站 */
+  SVC.matchTriggerIn = function (list, url) {
     const href = String(url || location.href);
-    for (let i = 0; i < list.length; i++) {
-      const s = list[i];
-      const tr = s.trigger;
+    // 触发参数既可能在 query，也可能在 hash 内的 query（SPA 路由习惯）
+    function q(name) {
+      if (!name) return '';
+      let v = '';
+      try { v = new URLSearchParams((href.split('#')[1] || '').split('?')[1] || '').get(name) || ''; } catch (e) {}
+      if (!v) { try { v = new URLSearchParams(href.split('?')[1] || '').get(name) || ''; } catch (e) {} }
+      return v;
+    }
+    for (let i = 0; i < (list || []).length; i++) {
+      const s = list[i], tr = s.trigger;
       if (!tr || !Array.isArray(tr.url_patterns)) continue;
       for (let k = 0; k < tr.url_patterns.length; k++) {
         let re = null;
         try { re = new RegExp(tr.url_patterns[k]); } catch (e) { continue; }
         if (!re.test(href)) continue;
-        let rid = '';
-        const q = tr.record_id_query;
-        if (q) {
-          try { rid = new URLSearchParams((href.split('#')[1] || '').split('?')[1] || '').get(q) || ''; } catch (e) {}
-          if (!rid) {
-            try { rid = new URLSearchParams(href.split('?')[1] || '').get(q) || ''; } catch (e) {}
-          }
+        // 表认领：多个场景共用同一个入口 URL（中转页）时，只能靠表 ID 区分。
+        // 声明了 table_id_query 就必须对得上，否则跳过——宁可不动，也不猜是哪个场景。
+        if (tr.table_id_query) {
+          const tid = q(tr.table_id_query);
+          if (!tid || !s.table_id || tid !== s.table_id) continue;
         }
-        return { script_id: s.script_id, name: s.name, record_id: rid };
+        return {
+          script_id: s.script_id, name: s.name, record_id: q(tr.record_id_query),
+          on_match: tr.on_match || 'fill',
+          redirect_to: tr.redirect_to || '',
+        };
       }
     }
     return null;
   };
+  SVC.matchTrigger = function (url) {
+    return SVC.matchTriggerIn((SVC._sceneCache && SVC._sceneCache.list) || [], url);
+  };
+  /* 同步预判：直接读存储里的场景缓存，用于「挂面板之前」判断当前页是不是中转页。
+   * 中转页不能挂主面板（用户只是点了个按钮，不该看到工作台）。 */
+  SVC.peekTrigger = function (url) {
+    try {
+      const raw = GM_getValue(SVC.SCENES_KEY, '');
+      if (!raw) return null;
+      const c = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!c || !Array.isArray(c.list)) return null;
+      SVC._sceneCache = c;      // 顺手当缓存用，省一次网络
+      if (!c.at || Date.now() - c.at >= SVC.SCENES_TTL_MS) return null;  // 过期不预判，等异步刷新后再定
+      return SVC.matchTriggerIn(c.list, url);
+    } catch (e) { return null; }
+  };
+  /* 通用模板替换：{{record_id}} / {{参数名}}。只做取值，不做业务判断 */
+  SVC.tpl = function (str, vars) {
+    return String(str == null ? '' : str).replace(/\{\{\s*([\w.]+)\s*\}\}/g, function (_, k) {
+      const v = (vars || {})[k];
+      return (v === undefined || v === null) ? '' : String(v);
+    });
+  };
+  /* 跳转收敛成一个出口：便于回归探针拦截验证，也避免各处直接写 location */
+  SVC.go = function (url) {
+    if (typeof SVC._goHook === 'function') { SVC._goHook(url); return; }
+    location.replace(url);
+  };
+  /* 跨页传递：中转页取到的任务 → 业务页恢复。
+   * 用 GM 存储（跨域共享），带时间戳防陈旧；业务页宿主要对得上才恢复，避免跑到别的媒体页面上。 */
+  SVC.PEND_KEY = 'masr_pending_task_v1';
+  SVC.PEND_TTL_MS = 10 * 60 * 1000;
+  SVC.pendSet = function (t, host) {
+    try { GM_setValue(SVC.PEND_KEY, JSON.stringify({ t: t, host: host || '', ts: Date.now() })); } catch (e) {}
+  };
+  SVC.pendGet = function () {
+    try {
+      const raw = GM_getValue(SVC.PEND_KEY, '');
+      if (!raw) return null;
+      const o = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!o || !o.t) return null;
+      if (Date.now() - Number(o.ts || 0) > SVC.PEND_TTL_MS) { SVC.pendClear(); return null; }
+      return o;
+    } catch (e) { return null; }
+  };
+  SVC.pendClear = function () { try { GM_setValue(SVC.PEND_KEY, ''); } catch (e) {} };
   SVC.base = function () {
     const v = String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, '');
     return v || SVC.DEFAULT_BASE;
@@ -1277,6 +1334,14 @@
         if (!t.script_id) t.script_id = scriptId || '';
       });
       return j;
+    });
+  };
+  /* 单条取数（URL 触发路径）：record_id 来自页面地址，服务端按 scene 声明的状态条件校验后才给参数与票据 */
+  SVC.record = function (recordId, scriptId) {
+    if (!recordId) return Promise.reject(new Error('E_PARAM 页面地址里没有 record_id'));
+    if (!scriptId) return Promise.reject(new Error('E_SCENE 未能确定该 URL 属于哪个场景'));
+    return SVC.call('GET', '/task', { script_id: scriptId, record_id: recordId }).then(function (j) {
+      return j.item;
     });
   };
   SVC.spec = function (scriptId) {
@@ -1614,6 +1679,7 @@
         '<button class="primary" id="masr-task-pull">拉我的待办</button>' +
       '</div>' +
       (pend.length ? '<div style="display:flex;justify-content:flex-end;margin-top:4px"><button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button></div>' : '') +
+      '<div id="masr-trigger-box"></div>' +
       '<div id="masr-task-list" style="margin-top:4px"></div>';
 
     const rw = document.getElementById('masr-retry-writes');
@@ -1690,6 +1756,7 @@
         list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + e.message + '</div>';
       }
     });
+    if (UI.renderTrigger) UI.renderTrigger();
   }
 
   UI.renderTasks = function () {
@@ -2745,24 +2812,206 @@
     }, 250);
   }
 
+  /* ===== URL 触发：地址带 recordId → 自动按记录取数并填充（不自动开跑） =====
+   * 规则全部来自 spec.scene.trigger（Runner 不登记任何业务 URL）。
+   * 取数由服务端按 scene 声明的状态条件校验（如「邀请状态=未邀请」），不满足直接拒绝。
+   * 不自动执行：这类流程含不可逆/不可幂等步骤，必须人看到参数后点「运行」。 */
+  /* 无面板场景（中转页）用的极简提示条：不依赖主面板 DOM，失败时人至少知道发生了什么 */
+  UI.notice = function (text, level) {
+    try {
+      let el = document.getElementById('masr-notice');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'masr-notice';
+        el.style.cssText = 'position:fixed;z-index:2147483647;top:0;left:0;right:0;padding:8px 12px;' +
+          'font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;' +
+          'text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.12)';
+        (document.body || document.documentElement).appendChild(el);
+      }
+      const bad = level === 'error' || level === 'warn';
+      el.style.background = bad ? '#fff2f0' : '#f0fff4';
+      el.style.color = bad ? '#c02a2a' : '#1a7f45';
+      el.style.borderBottom = '1px solid ' + (bad ? '#ffccc7' : '#b7eb8f');
+      el.textContent = 'MAS · ' + String(text || '');
+      if (!bad) setTimeout(function () { try { el.parentNode && el.parentNode.removeChild(el); } catch (e) {} }, 4000);
+    } catch (e) {}
+  };
+
+  function trigEsc(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  UI.renderTrigger = function () {
+    const box = document.getElementById('masr-trigger-box');
+    if (!box) return;
+    const t = UI._triggerTask, err = UI._triggerErr || '';
+    if (!t && !err) { box.innerHTML = ''; return; }
+    const bar = 'margin-top:4px;padding:5px 7px;border-radius:6px;';
+    if (err) {
+      box.innerHTML = '<div style="' + bar + 'background:#fff2f0;border:1px solid #ffccc7;color:#c02a2a;font-size:11px">' +
+        trigEsc(err) + '</div>';
+      return;
+    }
+    const view = SVC.sceneView(t.script_id);
+    // 主标题优先取业务字段（昵称/名称之类），record_id 只在没有别的可显示时才顶上
+    const dk = (t.display ? Object.keys(t.display) : []).filter(function (k) { return k !== 'record_id'; });
+    const dv = dk.length ? t.display[dk[0]] : '';
+    const draft = String(t.spec_status || '') === 'draft';
+    box.innerHTML =
+      '<div style="' + bar + 'background:#f0fff4;border:1px solid #b7eb8f">' +
+        '<div style="font-size:11px;color:#1a7f45">已按页面记录取数：<b>' + trigEsc(view.name) + '</b> · ' +
+          trigEsc(dv || t.record_id) + '（' + trigEsc(t.record_id) + '）—— 参数已填充，确认后点「运行」</div>' +
+        (draft ? '<div style="font-size:11px;color:#b26a00;margin-top:2px">⚠ 该场景的 spec 仍是草稿（draft）：流程未全部验证过，运行会真的发请求，请确认参数无误</div>' : '') +
+        '<div class="row" style="margin-top:4px">' +
+          '<button class="primary" id="masr-trigger-run">运行</button>' +
+          '<span style="font-size:11px;color:#8f959e">会真发请求/不可逆的步骤不会自动执行</span>' +
+        '</div>' +
+      '</div>';
+    const btn = document.getElementById('masr-trigger-run');
+    if (btn) btn.addEventListener('click', function () { UI.runTask(t, btn); });
+  };
+
+  UI.loadTriggeredTask = async function (task) {
+    UI.currentTask = {
+      record_id: task.record_id,
+      table_id: task.table_id, script_id: task.script_id || '',
+      params: task.params || null,
+      display: task.display || null,
+      write_token: task.write_token || '',
+    };
+    const s = await SVC.spec(task.script_id);
+    UI.currentTask.spec_version = s.version;
+    UI.applySpec(JSON.stringify(s.spec), { persist: true });
+    if (UI.spec && UI.restoreSpecText) UI.restoreSpecText();
+    UI._triggerTask = task;
+    UI._triggerErr = '';
+    UI.renderTrigger();
+    const ps = task.params || {};
+    const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
+    UI.appendLog({
+      t: Date.now(), level: 'ok',
+      msg: '已按页面记录取数 ' + task.record_id + '（' + s.spec_id + ' v' + s.version + '）' +
+        (keys.length ? '；参数 ' + keys.map(function (k) { return k + '=' + ps[k]; }).join('，') : ''),
+    });
+    SVC.warmStart(90000, task.script_id);
+  };
+
+  /* 监听 URL 变化：hashchange / popstate + 1.2s 轮询兜底（SPA 可能用 pushState 静默改地址） */
+  async function armUrlTrigger() {
+    const seen = {};
+    let lastHref = location.href;
+    let busy = false;
+
+    // 有没有场景声明 URL 触发，由 /scenes 决定；一个都没有就不起监听（零开销，不是靠开关猜）
+    const list = await SVC.scenes().catch(function () { return []; });
+    const hasTrig = list.some(function (s) { return s.trigger && (s.trigger.url_patterns || []).length; });
+    if (!hasTrig) return;
+
+    async function fire(reason) {
+      if (busy || !SVC.code()) return;
+      busy = true;
+      try {
+        await SVC.scenes();
+        const hit = SVC.matchTrigger();
+        UI._trigger = hit;
+        if (!hit) return;
+        if (!hit.record_id) {
+          UI._triggerTask = null;
+          UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
+          UI.renderTrigger();
+          return;
+        }
+        const key = hit.script_id + '|' + hit.record_id;
+        if (seen[key]) return;                 // 同一页面生命周期内一条记录只取一次
+        seen[key] = true;
+        // 命中后做什么由 spec.scene.trigger.on_match 声明，Runner 不预设业务偏好
+        if (hit.on_match === 'mark') {
+          UI.appendLog({ t: Date.now(), level: 'info', msg: '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，记录 ' + hit.record_id + '（该场景声明只标注、不自动取数）' });
+          return;
+        }
+        UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' });
+        const task = await SVC.record(hit.record_id, hit.script_id);
+        // 中转页：当前页只是跳板，取到数就把这个标签页「原地替换」成业务页。
+        // 用 replace 而不是 open+close：脚本无权关闭不是自己打开的标签页，close 会被浏览器拒绝；
+        // replace 还能保证浏览器历史里不留中转页，用户按后退不会再次触发。
+        if (hit.redirect_to) {
+          const vars = Object.assign({}, task.params || {}, task.display || {}, { record_id: hit.record_id });
+          const to = SVC.tpl(hit.redirect_to, vars);
+          if (!/^https:\/\//.test(to)) throw new Error('E_SPEC redirect_to 不是 https 地址：' + to);
+          let host = '';
+          try { host = new URL(to).host; } catch (e) {}
+          SVC.pendSet(task, host);
+          UI.notice('已取到记录 ' + hit.record_id + '，正在打开业务页面…');
+          SVC.go(to);
+          return;
+        }
+        await UI.loadTriggeredTask(task);
+        if (hit.on_match === 'fill_and_run') {
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill_and_run：参数已填充，立即开跑' });
+          await UI.runTask(task, document.getElementById('masr-trigger-run'));
+        }
+      } catch (e) {
+        UI._triggerTask = null;
+        UI._triggerErr = '按记录取数失败：' + e.message;
+        UI.renderTrigger();
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '按记录取数失败：' + e.message });
+        // 中转页没有主面板，必须让人看见失败原因，否则会以为按钮坏了
+        if (!document.getElementById('masr-trigger-box')) {
+          UI.notice('取数失败：' + e.message + '（不会继续，请回业务表核对该行状态）', 'error');
+        }
+      } finally {
+        busy = false;
+      }
+    }
+
+    window.addEventListener('hashchange', function () { fire('hashchange'); }, true);
+    window.addEventListener('popstate', function () { fire('popstate'); }, true);
+    setInterval(function () {
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      fire('url-change');
+    }, 1200);
+    fire('boot');
+    return fire;
+  }
+
   function boot() {
+    // 中转页判定必须发生在「挂面板之前」：脚本同样注入在跳板域名（如业务表按钮打开的百度页）上，
+    // 若先挂面板，用户日常打开那些页面就会看到工作台——那是污染，不是功能。
+    if (!SVC.code()) { mountAll(); return; }
+    const peek = SVC.peekTrigger();                    // 快路径：缓存新鲜时同步判定，零等待
+    if (peek && peek.redirect_to) { try { armUrlTrigger(); } catch (e) {} return; }
+    SVC.scenes().then(function () {                    // 慢路径：首次安装/缓存过期，先取规则再决定
+      const hit = SVC.matchTrigger();
+      if (hit && hit.redirect_to) { try { armUrlTrigger(); } catch (e) {} return; }
+      mountAll();
+    }).catch(function () { mountAll(); });
+  }
+
+  /* 常规业务页：挂面板、恢复中转页带过来的任务、起触发监听 */
+  function mountAll() {
     UI.mount();
     UI.renderTasks();
     UI.replayPersistedLogs(); // 跨页日志回放：任何页面加载都能看到之前全部输出
-    // 场景元数据 + URL 触发识别：规则同样来自 spec.scene.trigger（Runner 不登记任何场景）
-    // 本期只做「识别 + 在待办里标出」，不自动开跑——开户这类流程含不可逆步骤，必须人点。
+    // 中转页刚取到的任务：跳到业务页后在这里恢复。宿主要对得上，
+    // 否则在别的媒体页面上也会冒出这张卡（pending 只对声明它的业务页有效）。
     if (SVC.code()) {
-      SVC.scenes().then(function () {
-        const hit = SVC.matchTrigger();
-        UI._trigger = hit;
-        if (hit) {
-          UI.appendLog({
-            t: Date.now(), level: 'info',
-            msg: '当前页面匹配场景「' + (hit.name || hit.script_id) + '」' +
-              (hit.record_id ? '，记录 ' + hit.record_id + '（点「拉我的待办」会在列表中标出）' : ''),
-          });
+      const pend = SVC.pendGet();
+      if (pend && pend.t) {
+        const host = String(pend.host || ''), here = String(location.host || '');
+        if (!host || host === here) {
+          (async function () {
+            try { await UI.loadTriggeredTask(pend.t); SVC.pendClear(); }
+            catch (e) { UI.notice('已取到记录，但载入场景失败：' + e.message + '（可回业务表重新点按钮）', 'error'); }
+          })();
         }
-      }).catch(function () {});
+      }
+    }
+    // 场景元数据 + URL 触发：规则同样来自 spec.scene.trigger（Runner 不登记任何场景）
+    // 命中后自动按 record_id 取数并填充参数，但不自动开跑——含不可逆步骤的流程必须人点。
+    if (SVC.code()) {
+      try { armUrlTrigger(); } catch (e) { /* 触发失败不影响手动流程 */ }
     }
     // 版本落点：解释器升级后第一次加载，明确告诉人「现在跑的是哪个版本」
     try {
@@ -2851,6 +3100,8 @@
 
   // 暴露引擎给测试与控制台（不影响页面）
   try { (unsafeWindow || window).__MASR_TEST__ = ENGINE; } catch (e) { window.__MASR_TEST__ = ENGINE; }
+  // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
+  try { (unsafeWindow || window).__MASR_TEST_SVC__ = SVC; } catch (e) { window.__MASR_TEST_SVC__ = SVC; }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
