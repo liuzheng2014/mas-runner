@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.6.2
+// @version      0.7.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -19,6 +19,7 @@
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_setClipboard
+// @grant        unsafeWindow
 // @connect      svc-drcn.ads.huawei.com
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
@@ -381,6 +382,27 @@
     return h.toString(16);
   };
 
+  // ---------- 页面提交监听（submit_watch）纯函数 ----------
+  // sw 形如 {url_pattern, method?, success_assert: [表达式]}，全部来自 spec 声明，引擎不认识具体业务接口。
+  ENGINE.submitWatchMatch = function (sw, method, url) {
+    if (!sw || !sw.url_pattern) return false;
+    if (sw.method && String(sw.method).toUpperCase() !== String(method || '').toUpperCase()) return false;
+    try { return new RegExp(sw.url_pattern).test(String(url || '')); }
+    catch (e) { return false; }
+  };
+  // 成功判定：逐条跑 success_assert（与步骤断言同一求值器），全过才算成功。
+  ENGINE.submitWatchPass = function (sw, json) {
+    const results = [];
+    for (const expr of (sw && sw.success_assert) || []) {
+      let r;
+      try { r = ENGINE.evalAssert(expr, json, {}); }
+      catch (e) { r = { pass: false, detail: e.message }; }
+      results.push({ assert: expr, pass: !!r.pass, detail: r.detail || '' });
+    }
+    if (!results.length) return { pass: false, results: results };
+    return { pass: results.every(x => x.pass), results: results };
+  };
+
   /* ==================== ENGINE-END ==================== */
 
   const GV = {
@@ -390,7 +412,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.6.2',
+    RUNNER_VERSION: '0.7.0',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -2776,6 +2798,128 @@
     });
   };
 
+  /* ---------- 页面提交监听（E5，2026-11-03）：spec.scene.submit_watch 声明后生效 ----------
+   * 表单填充完成后不再只等人点「已发送」：挂网络钩子盯真实提交接口，命中 url_pattern 且响应
+   * 过 success_assert（与步骤断言同一求值器）即视为业务真实成功，自动按 writeback.ok 回写。
+   * 比人眼确认更准（盯的是接口返回，不是页面表象），也少一步手工。
+   * 降级保障：钩子装不上（沙箱/CSP）→ 退回人工确认按钮；命中接口但断言不过 → 不自动写
+   * 「邀请失败」（页面会提示错误，用户修正后可重发，监听继续），写失败态走人工兜底按钮。 */
+  UI._swHooks = false;
+  UI._sw = null;
+  UI.onWatchedResponse = function (method, url, text, status) {
+    const cur = UI._sw;
+    if (!cur || cur.done) return;
+    if (Date.now() - cur.armedAt > 30 * 60 * 1000) { cur.done = true; UI._sw = null; return; } // 30 分钟 TTL
+    if (!ENGINE.submitWatchMatch(cur.sw, method, url)) return;
+    let json = null;
+    try { json = JSON.parse(text); } catch (e) {}
+    const verdict = json
+      ? ENGINE.submitWatchPass(cur.sw, json)
+      : { pass: false, results: [{ assert: '响应为 JSON', pass: false, detail: '响应不是合法 JSON' }] };
+    const httpOk = status === undefined || status === null || (Number(status) >= 200 && Number(status) < 300);
+    if (verdict.pass && httpOk) {
+      cur.done = true;
+      UI._sw = null;
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '✓ 提交监听命中：接口返回成功（' + verdict.results.map(x => x.assert).join('; ') + '），自动回写「已发邀请」' });
+      watchWrite('接口监听', true);
+    } else {
+      const why = !httpOk ? 'HTTP ' + status : verdict.results.filter(x => !x.pass).map(x => x.assert + '（' + x.detail + '）').join('; ');
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '提交监听：接口已响应但未满足成功条件（' + why + '），未回写——可在页面修正后重新发送，监听继续' });
+      const el = document.getElementById('masr-watch-status');
+      if (el) el.innerHTML = '⚠️ 提交接口已响应但未成功（' + String(why).slice(0, 120) + '），未回写；可在页面修正后重新发送，监听继续';
+    }
+  };
+  UI.armSubmitWatch = function (spec) {
+    const sw = spec && spec.scene && spec.scene.submit_watch;
+    if (!sw || !sw.url_pattern) return false;
+    const old = document.getElementById('masr-manual-wb'); if (old) old.remove();
+    const oldW = document.getElementById('masr-watch-box'); if (oldW) oldW.remove();
+    const host = document.getElementById('masr-trigger-box') || document.getElementById('masr-result');
+    const outputs = (UI.lastResult && UI.lastResult.outputs) || {};
+    const st = function () { return { task: UI.currentTask, startedAt: UI._runStartedAt || Date.now(), specVersion: spec.version }; };
+    function disarm() { if (UI._sw) { UI._sw.done = true; } UI._sw = null; }
+    function watchWrite(via, ok) {
+      const el = document.getElementById('masr-watch-status');
+      if (el) el.innerHTML = '⏳ 正在回写…（' + via + '）';
+      Promise.resolve(pushTaskResult(st(), ok, outputs)).then(function (r) {
+        if (el) el.innerHTML = (r && r.written)
+          ? '✅ 已回写「已发邀请」，本条流程结束（' + via + '）'
+          : '⚠️ 回写未落表：' + ((r && r.msg) || '') + '（已存本地，可稍后「重试回写」）';
+      }).catch(function (e) {
+        if (el) el.innerHTML = '⚠️ 回写失败：' + e.message + '（已存本地待写队列，稍后「重试回写」）';
+      });
+    }
+    if (host) {
+      const box = document.createElement('div');
+      box.id = 'masr-watch-box';
+      box.style.cssText = 'margin-top:8px;padding:8px 10px;border:1px solid #b7d8b0;background:#f0f8ee;border-radius:8px;font-size:12px;line-height:1.7';
+      box.innerHTML = '<b>表单已自动填充。请在页面核对后点击「发送邀请」</b><br>' +
+        '<span id="masr-watch-status" style="color:#5a6b58">👀 正在监听提交结果：接口返回成功将自动回写「已发邀请」，无需再点按钮</span><br>' +
+        '<button id="masr-wb-ok2" class="primary" style="margin-top:6px">手动标记已发送</button>' +
+        '<button id="masr-wb-skip2" style="margin-left:8px">暂不发送</button>';
+      host.appendChild(box);
+      document.getElementById('masr-wb-ok2').addEventListener('click', function () { disarm(); watchWrite('人工标记', true); });
+      document.getElementById('masr-wb-skip2').addEventListener('click', function () {
+        disarm();
+        const el = document.getElementById('masr-watch-status');
+        if (el) el.innerHTML = '已跳过回写，记录保持「未邀请」';
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '人工选择暂不发送：不回写，记录保持"未邀请"，下次可重新触发' });
+      });
+    }
+    // 网络钩子：优先挂页面真实环境（unsafeWindow），失败则降级为纯人工确认
+    let hooksOk = false;
+    try {
+      const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      if (w.XMLHttpRequest && w.XMLHttpRequest.prototype && !w.XMLHttpRequest.prototype.__masrPatched) {
+        const proto = w.XMLHttpRequest.prototype;
+        const origOpen = proto.open, origSend = proto.send;
+        proto.open = function (m, u) {
+          try { this.__masr = { m: String(m || ''), u: String(u || '') }; } catch (e) {}
+          return origOpen.apply(this, arguments);
+        };
+        proto.send = function () {
+          const info = this.__masr;
+          if (info) this.addEventListener('load', function () {
+            try { UI.onWatchedResponse(info.m, info.u, this.responseText, this.status); } catch (e) {}
+          });
+          return origSend.apply(this, arguments);
+        };
+        proto.__masrPatched = true;
+        hooksOk = true;
+      } else if (w.XMLHttpRequest && w.XMLHttpRequest.prototype && w.XMLHttpRequest.prototype.__masrPatched) {
+        hooksOk = true;
+      }
+      if (typeof w.fetch === 'function' && !w.fetch.__masrPatched) {
+        const origFetch = w.fetch;
+        const patched = function (input, init) {
+          let u = '', m = '';
+          try {
+            u = (typeof input === 'string') ? input : (input && input.url) || '';
+            m = (init && init.method) || (input && input.method) || 'GET';
+          } catch (e) {}
+          return origFetch.apply(this, arguments).then(function (resp) {
+            try {
+              resp.clone().text().then(function (t) { UI.onWatchedResponse(m, u, t, resp.status); }).catch(function () {});
+            } catch (e) {}
+            return resp;
+          });
+        };
+        patched.__masrPatched = true;
+        try { w.fetch = patched; hooksOk = true; } catch (e) { /* fetch 不可写不算致命 */ }
+      }
+    } catch (e) {
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '提交监听钩子安装失败（' + e.message + '），已降级为人工确认' });
+      hooksOk = false;
+    }
+    UI._sw = { sw: sw, armedAt: Date.now(), done: false };
+    UI.appendLog({ t: Date.now(), level: 'ok', msg: '提交监听已布防：' + (sw.method || '任意方法') + ' 匹配 ' + sw.url_pattern + (hooksOk ? '' : '（钩子不可用，请用下方按钮人工确认）') });
+    if (!hooksOk) {
+      const el = document.getElementById('masr-watch-status');
+      if (el) el.innerHTML = '⚠️ 自动监听在当前页面不可用，请发送成功后点「手动标记已发送」';
+    }
+    return true;
+  };
+
   UI.doRun = async function (opts) {
     opts = opts || {};
     // 续跑优先：落地页上 spec/参数从运行态恢复，不要求本页先粘贴 spec
@@ -2859,7 +3003,7 @@
           UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 表单填充完成（manual 回写：是否已发送由人工确认，不自动写表）===' });
           renderOutputs(result.outputs || {});
           RunState.clear();
-          UI.renderManualWriteback(spec);
+          if (!UI.armSubmitWatch(spec)) UI.renderManualWriteback(spec);
           console.log('[MASR] result =', result);
           return;
         }
