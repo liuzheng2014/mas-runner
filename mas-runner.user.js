@@ -1182,10 +1182,12 @@
       if (!v) { try { v = new URLSearchParams(href.split('?')[1] || '').get(name) || ''; } catch (e) {} }
       return v;
     }
+    const hits = [];
     for (let i = 0; i < (list || []).length; i++) {
       const s = list[i], tr = s.trigger;
       if (!tr || !Array.isArray(tr.url_patterns)) continue;
-      for (let k = 0; k < tr.url_patterns.length; k++) {
+      let matched = false;
+      for (let k = 0; k < tr.url_patterns.length && !matched; k++) {
         let re = null;
         try { re = new RegExp(tr.url_patterns[k]); } catch (e) { continue; }
         if (!re.test(href)) continue;
@@ -1195,13 +1197,29 @@
           const tid = q(tr.table_id_query);
           if (!tid || !s.table_id || tid !== s.table_id) continue;
         }
-        return {
+        // 动作认领：同一张表可能有多个操作按钮（发邀请 / 导入成员 / 一键开户），
+        // 它们指向同一个入口 URL、同一个 recordId，只能靠按钮链接里自带的标记参数区分。
+        // 声明了 action_query 就必须对得上；声明了 action_query 但没配 action 视为声明不完整，跳过。
+        if (tr.action_query) {
+          if (!tr.action) continue;
+          if (q(tr.action_query) !== String(tr.action)) continue;
+        }
+        matched = true;
+        hits.push({
           script_id: s.script_id, name: s.name, record_id: q(tr.record_id_query),
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
-        };
+        });
       }
     }
+    // 多个场景同时命中 = 声明不足（多半是同表多按钮却没配 action 标记）。
+    // 这种情况一律不认领，绝不按顺序取第一个——那等于赌。
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) {
+      SVC._triggerAmbiguous = hits.map(function (h) { return h.script_id; });
+      return null;
+    }
+    SVC._triggerAmbiguous = null;
     return null;
   };
   SVC.matchTrigger = function (url) {
