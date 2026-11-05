@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.12
+// @version      0.9.0
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -10,6 +10,10 @@
 // @downloadURL  https://mas.wankahuanju.top/runner.user.js
 // @match        https://ads.huawei.com/*
 // @match        https://*.ads.huawei.com/*
+// 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
+// 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+// @match        https://id1.cloud.huawei.com/*
+// @match        https://id.cloud.huawei.com/*
 // @match        https://*.feishu.cn/*
 // 中转页（业务表按钮打开、URL 带 tableId+recordId 的跳板页）。此域上不挂主面板，
 // 只做「按表 ID 认领场景 → 按记录取数 → 把当前标签页替换成业务页」。
@@ -108,6 +112,20 @@
  *   - v0.4.4：回写抗抖动——①客户端遇超时/断连自动再试一次（1 秒后），仍失败才进本地待写队列；
  *     ②失败提示分清责任：`E_FS_TIMEOUT/E_FS_NET` 是「后端连飞书超时」而不是「本机服务没跑」
  *     （0.4.3 那句提示会误导人，用户实测踩到）；③service 侧同步给出站请求 7s 硬超时 + 重试一次
+ *
+ *   - v0.9.0：开户阶段二（管理式登录 / 导入成员）所需的 4 项能力，一次发版：
+ *     ①跨域登录链路——新增 @match id1./id.cloud.huawei.com，SCENE.trigger 支持 cross_domain
+ *       （hosts 白名单 + 用 service/redirect_uri 的目标主机名决定要不要接管，同一登录页会给很多站点用）；
+ *       跨页任务恢复从「host 相等」改为「落点域在场景声明内」；recordId 经 302/hash 多层编码，
+ *       新增 decodeParam 循环解码（最多 5 轮，解不动就返回原值，不猜）
+ *     ②人工闸门 confirm_gate / gateWhen——整屏遮罩 + 必须点，**无超时自动通过**（自动通过＝假装人看过了）。
+ *       when 支持 exists 与人数比较；判不出来一律 E_GATE 终止，绝不当「没命中」继续。
+ *       终止码取 action.error（缺省 E_HUMAN_CONFIRM），带 human 标记：收尾横幅说「已按设计终止（需人工接手）」
+ *       而不是「失败」，文案不含「重试」暗示——重跑一次往往就多建一个成员
+ *     ③参数级脱敏——param.secret=true 的值在面板/日志/GM 存储/回写载荷全链路打码；凭据禁走 URL
+ *       （scene.trigger.params_query 里出现 secret 参数 → 加载期 E_SPEC）
+ *     ④两处会长期误导的缺陷顺手修：uiText 读 el.value（原来对 input 恒返回空串，assert_ui 形同虚设）；
+ *       type 支持 skip_if_empty（可空字段原来只能填假值或整步失败）
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -240,6 +258,13 @@
    * input.value 是空的 —— 判「有没有选中」只能读文本，不能读 value（2026-11-05 实测）。 */
   ENGINE.uiText = function (el) {
     if (!el) return '';
+    /* 表单控件要读 value：input/textarea 的 innerText 永远是空串，
+     * 不特判的话 assert_ui 对输入框永远「实际空」——那会逼人放弃提交前校验，
+     * 退回到只看浮层显隐的假成功（2026-11-05 的事故路径）。 */
+    try {
+      const tag = String(el.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return String(el.value == null ? '' : el.value).trim();
+    } catch (e) { /* 非元素节点，走下面的文本路径 */ }
     const t = (typeof el.innerText === 'string' && el.innerText) ? el.innerText : (el.textContent || '');
     return String(t).replace(/\s+/g, ' ').trim();
   };
@@ -373,6 +398,89 @@
       });
     } catch (e) { return []; }
   };
+  /* 人工确认闸门：整屏遮罩 + 必须点一下才能继续。
+   * 用途：某一步之后已经没有「自动可做」的事，但人必须知道（如组织已满 200 人、
+   * 需要人完成短信验证码）。它**不**替人做决定，也不自动放行——点了才 resolve，
+   * 没点就永远挂着（不设超时自动通过：那等于假装人看过了）。 */
+  ENGINE.confirmGate = function (opts) {
+    const o = opts || {};
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    return new Promise(function (resolve) {
+      try {
+        const old = document.getElementById('masr-gate');
+        if (old) old.parentNode.removeChild(old);
+        const wrap = document.createElement('div');
+        wrap.id = 'masr-gate';
+        wrap.style.cssText = 'position:fixed;z-index:2147483647;left:0;top:0;right:0;bottom:0;' +
+          'background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;' +
+          'font:14px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif';
+        wrap.innerHTML =
+          '<div style="background:#fff;color:#1f2329;max-width:520px;border-radius:10px;padding:18px 20px;box-shadow:0 10px 40px rgba(0,0,0,.25)">' +
+          '<div style="font-size:16px;font-weight:600;margin-bottom:8px">' + esc(o.title || '需要你确认') + '</div>' +
+          '<div style="white-space:pre-wrap;color:#3d4757">' + esc(o.message || '') + '</div>' +
+          '<div style="margin-top:16px;text-align:right">' +
+          '<button id="masr-gate-ok" style="padding:6px 18px;border:0;border-radius:6px;background:#1664ff;color:#fff;font-size:14px;cursor:pointer">' +
+          esc(o.button || '我知道了') + '</button></div></div>';
+        document.body.appendChild(wrap);
+        wrap.querySelector('#masr-gate-ok').addEventListener('click', function () {
+          try { wrap.parentNode && wrap.parentNode.removeChild(wrap); } catch (e) {}
+          resolve({ confirmed: true, at: Date.now() });
+        });
+      } catch (e) {
+        // DOM 异常时不能静默放行（那就是「假装人确认过」），直接把错误抛给调用方
+        resolve({ confirmed: false, error: e.message });
+      }
+    });
+  };
+  /* 闸门条件：判断「此刻该不该弹闸门」。
+   * 业务上有两类必须拦的情况，都不能靠人盯着：
+   *   ① 元素出现即代表异常/需要人工（如 .hwid-authentication-root = 要短信验证码）
+   *   ② 两个数字比大小（如「成员人数 139」vs「成员人数上限 200」，满了就不能再建）
+   * 引擎只做「取文本 → 正则提数 → 按运算符比较」，业务含义全部由 spec 声明（pattern/op）。
+   * 返回 {hit, detail} 或 {error}：**判不出来必须报错，不能当成「没命中」放过去**——
+   * 判不出来还继续，等于在不知道是否满员的情况下建成员。 */
+  ENGINE.gateWhen = function (when, scope) {
+    const rp = (s) => ENGINE.resolvePlaceholders(String(s == null ? '' : s), scope || {});
+    if (!when || typeof when !== 'object') return { hit: true, detail: '无条件闸门' };
+
+    if (when.exists) {
+      const xp = rp(when.exists);
+      let el = null;
+      try { el = ENGINE.uiFindByXPath(xp); } catch (e) { return { error: 'exists 选择器无效: ' + xp + '（' + e.message + '）' }; }
+      /* 「找不到」和「找到了但被 display:none 藏住」是两件事：都算未命中，但日志必须说实话。
+       * 把后者说成「不存在」，排查时会被引到「选择器写错了」的错误方向。 */
+      const vis = !!el && ENGINE.uiIsVisible(el);
+      return { hit: vis, detail: (when.name || '元素') + (!el ? ' 不存在' : (vis ? ' 存在' : ' 存在但不可见')) };
+    }
+
+    const op = String(when.op || '>=');
+    const legal = ['>=', '>', '<=', '<', '==', '!='];
+    if (legal.indexOf(op) < 0) return { error: 'op 非法: ' + op + '（只允许 ' + legal.join(' ') + '）' };
+    const num = (xpRaw, patRaw, label) => {
+      const xp = rp(xpRaw);
+      const el = ENGINE.uiFindByXPath(xp);
+      if (!el) return { error: label + ' 元素未找到: ' + xp };
+      const txt = ENGINE.uiText(el);
+      const pat = patRaw ? rp(patRaw) : '(\\d+)';
+      let m = null;
+      try { m = new RegExp(pat).exec(txt); } catch (e) { return { error: label + ' 正则非法: ' + pat }; }
+      if (!m) return { error: label + ' 文本里取不到数字（pattern=' + pat + '，实际「' + String(txt).slice(0, 60) + '」）' };
+      const v = Number(m[1] === undefined ? m[0] : m[1]);
+      if (!isFinite(v)) return { error: label + ' 取到的不是数字: ' + (m[1] === undefined ? m[0] : m[1]) };
+      return { value: v, text: txt };
+    };
+    const left = num(when.xpath, when.pattern, '左值');
+    if (left.error) return left;
+    const right = num(when.ref_xpath, when.ref_pattern, '右值');
+    if (right.error) return right;
+    const a = left.value, b = right.value;
+    const hit = ENGINE.cmpNum(a, op, b);
+    return {
+      hit: hit,
+      detail: '左=' + a + ' ' + op + ' 右=' + b + ' → ' + (hit ? '命中（需要人工）' : '未命中（可继续）'),
+      values: [a, b],
+    };
+  };
   ENGINE.execUiActions = async function (actions, scope, opts) {
     opts = opts || {};
     const gap = Number(opts.gap_ms) || 400;
@@ -399,6 +507,36 @@
         } catch (e) { log('关闭标签页失败：' + e.message + '（可能是本窗口最后一个标签页）'); }
         await sleep(200);
         return;
+      }
+
+      /* 人工闸门：不碰页面元素、不发任何请求，只要求人点一下，然后按 spec 声明的码终止。
+       * 放在「定位元素」之前——它不需要 target。典型用法：组织已满 200 人、需要人补验证码。 */
+      if (act === 'confirm_gate') {
+        const gTitle = ENGINE.resolvePlaceholders(String(a.title || '需要你确认'), scope);
+        const gMsg = ENGINE.resolvePlaceholders(String(a.message || ''), scope);
+        /* 判不出来一律终止（E_GATE），不能当作「没命中」继续往下走——
+         * 那会在不知道是否满员的情况下建成员。这类是引擎/配置故障，不是「需要人工」。 */
+        const engineFail = (m) => { const e = new Error(m); e.code = 'E_GATE'; e.noOnFail = true; return e; };
+        const gw = ENGINE.gateWhen(a.when, scope);
+        if (gw.error) {
+          throw engineFail('E_GATE 闸门条件无法判定：' + gw.error + '——已终止（不装作没看见）');
+        }
+        if (!gw.hit) { log('闸门条件未命中（' + gw.detail + '），继续'); return; }
+        log('⏸ 等待人工确认：' + gTitle + '（' + gw.detail + '）');
+        const gr = await ENGINE.confirmGate({ title: gTitle, message: gMsg, button: a.button ? String(a.button) : '' });
+        if (!gr.confirmed) {
+          throw engineFail('E_GATE 无法显示确认框（' + (gr.error || '未知原因') + '）——已终止，不在无人知晓的情况下继续往下跑');
+        }
+        log('✓ 人工已确认（' + gTitle + '），按 spec 声明终止本流程');
+        /* 这里是「按设计停下等人」，不是故障。必须带自己的错误码（spec 的 action.error，
+         * 缺省 E_HUMAN_CONFIRM）和 human 标记抛出去：
+         *   - 不带码 → 上层 catch 会套用 step.on_fail 的文案，把「满员/要验证码」说成
+         *     「组织没找到」「账号密码不对」——2026-11-05 的教训：文案错了比没文案更危险；
+         *   - human 标记 → 收尾横幅不说「失败」，也不诱导重复触发。 */
+        const gErr = new Error(gTitle + '｜请人工处理完成后重新触发（这不是故障，是设计上的停点）');
+        gErr.code = String(a.error || 'E_HUMAN_CONFIRM');
+        gErr.human = true;
+        throw gErr;
       }
 
       const target = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
@@ -444,7 +582,7 @@
           await sleep(60);
           r = ENGINE.uiExpectText(xp, want);
         }
-        if (r.ok) { log('结果校验通过：' + label + ' = ' + want); return true; }
+        if (r.ok) { log('结果校验通过：' + label + (want ? ' = ' + want : '（元素已出现）')); return true; }
         lastErr = '期望「' + want + '」未出现（实际「' + (r.found ? r.actual : '<元素未找到>') + '」）';
         log('结果校验未通过（' + lastErr + '），重试 ' + label);
         if (reopenXp) {
@@ -479,7 +617,16 @@
           if (!(await verifyExpect())) continue;
         } else if (act === 'type') {
           const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
-          if (!String(val).length) throw new Error('E_UI_VALUE 填充值解析为空: ' + label + '——查任务参数或表字段值');
+          /* 可空字段：只有 spec 显式声明 skip_if_empty 才允许空值跳过。
+           * 缺省仍然报错——「解析为空」多半是参数没取到，静默跳过会让人以为填过了。
+           * 声明了就必须留日志，别让「跳过一个字段」变成看不见的事。 */
+          if (!String(val).length) {
+            if (a.skip_if_empty === true) {
+              log('跳过 ' + label + '：值为空（spec 声明该字段可空）');
+              return;
+            }
+            throw new Error('E_UI_VALUE 填充值解析为空: ' + label + '——查任务参数或表字段值');
+          }
           /* 敏感值（密码/密钥）在日志与报错里一律打码。日志会落屏、跨页保留（GM 存储）、
            * 并常被截图或整段贴进对话与文档——每贴一次就多一份密码副本，且无法审计、无法收回。
            * spec 用 type.secret=true 声明；未声明者照旧显示原值（向后兼容，不影响既有场景）。 */
@@ -775,7 +922,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.12',
+    RUNNER_VERSION: '0.9.0',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -974,6 +1121,18 @@
         throw new Error('E_SPEC: ' + s.id + ' 含 submit 动作但未声明 write:true —— 提交是不可逆写操作，必须显式声明才能受写配额约束');
       }
     });
+    /* 凭据不许走 URL：secret 参数只能由 /task 下发（请求体），不能出现在 scene.trigger.params_query，
+     * 也不能出现在 url_patterns 之外的任何 URL 侧声明里。URL 会进浏览器历史、服务端访问日志、
+     * 别人的截屏，一旦泄出去收不回来（密码改掉之前一直是活凭据）。 */
+    (function () {
+      const tr = (spec.scene && spec.scene.trigger) || {};
+      const pq = tr.params_query && typeof tr.params_query === 'object' ? tr.params_query : {};
+      (spec.params || []).forEach(function (p) {
+        if (p && p.secret === true && Object.prototype.hasOwnProperty.call(pq, p.name)) {
+          throw new Error('E_SPEC: 参数「' + p.name + '」声明为 secret，却出现在 scene.trigger.params_query —— 凭据不得由 URL 携带');
+        }
+      });
+    })();
     // 版本协商：spec 要求的最低 Runner 版本不满足就停在加载阶段。
     // 否则会跑到用到新原语的那一步才报「未知动作」，看着像页面改版，实际是没更新脚本。
     const needRunner = (spec.runtime || {}).requires_runner;
@@ -1104,6 +1263,15 @@
         if (e instanceof RunnerError) {
           log({ t: Date.now(), level: 'fatal', msg: step.id + ' 失败: [' + e.code + '] ' + e.message });
           throw e;
+        }
+        /* 自带错误码且声明 noOnFail/human 的（人工闸门、闸门条件判不出）不走 on_fail：
+         * on_fail 是「这一步的正常失败该怎么向业务解释」的模板，而这两种情况本身
+         * 已经把原因说清楚了，再套模板就会把「组织满员」写成「组织没找到」。 */
+        if (e && e.code && (e.noOnFail || e.human)) {
+          log({ t: Date.now(), level: e.human ? 'warn' : 'fatal', msg: step.id + (e.human ? ' 中止: [' : ' 失败: [') + e.code + '] ' + e.message });
+          const re = new RunnerError(e.code, e.message);
+          if (e.human) re.human = true;
+          throw re;
         }
         // spec 定义的 on_fail 优先，但底层原因永远保留（三要素：期望/实际/差异）
         const of = step.on_fail || {};
@@ -1701,6 +1869,21 @@
       requireField: '',
     };
   };
+  /* URL 参数可能被上游编码多次（业务表按钮 → 中转页 → 302 → SPA router，每跳都可能 encode 一次）。
+   * 只解一次会把 `rec%2525...` 这种串当原值传给服务端，表现为「记录ID格式不对」或查到空。
+   * 循环解到稳定为止；解不开就返回原值（宁可报错也不要静默给出半截值）。 */
+  SVC.decodeParam = function (v, maxRounds) {
+    let s = String(v == null ? '' : v);
+    const limit = Math.max(1, Number(maxRounds) || 5);
+    for (let i = 0; i < limit; i++) {
+      if (s.indexOf('%') < 0) break;
+      let n;
+      try { n = decodeURIComponent(s); } catch (e) { break; }   // 非法百分号转义：保留原样
+      if (n === s) break;
+      s = n;
+    }
+    return s;
+  };
   /* URL 触发匹配（纯函数）：规则全部来自 spec.scene.trigger，引擎不认识任何具体网站 */
   SVC.matchTriggerIn = function (list, url) {
     const href = String(url || location.href);
@@ -1710,8 +1893,31 @@
       let v = '';
       try { v = new URLSearchParams((href.split('#')[1] || '').split('?')[1] || '').get(name) || ''; } catch (e) {}
       if (!v) { try { v = new URLSearchParams(href.split('?')[1] || '').get(name) || ''; } catch (e) {} }
-      return v;
+      return SVC.decodeParam(v);
     }
+    /* 跨域登录页的安全阀：同一个 CAS 登录页服务很多站点，脚本装在这里不能见登录页就接管。
+     * spec 声明 cross_domain.hosts（会落到哪些域）+ require_service_hosts（只接管回跳本业务的登录）。
+     * 判定用 URL 里的 service / redirect_uri 参数的主机名；拿不到或不匹配 → 不认领。 */
+    function crossDomainOk(tr) {
+      const cd = tr && tr.cross_domain;
+      if (!cd) return true;                       // 未声明跨域 → 老路径，不改变既有行为
+      let here = '';
+      try { here = new URL(href).host; } catch (e) { here = String(location.host || ''); }
+      const hosts = Array.isArray(cd.hosts) ? cd.hosts : [];
+      if (!hosts.length || hosts.indexOf(here) < 0) return true;  // 不是登录域，不归本闸管
+      const allow = Array.isArray(cd.require_service_hosts) ? cd.require_service_hosts : [];
+      if (!allow.length) return true;             // 声明了登录域但没给白名单：不额外拦（由 spec 作者负责）
+      const svcNames = Array.isArray(cd.service_query) ? cd.service_query : ['service', 'redirect_uri'];
+      for (const n of svcNames) {
+        const raw = q(n);
+        if (!raw) continue;
+        let h = '';
+        try { h = new URL(raw).host; } catch (e) { h = ''; }
+        if (h && allow.indexOf(h) >= 0) return true;
+      }
+      return false;
+    }
+
     const hits = [];
     for (let i = 0; i < (list || []).length; i++) {
       const s = list[i], tr = s.trigger;
@@ -1734,9 +1940,12 @@
           if (!tr.action) continue;
           if (q(tr.action_query) !== String(tr.action)) continue;
         }
+        // 跨域登录页：不是回跳本业务的登录就不认领（别把别人的登录页接管掉）
+        if (!crossDomainOk(tr)) continue;
         matched = true;
         // params_query：spec 声明「哪些参数由页面地址直接带」（省掉查业务表那一步）。
         // 映射方向：spec 参数名 → URL 里的 query 参数名。引擎只认这份声明，不认识业务含义。
+        // 凭据类参数（secret）禁止走这里：URL 会进浏览器历史/日志/他人截屏，加载期校验会拦下这种声明。
         const params = {};
         if (tr.params_query && typeof tr.params_query === 'object') {
           for (const pname in tr.params_query) {
@@ -1749,6 +1958,7 @@
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
           params: params,
+          cross_domain: (tr.cross_domain && Array.isArray(tr.cross_domain.hosts)) ? tr.cross_domain.hosts.slice() : [],
         });
       }
     }
@@ -1808,6 +2018,26 @@
     } catch (e) { return null; }
   };
   SVC.pendClear = function () { try { GM_setValue(SVC.PEND_KEY, ''); } catch (e) {} };
+  /* 按 script_id 找场景声明（跨域判定要用它声明的 hosts） */
+  SVC.sceneById = function (scriptId) {
+    const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+    for (let i = 0; i < list.length; i++) {
+      if (String(list[i].script_id) === String(scriptId)) return list[i];
+    }
+    return null;
+  };
+  /* 跨页任务能不能在本页恢复：同域直接认；跨域只在 spec 声明的 hosts 里认。
+   * 301/302 换域是 P2 开户的常态（业务页 → CAS 登录页 → 管理台），若还死守 host 相等，
+   * 登录页永远恢复不了任务，recordId 就断了。 */
+  SVC.pendAccept = function (o, here) {
+    if (!o || !o.t) return false;
+    const host = String(o.host || '').toLowerCase();
+    const cur = String(here || '').toLowerCase();
+    if (!host || !cur || host === cur) return true;
+    const s = SVC.sceneById(o.t.script_id);
+    const hosts = (s && s.trigger && s.trigger.cross_domain && s.trigger.cross_domain.hosts) || [];
+    return hosts.map(function (x) { return String(x).toLowerCase(); }).indexOf(cur) >= 0;
+  };
   SVC.base = function () {
     const v = String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, '');
     return v || SVC.DEFAULT_BASE;
@@ -2905,15 +3135,21 @@
       (hasTask ? ' <span style="font-size:11px;color:#1a7f45">来自当前任务，无需填写</span>' : '') +
       list.map(function (p) {
         const auto = UI.taskParamValue(p.name);
+        /* 凭据类参数（secret:true）在面板上一律打码：面板会被截屏、录屏、共享屏幕，
+         * 贴到群里求助时密码就跟着出去了。打码只影响展示，实际执行用的仍是原值。 */
+        const secret = p.secret === true;
         if (auto) {
+          const shown = secret ? (String(ENGINE.maskValue(auto)) + '（已打码）') : auto;
           return '<div class="row"><label>' + esc(p.label || p.name) + '：</label>' +
-            '<code style="background:#f2f3f5;padding:1px 6px;border-radius:4px">' + esc(auto) + '</code>' +
+            '<code style="background:#f2f3f5;padding:1px 6px;border-radius:4px">' + esc(shown) + '</code>' +
             '<span style="font-size:10px;color:#8f959e;margin-left:6px">任务行</span></div>';
         }
         // 数据源参数（如 子客ID）：不再提供人工输入框，只能由任务行带入 —— 抄错账户ID会跑到别人头上
         if (p.source === 'manual') {
+          // secret 的手工输入框用 password 类型，且不回填历史值（不把密码留在本机 DOM 里）
           return '<div class="row"><label>' + esc(p.label || p.name) + ' (' + p.name + ')：</label>' +
-            '<input id="masr-p-' + p.name + '" value="' + esc(last[p.name] || '') + '" placeholder="' + esc(p.description || '') + '"></div>';
+            '<input id="masr-p-' + p.name + '" type="' + (secret ? 'password' : 'text') + '" autocomplete="off"' +
+            ' value="' + esc(secret ? '' : (last[p.name] || '')) + '" placeholder="' + esc(p.description || '') + '"></div>';
         }
         return '<div class="row"><label>' + esc(p.label || p.name) + '：</label>' +
           '<span style="font-size:11px;color:#8f959e">由任务带入（从「任务」点待办的「执行」或「批量执行」时自动填充）</span></div>';
@@ -3297,7 +3533,14 @@
           return;
         }
       }
-      UI.saveParams(spec.spec_id, params); // 记住这次填的值，下次自动回填
+      /* 参数记忆只记非凭据项：GM 存储是明文落盘的，密码写进去等于在本机留一份长期副本，
+       * 而且「下次自动回填」会把密码塞回 DOM。凭据每次从 /task 重新取，不落本地。 */
+      const keep = {};
+      (spec.params || []).forEach(function (p) {
+        if (p && p.secret === true) return;
+        if (params[p.name] !== undefined) keep[p.name] = params[p.name];
+      });
+      UI.saveParams(spec.spec_id, keep);
       // 角色标记：发起页（通常为代理页）永不自毁，负责展示最终结果
       try { sessionStorage.setItem('masrRole', 'origin'); } catch (e) {}
       CloseSig.clear();   // 新一次流程：抹掉上一轮的收摊信号，避免误关本次打开的标签页
@@ -3310,13 +3553,39 @@
       UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 续跑模式：从运行态恢复（' + st0.navStepId + ' 之后）===' });
       UI.replayStepLogs(st0.stepLogs);
     } else {
+      /* 运行态落盘时剔除凭据：RunState 走 GM 存储（明文）、会被跨页复制、并可能长期留着。
+       * 跨域登录页需要凭据时由它自己的场景从 /task 重新取（P2 就是拆成两个场景做的）。
+       * 代价写在这里：同一个 spec 里既有 navigate 又用 secret 参数时，续跑那一段拿不到凭据。 */
+      const pubParams = {};
+      const secretNames = [];
+      (spec.params || []).forEach(function (p) {
+        if (p && p.secret === true) { secretNames.push(p.name); return; }
+        if (params[p.name] !== undefined) pubParams[p.name] = params[p.name];
+      });
+      if (secretNames.length) {
+        const hasNav = (spec.steps || []).some(function (s) { return s.mode === 'navigate'; });
+        if (hasNav) {
+          UI.appendLog({
+            t: Date.now(), level: 'warn',
+            msg: '⚠️ 本 spec 同时含 navigate 与凭据参数：跨页后会丢弃凭据（安全策略），落地页需要能自行取得凭据，否则该步会失败',
+          });
+        }
+      }
       // 运行态初始化（供 navigate 续跑恢复用）
+      // task 也要脱敏：它是 /task 原样回来的对象，params 里就带着密码。
+      const pubTask = UI.currentTask ? Object.assign({}, UI.currentTask, {
+        params: (function () {
+          const p = Object.assign({}, (UI.currentTask && UI.currentTask.params) || {});
+          secretNames.forEach(function (n) { delete p[n]; });
+          return p;
+        })(),
+      }) : null;
       RunState.set({
         phase: 'running', specId: spec.spec_id, specVersion: spec.version,
-        specJson: JSON.stringify(spec), params, log: [], startedAt: Date.now(),
+        specJson: JSON.stringify(spec), params: pubParams, log: [], startedAt: Date.now(),
         runId: 'r' + Date.now(),   // 一次流程的唯一标识：收摊信号只认它，避免误关别的流程的标签页
         runnerVersion: GV.RUNNER_VERSION,
-        task: UI.currentTask || null,
+        task: pubTask,
       });
     }
     const hooks = { onLog: UI.appendLog, onStep: UI.markStep };
@@ -3347,7 +3616,17 @@
         if (wbModeOf(spec) === 'none') {
           const stm = RunState.get() || {};
           UI._runStartedAt = stm.startedAt || Date.now();
-          UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 表单填充完成（本场景不回写：请在页面核对后手动提交）===' });
+          /* 文案必须跟 spec 实际做到哪一步一致：P1 早期只填表，0.8.0 起改成了自动提交。
+           * 还在说「请手动提交」会诱导人多点一次 —— 那等于多给广告主发一封邀请，不可逆。 */
+          const didSubmit = (spec.steps || []).some(function (s) {
+            return ((s.ui && s.ui.actions) || []).some(function (a) { return a && a.do === 'submit'; });
+          });
+          UI.appendLog({
+            t: Date.now(), level: 'ok',
+            msg: didSubmit
+              ? '=== 已完成（含提交动作，判定结果见上方；本场景不回写飞书）==='
+              : '=== 表单填充完成（本场景不回写：请在页面核对后手动提交）===',
+          });
           renderOutputs(result.outputs || {});
           const stcN = RunState.get() || {};
           stcN.phase = 'done';
@@ -3374,8 +3653,12 @@
       console.log('[MASR] result =', result); // 本地调试用，不入表格
     } catch (e) {
       const code = e.code || 'E_UNKNOWN';
-      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '=== 终止: [' + code + '] ' + e.message + ' ===' });
-      UI.lastResult = { ok: false, error: code, message: e.message };
+      /* human=true 表示「按设计停在人工环节」，不是故障。
+       * 横幅与提示必须区分开：把它写成「失败」，人会以为脚本坏了、要重跑一遍，
+       * 而重跑往往要多发一封邀请/多建一个成员。 */
+      const human = !!e.human;
+      UI.appendLog({ t: Date.now(), level: human ? 'warn' : 'fatal', msg: (human ? '=== 已按设计终止（需人工接手）: [' : '=== 终止: [') + code + '] ' + e.message + ' ===' });
+      UI.lastResult = { ok: false, error: code, message: e.message, human: human };
       // 失败也广播（发起页能看到）；但辅助页不自毁，保留现场供排查
       try {
         const role = sessionStorage.getItem('masrRole') || '';
@@ -3391,7 +3674,9 @@
               if (wbModeOf(spec) !== 'auto') {
                 // none 模式：填充失败不写表（记录保持原状态，可重试）；提示人现场处置
                 stc.final.manual = true;
-                UI.appendLog({ t: Date.now(), level: 'warn', msg: '本场景不回写：填充失败不写表，记录保持原状态；可排查后重新触发' });
+                UI.appendLog({ t: Date.now(), level: 'warn', msg: human
+                  ? '本场景不回写：流程按设计停在人工环节，记录保持原状态；人工处理完成后可重新触发'
+                  : '本场景不回写：填充失败不写表，记录保持原状态；可排查后重新触发' });
               } else {
                 stc.final.written = true;
                 pushTaskResult(stc, false, null, { code: code, message: e.message });
@@ -3737,8 +4022,7 @@
     if (SVC.code()) {
       const pend = SVC.pendGet();
       if (pend && pend.t) {
-        const host = String(pend.host || ''), here = String(location.host || '');
-        if (!host || host === here) {
+        if (SVC.pendAccept(pend, location.host)) {
           (async function () {
             try { await UI.loadTriggeredTask(pend.t); SVC.pendClear(); }
             catch (e) { UI.notice('已取到记录，但载入场景失败：' + e.message + '（可回业务表重新点按钮）', 'error'); }
