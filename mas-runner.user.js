@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.6
+// @version      0.8.7
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -20,6 +20,9 @@
 // @grant        GM_deleteValue
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
+// 关闭当前标签页：普通 JS 的 window.close() 会被浏览器拒绝，油猴只有显式申请该权限才允许
+// （且仍不允许关闭窗口的最后一个标签页）。submit 成功后按 spec 声明自动关页靠它。
+// @grant        window.close
 // @connect      svc-drcn.ads.huawei.com
 // @connect      raw.githubusercontent.com
 // @connect      cdn.jsdelivr.net
@@ -225,6 +228,49 @@
       await sleep(tick);
     }
   };
+  /* 提交结果判定（只读页面，不发请求）。返回 {state, signal, text}：
+   *   ok=确认成功；fail=确认失败；invalid=表单校验没过（请求根本没发出）；
+   *   pending=还没有结果/只有无法归类提示；unknown 型提示会把文本带回，供人工判断。
+   * 判据优先级：spec 显式 success/fail XPath（有真实证据时最准）→ Element UI 消息组件约定。
+   * 为什么必须区分 invalid：校验没过和提交失败是两件事，前者要改数据、后者要改网络/重试，
+   * 混成一条「提交失败」会让人往错的方向查。
+   * 为什么判不出来绝不当成功：写操作误判成功的代价（以为发出去了实际没有）远大于多等十几秒。 */
+  ENGINE.uiDetectSubmitResult = function (opts) {
+    opts = opts || {};
+    const seen = function (xp) {
+      const el = ENGINE.uiFindByXPath(xp);
+      return (el && ENGINE.uiIsVisible(el)) ? el : null;
+    };
+    const txt = function (el) {
+      return el ? String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120) : '';
+    };
+    if (opts.success) { const el = seen(String(opts.success)); if (el) return { state: 'ok', signal: 'success_xpath', text: txt(el) }; }
+    if (opts.fail) { const el = seen(String(opts.fail)); if (el) return { state: 'fail', signal: 'fail_xpath', text: txt(el) }; }
+    const verr = seen('//*[contains(@class,"el-form-item__error")]');
+    if (verr) return { state: 'invalid', signal: 'form_validate', text: txt(verr) };
+    const okM = seen('//*[contains(@class,"el-message--success") or (contains(@class,"el-notification") and .//*[contains(@class,"el-icon-success")])]');
+    if (okM) return { state: 'ok', signal: 'el_message_success', text: txt(okM) };
+    const errM = seen('//*[contains(@class,"el-message--error") or (contains(@class,"el-notification") and .//*[contains(@class,"el-icon-error")])]');
+    if (errM) return { state: 'fail', signal: 'el_message_error', text: txt(errM) };
+    const anyM = seen('//*[contains(@class,"el-message") or contains(@class,"el-notification")]');
+    if (anyM) return { state: 'pending', signal: 'el_message_other', text: txt(anyM) };
+    return { state: 'pending', signal: '', text: '' };
+  };
+  /* 提交后新增的网络请求（只读 performance 缓冲，不拦截、不注入页面）。
+   * 用途：本场景的提交接口此前未捕获，第一次真实提交就能把 URL 与状态码记进日志，
+   * 之后要靠接口判成败就有证据了。t0Perf 必须是 performance.now() 的读数
+   * （resource 条的 startTime 也是同一时基；用 Date.now() 会比错量级）。 */
+  ENGINE.uiNewRequests = function (t0Perf) {
+    try {
+      if (typeof performance === 'undefined' || !performance.getEntriesByType) return [];
+      const base = Number(t0Perf) || 0;
+      return performance.getEntriesByType('resource').filter(function (e) {
+        return Number(e.startTime) >= base && /xmlhttprequest|fetch|beacon/i.test(String(e.initiatorType || ''));
+      }).map(function (e) {
+        return { url: String(e.name).slice(0, 200), status: Number(e.responseStatus) || 0, ms: Math.round(Number(e.duration) || 0) };
+      });
+    } catch (e) { return []; }
+  };
   ENGINE.execUiActions = async function (actions, scope, opts) {
     opts = opts || {};
     const gap = Number(opts.gap_ms) || 400;
@@ -239,10 +285,24 @@
     async function runOne(a) {
       const act = String(a.do || '');
       if (act === 'wait') { await sleep(Number(a.ms) || gap); return; }
+      /* 关页是纯本地动作：不等网络、不依赖任何元素。调用后页面可能立刻销毁，
+       * 所以不做「关掉了吗」的回读——那是自欺欺人（页面没了就读不到了）。 */
+      if (act === 'close_tab') {
+        const delay = Math.max(0, Number(a.delay_ms) || 0);
+        if (delay) { log('提交成功，' + delay + 'ms 后关闭标签页'); await sleep(delay); }
+        log('关闭标签页');
+        try {
+          if (typeof window !== 'undefined' && typeof window.close === 'function') window.close();
+          else log('当前环境不支持关闭标签页（缺少 window.close 授权）');
+        } catch (e) { log('关闭标签页失败：' + e.message + '（可能是本窗口最后一个标签页）'); }
+        await sleep(200);
+        return;
+      }
 
       const target = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
       const until = a.until ? String(a.until) : '';
-      const tries = Math.max(1, Number(a.max_tries) || 3);
+      // 提交是不可逆写操作：只点一次，绝不因「没看清结果」而重试
+      const tries = act === 'submit' ? 1 : Math.max(1, Number(a.max_tries) || 3);
       const untilMs = Number(a.until_ms) || 1500;
       const label = a.name || target;
       let lastErr = '';
@@ -287,6 +347,39 @@
             const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
             if (!ok) { lastErr = untilMs + 'ms 内未变为 ' + until; continue; }
           }
+        } else if (act === 'submit') {
+          /* 点提交并判定结果。三态分开报：成功 / 校验没过（请求都没发）/ 失败或未确认。
+           * 「未确认」一律当失败终止——写操作宁可少发一封让人手动补，也不能误报成功。 */
+          const timeout = Math.max(1000, Number(a.timeout_ms) || 15000);
+          const tPerf = (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : 0;
+          log('提交 ' + label);
+          el.click();
+          log('等待提交结果（最多 ' + timeout + 'ms）');
+          const t0s = Date.now();
+          let st = { state: 'pending', signal: '', text: '' };
+          while (Date.now() - t0s < timeout) {
+            st = ENGINE.uiDetectSubmitResult({ success: a.success, fail: a.fail });
+            if (st.state !== 'pending') break;
+            await sleep(100);
+          }
+          // 把提交触发的请求记下来：本场景提交接口此前未捕获，这里是第一次取证机会
+          const reqs = ENGINE.uiNewRequests(tPerf);
+          if (reqs.length) {
+            log('提交后网络请求：' + reqs.map(function (r) { return (r.status || '?') + ' ' + r.url + ' (' + r.ms + 'ms)'; }).join(' ｜ '));
+          }
+          if (st.state === 'ok') {
+            log('提交成功（' + st.signal + '）' + (st.text ? '：' + st.text : '') + '，判定用时 ' + (Date.now() - t0s) + 'ms');
+            await sleep(gap);
+            return;
+          }
+          if (st.state === 'invalid') {
+            throw new Error('E_UI_VALIDATE 表单校验未通过，提交没有发出: ' + (st.text || '见页面字段下的红色提示'));
+          }
+          if (st.state === 'fail') {
+            throw new Error('E_UI_SUBMIT 提交失败: ' + (st.text || st.signal) + '——已终止且不重试，请人工核对');
+          }
+          throw new Error('E_UI_SUBMIT 提交后 ' + timeout + 'ms 内未检测到成功信号（未确认，已终止且不重试）'
+            + (st.text ? '；页面提示：' + st.text : '') + '——请人工核对页面后决定是否重做，不要盲目重复提交');
         } else {
           throw new Error('E_SPEC 未知 ui 动作: ' + act);
         }
