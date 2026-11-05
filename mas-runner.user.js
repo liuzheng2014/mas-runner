@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.9
+// @version      0.8.10
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -236,6 +236,27 @@
       await sleep(tick);
     }
   };
+  /* 读元素文本（空白折叠）。注意：Element Plus 的 el-select 选中值体现在容器 innerText 上，
+   * input.value 是空的 —— 判「有没有选中」只能读文本，不能读 value（2026-11-05 实测）。 */
+  ENGINE.uiText = function (el) {
+    if (!el) return '';
+    const t = (typeof el.innerText === 'string' && el.innerText) ? el.innerText : (el.textContent || '');
+    return String(t).replace(/\s+/g, ' ').trim();
+  };
+  /* 结果断言：某 XPath 的文本是否包含期望值。返回 {ok, actual, found}。
+   *
+   * 为什么必须要它（2026-11-05 线上事故）：until="hidden" 校验的是「下拉浮层收起」，
+   * 这与「值真的写进表单」是两件事。一级行业选中后二级列表会重建，点击若落在重建窗口内，
+   * click 打到即将废弃的节点：不抛错、浮层照样收起、until=hidden 立即通过，但值没进表单，
+   * 一直拖到提交时才被 el-form 校验暴露成「二级行业不能为空」。
+   * 结论：动作是否生效必须校验【结果】（字段显示值），不能校验【副作用】（浮层显隐）。
+   */
+  ENGINE.uiExpectText = function (xp, want) {
+    const el = ENGINE.uiFindByXPath(xp);
+    const actual = ENGINE.uiText(el);
+    const w = String(want == null ? '' : want);
+    return { ok: !!el && actual.indexOf(w) >= 0, actual: actual, found: !!el };
+  };
   /* 语义化版本比较（逐段按数字比：0.8.10 > 0.8.9，按字符串比会错）。
    * 为什么需要：spec 可能用到新版 Runner 才有的原语（如 submit/close_tab）。老 Runner 会一路跑到
    * 那一步才抛「E_SPEC 未知 ui 动作」，用户看不出是版本问题，还以为是页面改版。
@@ -278,7 +299,10 @@
     };
     if (opts.success) { const el = seen(String(opts.success)); if (el) return { state: 'ok', signal: 'success_xpath', text: txt(el) }; }
     if (opts.fail) { const el = seen(String(opts.fail)); if (el) return { state: 'fail', signal: 'fail_xpath', text: txt(el) }; }
-    const verr = seen('//*[contains(@class,"el-form-item__error")]');
+    /* 表单校验未通过：只认「form-item 处于 is-error 状态」里的红字。
+     * 不能只看红字节点是否存在——Element Plus 在校验转 success 后，红字节点可能仍留在 DOM 里
+     * 一小段时间（节点残留、状态已变），按「存在即失败」会误报「校验没过」，而实际上能提交成功。 */
+    const verr = seen('//*[contains(concat(" ",normalize-space(@class)," ")," el-form-item ")][contains(concat(" ",normalize-space(@class)," ")," is-error ")]//*[contains(@class,"el-form-item__error")]');
     if (verr) return { state: 'invalid', signal: 'form_validate', text: txt(verr) };
     const okM = seen('//*[contains(@class,"el-message--success") or (contains(@class,"el-notification") and .//*[contains(@class,"el-icon-success")])]');
     if (okM) return { state: 'ok', signal: 'el_message_success', text: txt(okM) };
@@ -339,6 +363,51 @@
       const label = a.name || target;
       let lastErr = '';
 
+      /* assert_ui：只读确认，不做任何操作。用来在关键动作（尤其不可逆的提交）之前
+       * 确认表单真实值，把「填了但没进去」挡在提交之前。
+       * 与 until 的区别：until 看显隐（副作用），assert_ui 看文本（结果）。 */
+      if (act === 'assert_ui') {
+        const axp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
+        const awant = ENGINE.resolvePlaceholders(String(a.text == null ? '' : a.text), scope);
+        if (!axp) throw new Error('E_SPEC assert_ui 缺 xpath');
+        const r = ENGINE.uiExpectText(axp, awant);
+        if (!r.ok) {
+          throw new Error('E_UI_EXPECT ' + label + '：期望「' + awant + '」，实际「'
+            + (r.found ? r.actual : '<元素未找到>') + '」——' + (a.hint || '前面的动作没有真正写进表单'));
+        }
+        log('确认 ' + label + ' = ' + awant);
+        return;
+      }
+
+      /* 结果断言（可选，click/type 通用）：动作完成后校验 expect_xpath 的文本含 expect_text。
+       * 不通过则重试；重试前若声明了 reopen，先重新展开下拉（联动重渲染会把浮层关掉）。 */
+      const expectXp = a.expect_xpath ? String(a.expect_xpath) : '';
+      const expectText = a.expect_text == null ? '' : String(a.expect_text);
+      const reopenXp = a.reopen ? String(a.reopen) : '';
+
+      async function verifyExpect() {
+        if (!expectXp) return true;
+        const want = ENGINE.resolvePlaceholders(expectText, scope);
+        const xp = ENGINE.resolvePlaceholders(expectXp, scope);
+        /* 轮询而不是立即读：Vue/Element Plus 改完数据是 nextTick 才更新 DOM，
+         * 点完立刻读会读到旧文本，把「刚写进去」误判成「没写进去」，白白多重试一轮。 */
+        const limit = Math.max(0, Number(a.expect_ms) || 800);
+        const t0 = Date.now();
+        let r = ENGINE.uiExpectText(xp, want);
+        while (!r.ok && Date.now() - t0 < limit) {
+          await sleep(60);
+          r = ENGINE.uiExpectText(xp, want);
+        }
+        if (r.ok) { log('结果校验通过：' + label + ' = ' + want); return true; }
+        lastErr = '期望「' + want + '」未出现（实际「' + (r.found ? r.actual : '<元素未找到>') + '」）';
+        log('结果校验未通过（' + lastErr + '），重试 ' + label);
+        if (reopenXp) {
+          const rn = ENGINE.uiFindByXPath(ENGINE.resolvePlaceholders(reopenXp, scope));
+          if (rn) { rn.click(); await sleep(Number(a.reopen_ms) || 250); }
+        }
+        return false;
+      }
+
       for (let k = 1; k <= tries; k++) {
         // 每次重试都重新定位：联动重渲染会把旧节点换成新的，持有旧引用会点空
         const tFind = Date.now();
@@ -361,6 +430,7 @@
               continue;
             }
           }
+          if (!(await verifyExpect())) continue;
         } else if (act === 'type') {
           const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
           if (!String(val).length) throw new Error('E_UI_VALUE 填充值解析为空: ' + label + '——查任务参数或表字段值');
@@ -379,6 +449,7 @@
             const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
             if (!ok) { lastErr = untilMs + 'ms 内未变为 ' + until; continue; }
           }
+          if (!(await verifyExpect())) continue;
         } else if (act === 'submit') {
           /* 点提交并判定结果。三态分开报：成功 / 校验没过（请求都没发）/ 失败或未确认。
            * 「未确认」一律当失败终止——写操作宁可少发一封让人手动补，也不能误报成功。 */
@@ -628,7 +699,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.9',
+    RUNNER_VERSION: '0.8.10',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
