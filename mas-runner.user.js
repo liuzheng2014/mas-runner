@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.7
+// @version      0.8.8
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -227,6 +227,30 @@
       if (Date.now() - t0 >= limit) return false;
       await sleep(tick);
     }
+  };
+  /* 语义化版本比较（逐段按数字比：0.8.10 > 0.8.9，按字符串比会错）。
+   * 为什么需要：spec 可能用到新版 Runner 才有的原语（如 submit/close_tab）。老 Runner 会一路跑到
+   * 那一步才抛「E_SPEC 未知 ui 动作」，用户看不出是版本问题，还以为是页面改版。
+   * 在 spec 加载时就拦，一句话说清「要升级」。 */
+  ENGINE.versionCompare = function (a, b) {
+    const pa = String(a || '0').split('.').map(function (x) { return parseInt(x, 10) || 0; });
+    const pb = String(b || '0').split('.').map(function (x) { return parseInt(x, 10) || 0; });
+    for (let i = 0; i < 3; i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d > 0 ? 1 : -1;
+    }
+    return 0;
+  };
+  /* 检查 spec.runtime.requires_runner（只认 ">=0.8.7" 这类简单约束；写不明白就当没写，不误伤）。 */
+  ENGINE.checkRequiresRunner = function (needSpec, running) {
+    const need = String(needSpec == null ? '' : needSpec).trim();
+    if (!need) return { ok: true, checked: false };
+    const m = need.match(/^(>=|>|<=|<|=)?\s*([\d]+(?:\.[\d]+){0,2})$/);
+    if (!m) return { ok: true, checked: false, warn: 'requires_runner 写法无法解析: ' + need };
+    const op = m[1] || '>=';
+    const c = ENGINE.versionCompare(running, m[2]);
+    const ok = op === '>=' ? c >= 0 : op === '>' ? c > 0 : op === '<=' ? c <= 0 : op === '<' ? c < 0 : c === 0;
+    return { ok: ok, checked: true, need: need, running: String(running) };
   };
   /* 提交结果判定（只读页面，不发请求）。返回 {state, signal, text}：
    *   ok=确认成功；fail=确认失败；invalid=表单校验没过（请求根本没发出）；
@@ -784,6 +808,22 @@
     if (spec.last_verified_at) {
       const days = (Date.now() - new Date(spec.last_verified_at).getTime()) / 86400000;
       if (days > 30) throw new Error('E_SPEC: spec 已 ' + Math.floor(days) + ' 天未验证（last_verified_at=' + spec.last_verified_at + '），疑似失效，拒绝执行');
+    }
+    // 版本协商：spec 要求的最低 Runner 版本不满足就停在加载阶段。
+    // 否则会跑到用到新原语的那一步才报「未知动作」，看着像页面改版，实际是没更新脚本。
+    const needRunner = (spec.runtime || {}).requires_runner;
+    if (needRunner) {
+      let running = '';
+      try {
+        if (typeof GM_info !== 'undefined' && GM_info && GM_info.script) running = String(GM_info.script.version || '');
+      } catch (e) { running = ''; }
+      if (running) {
+        const chk = ENGINE.checkRequiresRunner(needRunner, running);
+        if (!chk.ok) {
+          throw new Error('E_SPEC: 该 spec 需要 Runner ' + needRunner + '，当前是 ' + running
+            + '——请先更新脚本（工具面板「检查更新」），更新后再跑');
+        }
+      }
     }
   }
 
