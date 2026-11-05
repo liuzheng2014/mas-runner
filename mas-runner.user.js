@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.0
+// @version      0.8.1
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -391,7 +391,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.0',
+    RUNNER_VERSION: '0.8.1',
     // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
     // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
     // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
@@ -1451,6 +1451,44 @@
     if (!id) return Promise.reject(new Error('E_SCENE 未能确定场景：该行没有 script_id，且当前不止一个场景'));
     return SVC.call('GET', '/spec', { script_id: id });
   };
+
+  /* ---------- spec 本地缓存（v0.8.1） ----------
+   * 每点一次业务表里的「操作按钮」都是新开一个标签页，页面内存里的 _specCache 随之销毁，
+   * 于是每一条都要重新「公网 → Worker → 飞书」取一次 spec。实测这一枪 14s：
+   * 客户端到自定义域的链路抖动 7~8s（偶发 20s 超时）+ 服务端两次飞书读 6~7s。
+   * spec 是纯声明式流程、一版发布长期稳定，天然适合落本地：
+   *   命中 URL → 直接用缓存开跑（≈0 等待）→ 后台静默拉一次，版本变了才更新缓存，本次仍按缓存版执行。
+   * 存的是 spec 原文（业务表 ID / 页面选择器，无任何凭据），与「加载 spec」按钮持久化的那份同性质。 */
+  const SPEC_KEY = 'masr.spec.';
+  const SPEC_STALE_MS = 7 * 24 * 3600 * 1000;   // 7 天没刷新过的不再采信：宁可等一次网络，也不用过期流程
+  SVC.specCache = {
+    get: function (id) {
+      if (!id) return null;
+      try {
+        const o = JSON.parse(GM_getValue(SPEC_KEY + id, 'null'));
+        if (!o || !o.spec || !o.version) return null;
+        if (o.ts && Date.now() - o.ts > SPEC_STALE_MS) return null;
+        return o;
+      } catch (e) { return null; }
+    },
+    put: function (id, s) {
+      if (!id || !s || !s.spec) return;
+      try {
+        GM_setValue(SPEC_KEY + id, JSON.stringify({
+          spec_id: s.spec_id || id, version: s.version, status: s.status || '', spec: s.spec, ts: Date.now(),
+        }));
+      } catch (e) { /* 存不下不影响本次执行 */ }
+    },
+    drop: function (id) { try { GM_deleteValue(SPEC_KEY + id); } catch (e) {} },
+  };
+  /* 后台刷新：不阻塞主流程；失败静默（缓存只是加速，不是依赖） */
+  SVC.specRefresh = function (id) {
+    return SVC.spec(id).then(function (s) {
+      const old = SVC.specCache.get(id);
+      SVC.specCache.put(id, s);
+      return { changed: !old || old.version !== s.version, version: s.version, oldVersion: old ? old.version : '' };
+    });
+  };
   SVC.writeResult = function (payload) {
     // 45s：服务端对飞书是 15s 硬超时 + 重试一次，客户端预算必须比它大，否则会把"正在重试"误判成失败
     return SVC.call('POST', '/result', null, payload, { timeout: 45000 });
@@ -1944,9 +1982,12 @@
       const dk = task.display ? Object.keys(task.display) : [];
       const dv = dk.length ? task.display[dk[0]] : '';
       UI.appendLog({ t: Date.now(), level: 'info', msg: '载入任务：' + SVC.sceneView(scene).name + ' · ' + (dv || task.record_id) + '（' + task.record_id + '）' });
-      // spec 优先复用刚载入的那份（同一轮流程内不会变），省一次往返
-      const cached = (UI._specCache && UI._specCache.script_id === scene) ? UI._specCache : null;
-      const s = cached ? { spec: cached.spec, version: cached.version } : await SVC.spec(scene);
+      // spec 三级取用：页面内存（本轮已载入）→ 本地持久缓存（跨标签页/跨重启）→ 联网取
+      const memc = (UI._specCache && UI._specCache.script_id === scene) ? UI._specCache : null;
+      const diskc = memc ? null : SVC.specCache.get(scene);
+      let s = memc ? { spec: memc.spec, version: memc.version }
+        : (diskc ? { spec_id: diskc.spec_id || scene, version: diskc.version, status: diskc.status || '', spec: diskc.spec } : null);
+      if (!s) { s = await SVC.spec(scene); SVC.specCache.put(scene, s); }
       UI._specCache = { script_id: scene, spec: s.spec, version: s.version };
       UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
@@ -1963,7 +2004,7 @@
         }
         SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
       }
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + s.spec_id + ' v' + s.version + '（任务参数已带入）' });
+      UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + (s.spec_id || scene) + ' v' + s.version + '（任务参数已带入）' });
       await UI.doRun({ keepLog: true });
     } catch (e) {
       UI.appendLog({ t: Date.now(), level: 'fatal', msg: '执行失败（载入阶段）：' + e.message });
@@ -3064,10 +3105,37 @@
       from_url: !!task.from_url,
       on_match: task.on_match || '',
     };
-    const s = await SVC.spec(task.script_id);
+    // 缓存优先：命中本地 spec 就立刻开跑，不等公网；版本校验放后台（见下面 specRefresh）
+    const t0 = Date.now();
+    const cached = SVC.specCache.get(task.script_id);
+    let s = cached
+      ? { spec_id: cached.spec_id || task.script_id, version: cached.version, status: cached.status || '', spec: cached.spec }
+      : null;
+    if (!s) {
+      s = await SVC.spec(task.script_id);
+      SVC.specCache.put(task.script_id, s);
+    }
     UI.currentTask.spec_version = s.version;
     UI._specCache = { script_id: task.script_id, spec: s.spec, version: s.version };
-    UI.applySpec(JSON.stringify(s.spec), { persist: true });
+    let applied = UI.applySpec(JSON.stringify(s.spec), { persist: true });
+    if (!applied && cached) {
+      // 本地那份坏掉（格式/校验不通过）：丢掉重取，绝不让坏缓存把流程卡死
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '本地缓存的 spec 无法加载，改为联网重取…' });
+      SVC.specCache.drop(task.script_id);
+      s = await SVC.spec(task.script_id);
+      SVC.specCache.put(task.script_id, s);
+      UI.currentTask.spec_version = s.version;
+      UI._specCache = { script_id: task.script_id, spec: s.spec, version: s.version };
+      applied = UI.applySpec(JSON.stringify(s.spec), { persist: true });
+    }
+    if (cached) {
+      // 后台校验版本：变了只提示、不打断本次（选择器若真被换掉，页面填充的断言会自己报错，不会静默填错）
+      SVC.specRefresh(task.script_id).then(function (r) {
+        if (r && r.changed) {
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到新版 spec v' + r.version + '（本地缓存 v' + r.oldVersion + '）：本次仍按缓存版执行，下次自动生效' });
+        }
+      }).catch(function () { /* 校验失败静默：不能因为刷新失败就否定缓存 */ });
+    }
     if (UI.spec && UI.restoreSpecText) UI.restoreSpecText();
     UI._triggerTask = task;
     UI._triggerErr = '';
@@ -3076,7 +3144,8 @@
     const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
     UI.appendLog({
       t: Date.now(), level: 'ok',
-      msg: (task.from_url ? '已从页面地址读取参数' : '已按页面记录取数 ' + task.record_id) + '（' + s.spec_id + ' v' + s.version + '）' +
+      msg: (task.from_url ? '已从页面地址读取参数' : '已按页面记录取数 ' + task.record_id) + '（' + s.spec_id + ' v' + s.version +
+        (cached ? '｜本地缓存，取 spec 用时 ' + (Date.now() - t0) + 'ms' : '｜联网取 spec 用时 ' + (Date.now() - t0) + 'ms') + '）' +
         (keys.length ? '；参数 ' + keys.map(function (k) { return k + '=' + ps[k]; }).join('，') : ''),
     });
     // 只有「要往业务表回写」的场景才需要捂热那张表；纯填表场景（URL 自带参数）不查表也不写表，捂热纯属浪费。
