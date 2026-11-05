@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.2
+// @version      0.8.3
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
 // @supportURL   https://github.com/liuzheng2014/mas-runner/issues
-// @updateURL    https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
-// @downloadURL  https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js
+// @updateURL    https://mas.wankahuanju.top/runner.user.js
+// @downloadURL  https://mas.wankahuanju.top/runner.user.js
 // @match        https://ads.huawei.com/*
 // @match        https://*.ads.huawei.com/*
 // @match        https://*.feishu.cn/*
@@ -391,17 +391,22 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.2',
-    // 自更新通道：manifest 与脚本本体同源（公开分发仓库，GitHub + Gitee 双仓镜像）。
-    // Gitee 为主：业务同学在国内、无代理环境 raw.githubusercontent.com 基本不可达，
-    // jsDelivr 时好时坏；油猴自身按 @updateURL 静默更新（同样指向 Gitee），
-    // 此处的 manifest 列表只用于「检查更新」按钮与启动静默自检的显式查询（按序尝试）。
+    RUNNER_VERSION: '0.8.3',
+    // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
+    //   https://mas.wankahuanju.top/runner.user.js
+    // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
+    // 为什么不用公共源直连（2026-11-05 实测）：
+    //   - Gitee raw 在浏览器/油猴里会被导向内网登录服务 authunicorn.gitee-prod:3000，
+    //     客户端不可达，装不上；
+    //   - jsDelivr 的 @main 有 12h 文件缓存 + 独立的分支→commit 解析缓存，purge 打不到，长期给旧版；
+    //   - GitHub raw 国内 DNS 污染，业务同学基本不可达。
+    // 下面的 manifest 列表只用于「检查更新」按钮与启动静默自检（按序尝试，自建优先）。
     UPDATE_MANIFEST: [
-      'https://gitee.com/dahan_2014/mas-runner/raw/main/manifest.json',
-      'https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/manifest.json',
-      'https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/manifest.json'
+      'https://mas.wankahuanju.top/runner.json',
+      'https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/manifest.json',
+      'https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/manifest.json'
     ],
-    INSTALL_URL: 'https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js',
+    INSTALL_URL: 'https://mas.wankahuanju.top/runner.user.js',
   };
 
   // ---------- 运行态存取（GM 存储跨域共享，导航后由新页面恢复） ----------

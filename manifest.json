@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "file": "mas-runner.user.js",
-  "sha256": "f204ac4ab6bcc7d6a52f4b1a82ab22f4648888bca9407fa8da5afddc9ef8c962",
-  "bytes": 185166,
-  "published_at": "2026-11-05T11:09:12+08:00",
-  "install_url": "https://gitee.com/dahan_2014/mas-runner/raw/main/mas-runner.user.js",
+  "sha256": "e4682926ed482392fb2c8c67e32bc6f452ce56bd7fd406e5d982ddfd9a2ab2ec",
+  "bytes": 185394,
+  "published_at": "2026-11-05T11:17:58+08:00",
+  "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "chore: 0.8.2 更新通道改 Gitee 主源——jsDelivr 分支引用有 12h CDN 缓存，导致「检查更新」长期停留在旧版本"
+  "notes": "fix: 0.8.3 分发源改为自建路由 mas.wankahuanju.top/runner.user.js\n\nGitee raw 在浏览器/油猴里被导向内网登录服务 authunicorn.gitee-prod:3000，\n客户端不可达（用户实测重定向 10 次失败，装不上）；jsDelivr @main 有 12h\n文件缓存 + 独立的分支→commit 解析缓存，purge 打不到解析层，长期给旧版。\n改为 Worker 自建分发（内部回源 GitHub，60s 边缘缓存），发布即生效。"
 }
