@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.10
+// @version      0.8.11
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -257,6 +257,28 @@
     const w = String(want == null ? '' : want);
     return { ok: !!el && actual.indexOf(w) >= 0, actual: actual, found: !!el };
   };
+  /* 列出「正处于校验失败状态」的表单项红字文本。
+   * 为什么要连 is-error 一起看：只按红字节点是否存在判断不可靠——Element Plus 校验转 success 后，
+   * 红字节点与 is-error 类可能残留一小段时间（2026-11-05 实测：字段已选中、is-success，
+   * DOM 里仍留着「二级行业不能为空」的旧节点）。
+   * 用途：提交前拍快照，提交后只把「新增」的红字算作本次失败（陈旧的与本次提交无关）。 */
+  ENGINE.uiFormErrors = function () {
+    const out = [];
+    try {
+      const doc = (typeof document !== 'undefined') ? document : null;
+      if (!doc) return out;
+      const it = doc.evaluate(
+        '//*[contains(concat(" ",normalize-space(@class)," ")," el-form-item ")][contains(concat(" ",normalize-space(@class)," ")," is-error ")]',
+        doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      for (let i = 0; i < it.snapshotLength; i++) {
+        const fi = it.snapshotItem(i);
+        const e = fi.querySelector('.el-form-item__error');
+        if (!e || !ENGINE.uiIsVisible(e)) continue;
+        out.push(ENGINE.uiText(e).slice(0, 120));
+      }
+    } catch (e) { /* 读不到就当没有，绝不因取证失败而误判提交结果 */ }
+    return out;
+  };
   /* 语义化版本比较（逐段按数字比：0.8.10 > 0.8.9，按字符串比会错）。
    * 为什么需要：spec 可能用到新版 Runner 才有的原语（如 submit/close_tab）。老 Runner 会一路跑到
    * 那一步才抛「E_SPEC 未知 ui 动作」，用户看不出是版本问题，还以为是页面改版。
@@ -288,6 +310,14 @@
    * 为什么必须区分 invalid：校验没过和提交失败是两件事，前者要改数据、后者要改网络/重试，
    * 混成一条「提交失败」会让人往错的方向查。
    * 为什么判不出来绝不当成功：写操作误判成功的代价（以为发出去了实际没有）远大于多等十几秒。 */
+  /* 提交结果判定（只读页面，不发请求）。返回 {state, signal, text}。
+   * opts: {success, fail, stale:[点击前已存在的红字], t0:点击时刻, grace_ms}
+   *
+   * 判定顺序的用意：明确的成功/失败信号 > 表单校验红字。
+   * 红字排最后是因为它是「间接信号」——它只说明有字段处于校验失败状态，
+   * 说明不了「本次点击发出的请求失败了」。实测（2026-11-05）：
+   * 表单值其实填对了、用户手动点提交一次成功，但页面上残留 is-error 红字，
+   * 按「有红字=失败」判会把成功报成「校验没过、提交没发出」，后果是用户重复提交。 */
   ENGINE.uiDetectSubmitResult = function (opts) {
     opts = opts || {};
     const seen = function (xp) {
@@ -299,15 +329,31 @@
     };
     if (opts.success) { const el = seen(String(opts.success)); if (el) return { state: 'ok', signal: 'success_xpath', text: txt(el) }; }
     if (opts.fail) { const el = seen(String(opts.fail)); if (el) return { state: 'fail', signal: 'fail_xpath', text: txt(el) }; }
-    /* 表单校验未通过：只认「form-item 处于 is-error 状态」里的红字。
-     * 不能只看红字节点是否存在——Element Plus 在校验转 success 后，红字节点可能仍留在 DOM 里
-     * 一小段时间（节点残留、状态已变），按「存在即失败」会误报「校验没过」，而实际上能提交成功。 */
-    const verr = seen('//*[contains(concat(" ",normalize-space(@class)," ")," el-form-item ")][contains(concat(" ",normalize-space(@class)," ")," is-error ")]//*[contains(@class,"el-form-item__error")]');
-    if (verr) return { state: 'invalid', signal: 'form_validate', text: txt(verr) };
     const okM = seen('//*[contains(@class,"el-message--success") or (contains(@class,"el-notification") and .//*[contains(@class,"el-icon-success")])]');
     if (okM) return { state: 'ok', signal: 'el_message_success', text: txt(okM) };
     const errM = seen('//*[contains(@class,"el-message--error") or (contains(@class,"el-notification") and .//*[contains(@class,"el-icon-error")])]');
     if (errM) return { state: 'fail', signal: 'el_message_error', text: txt(errM) };
+
+    /* 表单校验红字：只在「点击前没有、点击后出现」时才算本次失败。
+     * 点击前就有的（stale）属于上一次校验的残留，与本次提交无关，永远忽略——
+     * 真失败会有别的信号（失败提示 / 超时未确认）暴露，漏判的代价小于误判「没发出」。 */
+    const stale = Array.isArray(opts.stale) ? opts.stale : [];
+    let fresh = [];
+    try {
+      const all = ENGINE.uiFormErrors();
+      for (let i = 0; i < all.length; i++) {
+        if (stale.indexOf(all[i]) < 0) fresh.push(all[i]);
+      }
+    } catch (e) { fresh = []; }
+    if (fresh.length) {
+      /* grace：「点击后立刻出现红字」有两种可能——真的校验没过，或 Vue 还没把旧的
+       * 校验状态刷新完。等一小会再判定，能区分这两者（校验失败的提示不会自己消失）。 */
+      const grace = Number(opts.grace_ms) || 0;
+      if (grace > 0 && opts.t0 && (Date.now() - Number(opts.t0)) < grace) {
+        return { state: 'pending', signal: 'form_validate_grace', text: fresh[0] };
+      }
+      return { state: 'invalid', signal: 'form_validate', text: fresh[0] };
+    }
     const anyM = seen('//*[contains(@class,"el-message") or contains(@class,"el-notification")]');
     if (anyM) return { state: 'pending', signal: 'el_message_other', text: txt(anyM) };
     return { state: 'pending', signal: '', text: '' };
@@ -451,17 +497,31 @@
           }
           if (!(await verifyExpect())) continue;
         } else if (act === 'submit') {
-          /* 点提交并判定结果。三态分开报：成功 / 校验没过（请求都没发）/ 失败或未确认。
+          /* 点提交并判定结果。三态分开报：成功 / 校验没过 / 失败或未确认。
            * 「未确认」一律当失败终止——写操作宁可少发一封让人手动补，也不能误报成功。 */
           const timeout = Math.max(1000, Number(a.timeout_ms) || 15000);
+          /* 判定红字前的安抚窗口：点击后立刻出现的红字，可能是「真的校验没过」，
+           * 也可能是 Vue 还没把上一次的校验状态刷完。等一小会，前者不会消失、后者会。
+           * 声明在 spec 里可覆盖（grace_ms），缺省 1200ms。 */
+          const graceMs = Math.max(0, Number(a.grace_ms === undefined ? 1200 : a.grace_ms));
           const tPerf = (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : 0;
-          log('提交 ' + label);
+          /* 点击前快照：此刻已处于校验失败状态的字段红字，与本次提交无关。
+           * 实测（2026-11-05）：字段值其实是填对的，用户手动点一次提交就成功，但页面上残留
+           * is-error 红字；不拍快照就会把「成功」误报成「校验没过、提交没发出」，导致重复提交。 */
+          const staleErrs = ENGINE.uiFormErrors();
+          log('提交 ' + label + (staleErrs.length
+            ? '（点击前已有 ' + staleErrs.length + ' 处表单提示：' + staleErrs.join('｜') + '；不计入本次判定）'
+            : ''));
           el.click();
+          const tClick = Date.now();
           log('等待提交结果（最多 ' + timeout + 'ms）');
-          const t0s = Date.now();
+          const t0s = tClick;
           let st = { state: 'pending', signal: '', text: '' };
           while (Date.now() - t0s < timeout) {
-            st = ENGINE.uiDetectSubmitResult({ success: a.success, fail: a.fail });
+            st = ENGINE.uiDetectSubmitResult({
+              success: a.success, fail: a.fail,
+              stale: staleErrs, t0: tClick, grace_ms: graceMs
+            });
             if (st.state !== 'pending') break;
             await sleep(100);
           }
@@ -476,13 +536,22 @@
             return;
           }
           if (st.state === 'invalid') {
-            throw new Error('E_UI_VALIDATE 表单校验未通过，提交没有发出: ' + (st.text || '见页面字段下的红色提示'));
+            /* 措辞刻意保守：我们只看到「提交后新出现了一处校验错误」，并不能证明请求没发出
+             * （按钮可能先发请求、后渲染校验提示）。说成「没发出」会诱导人重复提交。 */
+            throw new Error('E_UI_VALIDATE 提交后新增表单校验错误，无法确认请求是否已发出: '
+              + (st.text || '见页面字段下的红色提示')
+              + '——请先核对该字段与后端记录，确认没有发出之前不要重复提交');
           }
           if (st.state === 'fail') {
             throw new Error('E_UI_SUBMIT 提交失败: ' + (st.text || st.signal) + '——已终止且不重试，请人工核对');
           }
+          /* 超时未确认时，把页面上仍存在的表单提示一起报出来：这些红字是陈旧的（点击前就有），
+           * 无法据此判断本次结果，但能直接告诉人工「该去看哪个字段」。 */
+          const remainErrs = ENGINE.uiFormErrors();
           throw new Error('E_UI_SUBMIT 提交后 ' + timeout + 'ms 内未检测到成功信号（未确认，已终止且不重试）'
-            + (st.text ? '；页面提示：' + st.text : '') + '——请人工核对页面后决定是否重做，不要盲目重复提交');
+            + (st.text ? '；页面提示：' + st.text
+              : (remainErrs.length ? '；页面仍有表单提示：' + remainErrs.join('｜') + '（点击前就存在，无法据此判断本次结果）' : ''))
+            + '——请人工核对页面后决定是否重做，不要盲目重复提交');
         } else {
           throw new Error('E_SPEC 未知 ui 动作: ' + act);
         }
@@ -699,7 +768,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.10',
+    RUNNER_VERSION: '0.8.11',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
