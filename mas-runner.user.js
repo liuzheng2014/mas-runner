@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.4
+// @version      0.8.5
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -171,6 +171,23 @@
     const r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
     return r.singleNodeValue;
   };
+  /* 等元素出现：命中即刻返回（正常路径零额外耗时），未命中每 100ms 重试至超时。
+   * 为什么必须等（2026-11-06 事故）：业务页是 SPA，URL 触发时 document-idle 只代表
+   * 文档就绪，表单还要等若干 XHR 回来才渲染。此前 spec 取数要走 14 秒网络，恰好把这段
+   * 渲染时间「等」掉了；0.8.1 加了本地缓存后取 spec 只要 4ms，第一个动作立刻抢在渲染前
+   * 查找，于是必报 E_UI_TARGET。查找一次就报错是把「页面还没画出来」误判成「页面改版」。 */
+  ENGINE.uiWaitByXPath = async function (xp, timeoutMs, sleep, stepMs) {
+    const limit = Math.max(0, Number(timeoutMs) || 0);
+    let el = ENGINE.uiFindByXPath(xp);
+    if (el || !limit) return el;
+    const t0 = Date.now();
+    const tick = Math.max(20, Number(stepMs) || 100);
+    while (!el && Date.now() - t0 < limit) {
+      await sleep(tick);
+      el = ENGINE.uiFindByXPath(xp);
+    }
+    return el;
+  };
   ENGINE.uiSetValue = function (el, val) {
     const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
       ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -182,6 +199,8 @@
   ENGINE.execUiActions = async function (actions, scope, opts) {
     opts = opts || {};
     const gap = Number(opts.gap_ms) || 400;
+    // 元素等待上限：页面渲染完就能点到，等不到才报错（0=不等待，退回旧行为）
+    const readyMs = opts.ready_timeout_ms === undefined ? 10000 : Number(opts.ready_timeout_ms);
     const log = opts.log || function () {};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     for (let i = 0; i < (actions || []).length; i++) {
@@ -189,8 +208,16 @@
       const act = String(a.do || '');
       if (act === 'wait') { await sleep(Number(a.ms) || gap); continue; }
       const target = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
-      const el = ENGINE.uiFindByXPath(target);
-      if (!el) throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '') + '——页面可能改版，或表单尚未渲染完');
+      const tFind = Date.now();
+      const first = ENGINE.uiFindByXPath(target);
+      // 有等待发生时在日志里留一句，否则用户只看到「页面填充」然后沉默若干秒，无法判断是卡住还是在等渲染
+      if (!first && readyMs > 0) log('等待页面渲染（' + (a.name || target) + '，最多 ' + readyMs + 'ms）');
+      const el = first || await ENGINE.uiWaitByXPath(target, readyMs, sleep);
+      if (!el) {
+        const waited = Date.now() - tFind;
+        throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '')
+          + '——已等待 ' + waited + 'ms 仍未出现：页面可能改版，或表单渲染比 ' + readyMs + 'ms 更慢');
+      }
       if (act === 'click') {
         log('点击 ' + (a.name || target));
         el.click();
@@ -391,7 +418,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.4',
+    RUNNER_VERSION: '0.8.5',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -693,6 +720,7 @@
     try {
       await ENGINE.execUiActions(ui.actions || [], scope, {
         gap_ms: ui.gap_ms,
+        ready_timeout_ms: ui.ready_timeout_ms,
         log: function (m) { log({ t: Date.now(), level: 'info', msg: step.id + ' · ' + m }); },
       });
     } catch (e) {

@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "file": "mas-runner.user.js",
-  "sha256": "3e4c1129d4176067ece1a3937294f55b27103252d5f53c6bab65dcfc4bea02f0",
-  "bytes": 186428,
-  "published_at": "2026-11-05T11:54:59+08:00",
+  "sha256": "7453c22faf9cfc552b092beee610f1c2cdd5709c1f26a1cc7dcb51ec038efb9a",
+  "bytes": 188207,
+  "published_at": "2026-11-05T12:04:43+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "fix: 0.8.4 绑定这一步彻底去掉网络交互\n\n现象：新电脑点「复制授权码并打开表单」报「没有表单地址/连不上服务端」。\n根因：这一步为了拿 form_url 去打 /bind/meta，而这条链路实测\n1.0/1.35/2.28/7.36/17.87s（客户端 20s 判死），纯本地的复制+开窗被无关网络拖垮；\nform_url 又只存在 GM 缓存里，首次必然为空。\n\n改动：\n- 表单地址改为内置常量 DEFAULT_FORM_URL（公开常量，非凭据），删除 FORM_KEY 缓存读写\n- 有效期由 AUTH_TTL_MS 推导，不再写死 30（防两处漂移）\n- acquire() 零网络：授权码/地址/有效期全部本地，只有提交后的 /bind/poll 才联网\n- window.open 移回点击的同步栈（原先在 copyNow().then 里，剪贴板慢会丢掉\n  transient activation 被弹窗拦截器静默吞掉），并用 win.opener=null 替代裸 noopener\n  以便判断是否真被拦，被拦时给出明确提示\n\n回归：新增 bind-form-fallback-smoke 11 项（用 0.8.3 跑对照，5 项必失败），\n全量 62/8/5/21/17/18/14/8/11 全绿。"
+  "notes": "fix: 0.8.5 页面元素定位改为轮询等待——修「提速后抢跑」导致的 E_UI_TARGET\n\n现象：0.8.4 起取 spec 只要 4ms（本地缓存生效），但第一个动作必报\n「页面元素未找到: //span[text()='请选择广告主预算类型']」。\n\n根因：业务页是 SPA，URL 触发时 document-idle 只代表文档就绪，表单还要等\nXHR 回来才渲染。此前取 spec 要走 14 秒公网，恰好把渲染时间「等」掉了；\n缓存提速后填表抢在渲染之前，而 uiFindByXPath 只查一次、查不到立刻抛错，\n把「页面还没画出来」误判成「页面改版」。\n\n改动：\n- 新增 ENGINE.uiWaitByXPath：命中即刻返回（正常路径零额外耗时），未命中每\n  100ms 轮询，超时才报错\n- execUiActions 支持 ready_timeout_ms（默认 10000，0=退回旧行为），\n  spec 的 step.ui 可声明；报错信息写明实际等待时长\n- 进入等待时日志留一句「等待页面渲染（元素名，最多 Xms）」，避免静默卡住\n- 华为开户 spec 声明 ready_timeout_ms=15000\n\n回归：新增 ui-wait-ready-smoke 11 项（对 0.8.4 跑必红 7 项，已对照验证），\n全量 62/8/5/21/17/18/14/8/11/11 全绿。"
 }
