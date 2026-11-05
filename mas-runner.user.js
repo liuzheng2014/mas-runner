@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.5
+// @version      0.8.6
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -196,6 +196,35 @@
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
   };
+  /* 元素是否可见：下拉「收起」是 display:none（节点还在），所以不能只看节点是否存在。
+   * 不用 offsetParent —— jsdom 里恒为 null，测试无法模拟可见状态。 */
+  ENGINE.uiIsVisible = function (el) {
+    if (!el) return false;
+    const doc = el.ownerDocument || (typeof document !== 'undefined' ? document : null);
+    const win = (doc && doc.defaultView) || (typeof window !== 'undefined' ? window : null);
+    if (!win || !win.getComputedStyle) return true;
+    if (el.hidden) return false;
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      const st = win.getComputedStyle(cur);
+      if (st && (st.display === 'none' || st.visibility === 'hidden')) return false;
+      cur = cur.parentElement;
+    }
+    return true;
+  };
+  /* 等元素到达某状态：want='visible' 出现即可见；want='hidden' 消失或不可见。
+   * 返回是否达成（false = 超时）。元素「不存在」按 hidden 计。 */
+  ENGINE.uiWaitState = async function (xp, want, timeoutMs, sleep, tickMs) {
+    const t0 = Date.now();
+    const limit = Math.max(0, Number(timeoutMs) || 0);
+    const tick = Math.max(20, Number(tickMs) || 80);
+    for (;;) {
+      const vis = ENGINE.uiIsVisible(ENGINE.uiFindByXPath(xp));
+      if (want === 'hidden' ? !vis : vis) return true;
+      if (Date.now() - t0 >= limit) return false;
+      await sleep(tick);
+    }
+  };
   ENGINE.execUiActions = async function (actions, scope, opts) {
     opts = opts || {};
     const gap = Number(opts.gap_ms) || 400;
@@ -203,33 +232,89 @@
     const readyMs = opts.ready_timeout_ms === undefined ? 10000 : Number(opts.ready_timeout_ms);
     const log = opts.log || function () {};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    for (let i = 0; i < (actions || []).length; i++) {
-      const a = actions[i] || {};
+
+    /* 单个动作。k 次重试的意义：下拉是联动的（选完一级，二级列表会重新请求重渲染），
+     * 抢在重渲染前点下去会「点空」——节点在、点击也成功，但状态没变。
+     * 所以 click 支持声明 until=hidden/visible：动作后校验是否真的生效，没生效就重做。 */
+    async function runOne(a) {
       const act = String(a.do || '');
-      if (act === 'wait') { await sleep(Number(a.ms) || gap); continue; }
+      if (act === 'wait') { await sleep(Number(a.ms) || gap); return; }
+
       const target = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
-      const tFind = Date.now();
-      const first = ENGINE.uiFindByXPath(target);
-      // 有等待发生时在日志里留一句，否则用户只看到「页面填充」然后沉默若干秒，无法判断是卡住还是在等渲染
-      if (!first && readyMs > 0) log('等待页面渲染（' + (a.name || target) + '，最多 ' + readyMs + 'ms）');
-      const el = first || await ENGINE.uiWaitByXPath(target, readyMs, sleep);
-      if (!el) {
-        const waited = Date.now() - tFind;
-        throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '')
-          + '——已等待 ' + waited + 'ms 仍未出现：页面可能改版，或表单渲染比 ' + readyMs + 'ms 更慢');
+      const until = a.until ? String(a.until) : '';
+      const tries = Math.max(1, Number(a.max_tries) || 3);
+      const untilMs = Number(a.until_ms) || 1500;
+      const label = a.name || target;
+      let lastErr = '';
+
+      for (let k = 1; k <= tries; k++) {
+        // 每次重试都重新定位：联动重渲染会把旧节点换成新的，持有旧引用会点空
+        const tFind = Date.now();
+        const first = ENGINE.uiFindByXPath(target);
+        if (!first && readyMs > 0) log('等待页面渲染（' + label + '，最多 ' + readyMs + 'ms）');
+        const el = first || await ENGINE.uiWaitByXPath(target, readyMs, sleep);
+        if (!el) {
+          throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '')
+            + '——已等待 ' + (Date.now() - tFind) + 'ms 仍未出现：页面可能改版，或表单渲染比 ' + readyMs + 'ms 更慢');
+        }
+
+        if (act === 'click') {
+          log('点击 ' + label + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+          el.click();
+          if (until) {
+            const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
+            if (!ok) {
+              lastErr = untilMs + 'ms 内未变为 ' + until;
+              log('未生效（' + lastErr + '），重试 ' + label);
+              continue;
+            }
+          }
+        } else if (act === 'type') {
+          const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
+          if (!String(val).length) throw new Error('E_UI_VALUE 填充值解析为空: ' + label + '——查任务参数或表字段值');
+          log('填写 ' + label + ' = ' + (String(val).length > 28 ? String(val).slice(0, 28) + '…' : val) + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+          ENGINE.uiSetValue(el, val);
+          /* 读回自检：受控组件（Vue v-model）可能在重渲染时把值刷回旧值。
+           * 判据只认 el.value 实际值，不认「事件已派发」——事件派发成功不代表值留住了。 */
+          let okv = String(el.value) === String(val);
+          for (let j = 0; j < 3 && !okv; j++) {
+            await sleep(60);
+            ENGINE.uiSetValue(el, val);
+            okv = String(el.value) === String(val);
+          }
+          if (!okv) { lastErr = '读回值不符（期望 ' + val + '，实际 ' + el.value + '）'; continue; }
+          if (until) {
+            const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
+            if (!ok) { lastErr = untilMs + 'ms 内未变为 ' + until; continue; }
+          }
+        } else {
+          throw new Error('E_SPEC 未知 ui 动作: ' + act);
+        }
+        await sleep(gap);
+        return;
       }
-      if (act === 'click') {
-        log('点击 ' + (a.name || target));
-        el.click();
-      } else if (act === 'type') {
-        const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
-        if (!String(val).length) throw new Error('E_UI_VALUE 填充值解析为空: ' + (a.name || a.target) + '——查任务参数或表字段值');
-        log('填写 ' + (a.name || target) + ' = ' + (String(val).length > 28 ? String(val).slice(0, 28) + '…' : val));
-        ENGINE.uiSetValue(el, val);
+      throw new Error('E_UI_NOEFFECT 动作执行 ' + tries + ' 次仍未生效: ' + label + '——' + lastErr);
+    }
+
+    /* 同 group 的连续动作并行（文本输入之间互不依赖，串行只是白等）。
+     * 每组内部并发、组之间顺序——所以「先展开、再选、再填下一页」的依赖不会被打破。 */
+    const list = actions || [];
+    const batches = [];
+    for (const a of list) {
+      const item = a || {};
+      const g = item.group ? String(item.group) : '';
+      const last = batches[batches.length - 1];
+      const canMerge = g && last && last.group === g && String(item.do) !== 'wait';
+      if (canMerge) last.items.push(item);
+      else batches.push({ group: g, items: [item] });
+    }
+    for (const b of batches) {
+      if (b.items.length > 1) {
+        log('并行处理 ' + b.items.length + ' 项（' + b.group + '）');
+        await Promise.all(b.items.map(runOne));
       } else {
-        throw new Error('E_SPEC 未知 ui 动作: ' + act);
+        await runOne(b.items[0]);
       }
-      await sleep(gap);
     }
     return {};
   };
@@ -418,7 +503,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.5',
+    RUNNER_VERSION: '0.8.6',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2521,9 +2606,13 @@
       UI.renderParams(spec);
       document.getElementById('masr-run').textContent = spec.status === 'active' ? '重跑当前 spec' : '执行（draft → dry_run）';
       // 自动恢复（fromStore）静默处理：只更新 badge/参数表，不往跨页日志里灌噪音
-      if (!opts.fromStore) {
+      // 同一份 spec 重复 apply 也不重复播报：URL 触发 → runTask 会把同一份 spec 载两遍，
+      // 日志里出现两条一模一样的「spec 已加载」会让人以为加载了两次、版本可能不同
+      const specKey = String(spec.spec_id) + '@' + String(spec.version) + '#' + ENGINE.strHash(text);
+      if (!opts.fromStore && UI._lastSpecKey !== specKey) {
         UI.appendLog({ t: Date.now(), level: 'ok', msg: 'spec 已加载: ' + spec.spec_id + ' v' + spec.version + '，' + spec.steps.length + ' 步' });
       }
+      UI._lastSpecKey = specKey;
       if (repaired) UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到弯引号等脏字符，已自动修复——但建议以后先粘到记事本再复制过来，保证与 git 里的原文逐字节一致' });
       return true;
     } catch (e) {
