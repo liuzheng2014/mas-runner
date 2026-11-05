@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.11
+// @version      0.8.12
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -480,7 +480,14 @@
         } else if (act === 'type') {
           const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
           if (!String(val).length) throw new Error('E_UI_VALUE 填充值解析为空: ' + label + '——查任务参数或表字段值');
-          log('填写 ' + label + ' = ' + (String(val).length > 28 ? String(val).slice(0, 28) + '…' : val) + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+          /* 敏感值（密码/密钥）在日志与报错里一律打码。日志会落屏、跨页保留（GM 存储）、
+           * 并常被截图或整段贴进对话与文档——每贴一次就多一份密码副本，且无法审计、无法收回。
+           * spec 用 type.secret=true 声明；未声明者照旧显示原值（向后兼容，不影响既有场景）。 */
+          const secretVal = a.secret === true;
+          const showVal = (v) => secretVal
+            ? String(ENGINE.maskValue(v))
+            : (String(v).length > 28 ? String(v).slice(0, 28) + '…' : String(v));
+          log('填写 ' + label + ' = ' + showVal(val) + (secretVal ? '（敏感值，已打码）' : '') + (k > 1 ? '（第 ' + k + ' 次）' : ''));
           ENGINE.uiSetValue(el, val);
           /* 读回自检：受控组件（Vue v-model）可能在重渲染时把值刷回旧值。
            * 判据只认 el.value 实际值，不认「事件已派发」——事件派发成功不代表值留住了。 */
@@ -490,7 +497,7 @@
             ENGINE.uiSetValue(el, val);
             okv = String(el.value) === String(val);
           }
-          if (!okv) { lastErr = '读回值不符（期望 ' + val + '，实际 ' + el.value + '）'; continue; }
+          if (!okv) { lastErr = '读回值不符（期望 ' + showVal(val) + '，实际 ' + showVal(el.value) + '）'; continue; }
           if (until) {
             const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
             if (!ok) { lastErr = untilMs + 'ms 内未变为 ' + until; continue; }
@@ -768,7 +775,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.11',
+    RUNNER_VERSION: '0.8.12',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
