@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.0
+// @version      0.9.1
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -126,6 +126,8 @@
  *       （scene.trigger.params_query 里出现 secret 参数 → 加载期 E_SPEC）
  *     ④两处会长期误导的缺陷顺手修：uiText 读 el.value（原来对 input 恒返回空串，assert_ui 形同虚设）；
  *       type 支持 skip_if_empty（可空字段原来只能填假值或整步失败）
+ *   - v0.9.1：补漏——「已按页面记录取数」那行日志把 params 原样打印，参数级脱敏漏了这一处，
+ *     等于密码照样进日志（0.9.0 的 golden trace 基线里就躺着明文）。secret 参数改走 maskValue。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -922,7 +924,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.0',
+    RUNNER_VERSION: '0.9.1',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3889,11 +3891,22 @@
     UI.renderTrigger();
     const ps = task.params || {};
     const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
+    /* 这一行曾经把 params 原样打进日志——参数级脱敏做了面板/存储/回写，
+     * 唯独漏了这里，等于密码照样进日志（2026-11-05 golden trace 基线里抓到的明文）。
+     * 秘密参数一律走 maskValue，且注明已打码，免得人以为看到了真值。 */
+    /* 注意 params 在 s.spec.params 里（s 是 /spec 的回包 {spec,version,spec_id}），
+     * 写 s.params 会拿到 undefined → secretNames 空 → 静默退化成明文打印。 */
+    const secretNames = (((s && s.spec && s.spec.params) || (s && s.params) || []))
+      .filter(function (p) { return p && p.secret === true; })
+      .map(function (p) { return p.name; });
     UI.appendLog({
       t: Date.now(), level: 'ok',
       msg: (task.from_url ? '已从页面地址读取参数' : '已按页面记录取数 ' + task.record_id) + '（' + s.spec_id + ' v' + s.version +
         (cached ? '｜本地缓存，取 spec 用时 ' + (Date.now() - t0) + 'ms' : '｜联网取 spec 用时 ' + (Date.now() - t0) + 'ms') + '）' +
-        (keys.length ? '；参数 ' + keys.map(function (k) { return k + '=' + ps[k]; }).join('，') : ''),
+        (keys.length ? '；参数 ' + keys.map(function (k) {
+          if (secretNames.indexOf(k) >= 0) return k + '=' + ENGINE.maskValue(ps[k]) + '（已打码）';
+          return k + '=' + ps[k];
+        }).join('，') : ''),
     });
     // 只有「要往业务表回写」的场景才需要捂热那张表；纯填表场景（URL 自带参数）不查表也不写表，捂热纯属浪费。
     if (!task.from_url) SVC.warmStart(90000, task.script_id);
