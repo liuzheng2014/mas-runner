@@ -4,11 +4,11 @@
   "file": "mas-runner.user.js",
   "sha256": "22d39dee830c6bc8e4a1237127e52138f44e89b7ddd3967161433ee68e67bc54",
   "bytes": 192670,
-  "published_at": "2026-11-05T12:22:35+08:00",
+  "published_at": "2026-11-05T12:36:18+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "perf: 0.8.6 填表并行 + 联动重试 + 读回自检\n\n用户要求：缩短填表时间；下拉可能联动，快速填充失败要能重试；文本类可并行。\n\n调度开销实测（jsdom 元素秒就绪，纯固定等待）: 2056ms → 507ms（降 75%），\n与真实页面此前实测 2.1s 吻合，说明时间主要花在盲等而非渲染。\n\n- 同 group 连续动作并行，组内并发组间顺序（不破坏「展开→选→填」依赖）\n- until=hidden/visible + max_tries：点完校验真生效，没生效重做，\n  专治联动下拉抢在重渲染前点击（节点在、click 成功但状态没变）\n- type 读回自检：el.value 不等即重写，防受控组件刷回旧值；始终失败报 E_UI_NOEFFECT\n- 每次重试重新定位（联动会换节点，旧引用会点空）\n- uiIsVisible 逐级查 display/visibility\n- 修掉重复的「spec 已加载」日志（按 spec_id@version+内容哈希去重）\n\n回归：新增 ui-parallel-retry-smoke 12 项（对 0.8.5 必红 9 项），全量 176 项全绿。"
+  "notes": "v0.8.6"
 }
