@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.8
+// @version      0.8.9
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -32,9 +32,17 @@
 // ==/UserScript==
 
 /*
- * MAS-Runner v0.1 — 范围与边界（务必与 specs/README.md 的 Runner 契约对照）
+ * MAS-Runner — 范围与边界与变更史（务必与 specs/README.md 的 Runner 契约对照）
  *
- * 已实现（v0.1）：
+ * 【版本号真值只有两处，改版本必须同时改，publish_runner.py 会硬校验一致】
+ *   1) 头部 @version（油猴识别更新用）
+ *   2) 代码里 GV.RUNNER_VERSION（GM_info 取不到时的兜底显示 + spec requires_runner 协商）
+ * 文件名 runner-v0.1.user.js 是仓库里的固定快照名，不是版本号（测试脚本按此路径读），永不跟版本走。
+ * @name 里的 "(spec interpreter v0.1)" 同理是早期固定文案：改它会让油猴把它当成另一个脚本、
+ * 老用户收不到更新，所以保持原样不动。
+ * 下面的 v0.1.7 ~ v0.1.16 是早期真实历史编号（当时版本确实是 0.1.x），保留原文。
+ *
+ * 已实现：
  *   - spec 解释引擎：占位符解析、cookie 派生变量、api 步骤（fetch 优先 / GM_xhr 兜底）、
  *     断言引擎（specs/README.md 全部断言语法）、extract、on_fail 结构化错误
  *   - navigate 步骤 + 跨页续跑（GM 存储保存运行态，导航后新页面自动恢复）
@@ -620,7 +628,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.8',
+    RUNNER_VERSION: '0.8.9',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -809,6 +817,16 @@
       const days = (Date.now() - new Date(spec.last_verified_at).getTime()) / 86400000;
       if (days > 30) throw new Error('E_SPEC: spec 已 ' + Math.floor(days) + ' 天未验证（last_verified_at=' + spec.last_verified_at + '），疑似失效，拒绝执行');
     }
+    // 含 submit 的步骤必须声明 write:true。
+    // 否则 submit 会绕过写配额（配额只数 write 步骤），等于把不可逆操作藏在「只读步骤」里执行——
+    // 这是配额制唯一的自毁口子，宁可加载期就拒绝。
+    (spec.steps || []).forEach(function (s) {
+      const acts = (s.ui && s.ui.actions) || [];
+      const hasSubmit = acts.some(function (a) { return String((a && a.do) || '') === 'submit'; });
+      if (hasSubmit && s.write !== true) {
+        throw new Error('E_SPEC: ' + s.id + ' 含 submit 动作但未声明 write:true —— 提交是不可逆写操作，必须显式声明才能受写配额约束');
+      }
+    });
     // 版本协商：spec 要求的最低 Runner 版本不满足就停在加载阶段。
     // 否则会跑到用到新原语的那一步才报「未知动作」，看着像页面改版，实际是没更新脚本。
     const needRunner = (spec.runtime || {}).requires_runner;
@@ -825,6 +843,35 @@
         }
       }
     }
+  }
+
+  /* 写操作放行判定（0.8.9 起取代 v0.1 的「一律拦截」）
+   * v0.1 时没有任何写授权通道，所以 write:true 是死路——一律 E_PERM。
+   * 现在改成「按 spec 显式声明的配额放行」，规则：
+   *   1) draft spec 仍然一律拦（dry_run 门禁不许破，只能跑到写操作前一步）
+   *   2) active spec 需声明 runtime.write_caps.max_writes_per_run，缺省 0 = 不许写
+   *      —— 缺省拒绝而不是缺省允许：多写一封邀请的代价比多跑一次高得多
+   *   3) 单次运行内写步骤数不得超过配额
+   * 配额只管「写步骤个数」，写步骤内部怎么点由动作语义管（submit 只点一次、不重试）。
+   */
+  function writeQuota(spec) {
+    const caps = (spec.runtime || {}).write_caps || {};
+    const n = Number(caps.max_writes_per_run);
+    return (Number.isFinite(n) && n > 0) ? Math.floor(n) : 0;
+  }
+
+  function checkWriteAllowed(spec, step, usedCount, dryRun) {
+    if (dryRun || spec.status === 'draft') {
+      return { ok: false, msg: step.id + ' 是写操作，draft spec 只允许跑到写操作前一步（dry_run 门禁）' };
+    }
+    const quota = writeQuota(spec);
+    if (quota <= 0) {
+      return { ok: false, msg: step.id + ' 是写操作，但 spec 未授权写：需在 runtime.write_caps.max_writes_per_run 声明允许的写次数（当前缺省 0 = 拒绝）' };
+    }
+    if (usedCount >= quota) {
+      return { ok: false, msg: step.id + ' 超出写配额：本次运行已执行 ' + usedCount + ' 次写，配额 ' + quota };
+    }
+    return { ok: true };
   }
 
   function checkDryRunPermission(spec) {
@@ -857,6 +904,7 @@
     const extracted = {};
     const stepLogs = [];
     let scope = buildScope(spec, params, extracted, vars);
+    let writeCount = 0; // 本次运行的写操作计数（受 runtime.write_caps.max_writes_per_run 约束）
 
     // 预检：全部步骤的占位符当前可解析吗（除引用后步产物的）？——尽力预检，允许执行期再补
     const missing = ENGINE.findUnresolvedPlaceholders(
@@ -871,10 +919,13 @@
         ensureStepVars(spec, step, vars);
         scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域（vars 可能刚更新）
         if (step.write === true) {
-          if (dryRun || true /* v0.1 一律拦截写操作：confirm 机制在 v0.2 随 human 原语一起上 */) {
-            log({ t: Date.now(), level: 'fatal', msg: 'S' + i + ' 写操作被 v0.1 Runner 拦截（写操作需 v0.2 confirm 机制）' });
-            throw new RunnerError('E_PERM', 'v0.1 Runner 不执行写操作: ' + step.id);
+          const wchk = checkWriteAllowed(spec, step, writeCount, dryRun);
+          if (!wchk.ok) {
+            log({ t: Date.now(), level: 'fatal', msg: wchk.msg });
+            throw new RunnerError('E_PERM', wchk.msg);
           }
+          writeCount++;
+          log({ t: Date.now(), level: 'warn', msg: step.id + ' 写操作放行（本次运行第 ' + writeCount + '/' + writeQuota(spec) + ' 次）' });
         }
         if (step.mode === 'human') {
           throw new RunnerError('E_PERM', 'human 断点原语 v0.2 提供，本步骤无法执行: ' + step.id);
@@ -1156,11 +1207,18 @@
     const extracted = Object.assign({}, extracted0 || {});
     const stepLogs = stepLogs0 || [];
     let scope = buildScope(spec, params, extracted, vars);
+    // 续跑（navigate 恢复）时，fromIdx 之前的步骤已经跑过了，把它们的写操作计入已用量。
+    // 宁可少数一次也不多数一次：配额是防重复提交的最后一道闸，算宽了等于没有。
+    let writeCount = spec.steps.slice(0, fromIdx).filter(function (s) { return s && s.write === true; }).length;
     for (let i = fromIdx; i < spec.steps.length; i++) {
       const step = spec.steps[i];
       ensureStepVars(spec, step, vars);
       scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域
-      if (step.write === true) throw new RunnerError('E_PERM', 'v0.1 不执行写操作: ' + step.id);
+      if (step.write === true) {
+        const wchk = checkWriteAllowed(spec, step, writeCount, false);
+        if (!wchk.ok) throw new RunnerError('E_PERM', wchk.msg);
+        writeCount++;
+      }
       if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i); continue; }
       if (step.mode === 'navigate') {
         const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i);
