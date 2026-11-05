@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.8.3
+// @version      0.8.4
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -391,7 +391,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.8.3',
+    RUNNER_VERSION: '0.8.4',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1532,7 +1532,13 @@
   const AUTH_LEN = 6;
   const AUTH_TTL_MS = 30 * 60 * 1000;
   const AUTH_KEY = 'masr.authcode';
-  const FORM_KEY = 'masr.formurl';
+  /* 登记表单地址：固定常量，内置。
+   * 为什么不再问服务端（2026-11-06）：这一步是「复制授权码 + 打开表单」，全是本地动作，
+   * 而 /bind/meta 只是把这些常量重新下发一遍，却要在一条实测能抖到 17~25 秒的链路上
+   * 走一次往返（客户端 20s 判死），于是纯本地动作被一次无关的网络请求拖垮。
+   * 表单地址是公开常量（不是凭据）；真要换地址=发版。服务端 MAS_FORM_URL 那份仅作参考，
+   * 两边一致性由 scripts/bind-form-fallback-smoke.cjs 守着。 */
+  const DEFAULT_FORM_URL = 'https://scnzhojz10ln.feishu.cn/share/base/form/shrcn1WrOocHO5cG8cHrorhXJJe';
 
   function genAuthCode() {
     let s = '';
@@ -1663,7 +1669,7 @@
 
     let bindCode = '';
     let formUrl = '';
-    let expiresMin = 30;
+    let expiresMin = AUTH_TTL_MS / 60000; // 与码的实际有效期同源，避免两处写死漂移
     let tipTimer = null;
 
     function copyText(t) {
@@ -1768,24 +1774,16 @@
     }
 
     function acquire(force) {
-      // 码由本地面生成：30 分钟内复用同一个，force=true 才换新的
+      // 码由本地生成：30 分钟内复用同一个，force=true 才换新的
       bindCode = force ? '' : reuseAuthCode();
       if (!bindCode) { bindCode = genAuthCode(); saveAuthCode(bindCode); }
       if ($code()) $code().textContent = bindCode;
 
-      formUrl = GM_getValue(FORM_KEY, '');
-      if (formUrl) tip('授权码已就绪，' + expiresMin + ' 分钟内有效');
-      else tip('正在获取表单地址…');
-
-      SVC.bindMeta().then(function (j) {
-        formUrl = j.form_url || '';
-        expiresMin = j.expires_min || expiresMin;
-        GM_setValue(FORM_KEY, formUrl);
-        tip('授权码已就绪，' + expiresMin + ' 分钟内有效 —— 点按钮会先复制再打开表单');
-      }).catch(function (e) {
-        tip(formUrl ? '表单地址沿用上次缓存；服务端暂时连不上：' + e.message
-                    : '连不上服务端，拿不到表单地址：' + e.message);
-      });
+      /* 这一步零网络：授权码、表单地址、有效期全是本地常量，不查服务端也不做任何预检。
+       * 有效期由 AUTH_TTL_MS 推导（同一个来源，不会出现「显示 30 分钟但码 20 分钟就过期」）。
+       * 必须联网的只有「提交之后」的绑定轮询 —— 服务端要去飞书登记表里找这次提交。 */
+      formUrl = DEFAULT_FORM_URL;
+      tip('授权码已就绪，' + expiresMin + ' 分钟内有效 —— 点按钮会先复制再打开表单');
       if ($again()) $again().style.display = '';
     }
 
@@ -1796,9 +1794,13 @@
     document.getElementById('masr-bind-go').addEventListener('click', function () {
       if (!bindCode) { tip('授权码还没生成，稍等一下再点'); return; }
       const state = { code: bindCode, since: Date.now() };
+      // 开窗必须留在用户手势的同步调用栈里：一旦放进 Promise 回调，
+      // 剪贴板写入稍慢就会消耗掉 transient activation，被弹窗拦截器静默吞掉（不抛错、只返回 null）。
+      let win = null;
+      try { win = window.open(formUrl || DEFAULT_FORM_URL, '_blank'); } catch (e) {}
+      if (win) { try { win.opener = null; } catch (e) {} } // 等价 noopener，但要拿到返回值判断是否被拦
       copyNow().then(function () {
-        if (formUrl) { try { window.open(formUrl, '_blank', 'noopener'); } catch (e) {} }
-        else tip('没有表单地址，请手动打开管理员给你的飞书登记表单');
+        if (!win) tip('授权码 ' + bindCode + ' 已复制，但浏览器拦下了新窗口 —— 允许本页弹窗后重试，或手动打开登记表单粘贴它');
         pollBind(state, 200);
       });
     });
