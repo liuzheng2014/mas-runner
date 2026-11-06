@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "file": "mas-runner.user.js",
-  "sha256": "ef19797715b804dc72ee630c8f6f8fa3cfc6264d16d42d27ad1fb381f292b118",
-  "bytes": 274267,
-  "published_at": "2026-11-06T14:57:15+08:00",
+  "sha256": "24e7ccfd396c0bd383315fddfd9584b5fba9e1e0cb18fa269feb0eff0ccc03ab",
+  "bytes": 282515,
+  "published_at": "2026-11-06T15:28:36+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "0.9.6: 修交接链三个缺陷（handoff 写 final 致后续步骤被跳过 / 交接后失败覆盖已成功回写 / written 语义致重复回写）+ draft 标签不再伪装 dry_run"
+  "notes": "0.9.7: 交接拆三步（defer/退出续跑/同标签进下一环节）+ 修随行参数取不到、运行态不存 params、续跑页被当辅助标签页自关"
 }

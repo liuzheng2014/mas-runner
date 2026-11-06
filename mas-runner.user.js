@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.6
+// @version      0.9.7
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -696,10 +696,27 @@
             const hrefB = String(location.href);
             if (opts.onNavBefore) opts.onNavBefore(navA);
             el.click();
-            await sleep(1500);
-            const moved = String(location.href) !== hrefB;
-            const urlOk = !navA.url_contains || String(location.href).indexOf(navA.url_contains) >= 0;
+            /* 轮询而不是固定睡 1500ms：退出登录要整页崩到 CAS 登录页，实测常见 2~3s，
+             * 固定时长会把「慢」误判成「没跳」，进而回滚续跑状态、把流程掐在退出这一步。 */
+            const navMs = Number(navA.wait_ms) > 0 ? Number(navA.wait_ms) : 3000;
+            const navDeadline = Date.now() + navMs;
+            let moved = false, urlOk = false;
+            do {
+              await sleep(250);
+              moved = String(location.href) !== hrefB;
+              urlOk = !navA.url_contains || String(location.href).indexOf(navA.url_contains) >= 0;
+              if (moved && urlOk) break;
+            } while (Date.now() < navDeadline);
             if (!(moved && urlOk)) {
+              /* soft：这一次跳转不是硬门禁，确认不了就继续往下走。
+               * 用在「退出登录」这类地方——没跳成功也要接着进下一环节（下一环节本来就要重新
+               * 输账号密码），卡在这里反而让整条链停住。回滚续跑标记，避免留下一个永远等不到
+               * 落地的运行态（下次打开页面会误以为要续跑）。 */
+              if (navA.soft === true) {
+                if (opts.onNavAfter) opts.onNavAfter(false);
+                log('跳转未确认（当前 ' + String(location.href).slice(0, 80) + '），按声明继续');
+                return;
+              }
               if (opts.onNavAfter) opts.onNavAfter(false);
               throw new Error('E_NAV ' + label + ' 声明了跳转（' + JSON.stringify(navA) + '），但页面没有跳转：当前地址 ' +
                 String(location.href).slice(0, 120) + '——点击可能没落到可点的节点上，或页面结构变了');
@@ -1025,7 +1042,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.6',
+    RUNNER_VERSION: '0.9.7',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1344,6 +1361,13 @@
         }
         if (step.mode === 'navigate') {
           const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, i);
+          if (nav && nav.sameTab) {
+            /* 同标签交接：本流程已经结束，页面正在被下一个环节接管。
+             * 不能走下面「导航已发起，请点执行续跑」的提示——那句是给「本流程还要在同一
+             * 页面继续跑」用的，在这里会让人以为流程没跑完、又去点一次执行。 */
+            log({ t: Date.now(), level: 'ok', msg: '=== ' + step.id + ' 已把当前标签页交给下一环节，本流程结束 ===' });
+            continue;
+          }
           if (nav && nav.initiated) {
             // 导航发起是正常信号，不是失败。同页跳转：本页即将卸载；新标签页：本页保留
             const tip = nav.openedTab
@@ -1355,7 +1379,7 @@
           continue;
         }
         if (step.mode === 'ui') {
-          await execUi(spec, step, scope, stepLogs, log, onStep, i, extracted);
+          await execUi(spec, step, scope, stepLogs, log, onStep, i, extracted, params);
           scope = buildScope(spec, params, extracted, vars);
           continue;
         }
@@ -1402,7 +1426,7 @@
 
   /* UI 步骤执行：纯页面填充（click/type/wait），无网络请求、无写操作。
    * 选择器与取值全部来自 spec 的 step.ui.actions（业务知识在 spec，引擎只做原语）。 */
-  async function execUi(spec, step, scope, stepLogs, log, onStep, idx, extracted) {
+  async function execUi(spec, step, scope, stepLogs, log, onStep, idx, extracted, params) {
     onStep(step.id, 'running');
     const ui = step.ui || {};
     const t0 = Date.now();
@@ -1429,9 +1453,14 @@
           stn.navExpect = expect;
           stn.navAt = Date.now();
           stn.stepLogs = stepLogs;
+          /* 参数与产物必须随行：跳走之后新页面要靠它们续跑（record_id、邮箱后缀…）。
+           * 少了这一行，续跑起来 params 是空的，连 record_id 都解析不出来。 */
+          stn.params = persistableParams(spec, params);
+          stn.extracted = extracted || {};
           RunState.set(stn);
           navWrote.on = true;
-          log({ t: Date.now(), level: 'info', msg: step.id + ' 预期整页跳转（' + JSON.stringify(expect) + '），已预写续跑状态' });
+          log({ t: Date.now(), level: 'info', msg: step.id + ' 预期整页跳转（' + JSON.stringify(expect) + '），已预写续跑状态（参数 ' +
+            Object.keys(stn.params || {}).length + ' 个、产物 ' + Object.keys(stn.extracted || {}).length + ' 项）' });
         },
         onNavAfter: function (ok) { if (!ok) clearNav(); },
       });
@@ -1562,6 +1591,18 @@
     log({ t: Date.now(), level: 'ok', msg: step.id + ' ✓ 断言 ' + assertResults.length + ' 条全过' + (Object.keys(got).length ? '，抽取: ' + Object.keys(got).join(', ') : '') });
   }
 
+  /* 落盘的参数副本：剔除 secret（本地存储是明文的，密码不落盘），续跑时再 /task 补回来。
+   * 运行态以前根本没存过 params —— 只有 navigate 分支存了 extracted，于是「退出登录导致跳转」
+   * 这条路上续跑起来 params 是空的，连 record_id 都解析不出来，S7 直接 E_SPEC。
+   * 单点跳转（点「去登录」那种）一直没暴露，因为那些步骤跳过去就结束了，不需要参数。 */
+  function persistableParams(spec, params) {
+    const out = {};
+    const sec = {};
+    (spec.params || []).forEach(function (p) { if (p && p.secret === true) sec[p.name] = 1; });
+    Object.keys(params || {}).forEach(function (k) { if (!sec[k]) out[k] = params[k]; });
+    return out;
+  }
+
   async function execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, idx) {
     // navigate 前必须先把运行态落盘（导航会销毁当前 JS 环境）
     const url = ENGINE.resolvePlaceholders(step.url, scope);
@@ -1585,8 +1626,16 @@
       const keep = Array.isArray(handoff.params) ? handoff.params : [];
       const cp = {};
       for (let i = 0; i < keep.length; i++) {
-        const v = scope[keep[i]];
-        if (v !== undefined && v !== null && String(v) !== '') cp[keep[i]] = String(v);
+        const k = keep[i];
+        let v = scope[k];
+        /* 随行参数常常是**本流程算出来的产物**而不是表里的列（例如 account_email =
+         * 前缀 + 页面带出的后缀）。这类值只存在于 outputs 里，scope 里没有——
+         * 0.9.6 只查 scope，日志里就出现过「随行参数 无」，交接白带了一趟，
+         * 全靠表里已回写才没出事。这里按 outputs 再解析一次兜底。 */
+        if ((v === undefined || v === null || String(v) === '') && spec.outputs && spec.outputs[k] !== undefined) {
+          try { v = ENGINE.resolvePlaceholders(spec.outputs[k], scope); } catch (e) { v = ''; }
+        }
+        if (v !== undefined && v !== null && String(v) !== '') cp[k] = String(v);
       }
       let host = '';
       try { host = new URL(url).host; } catch (e) { throw new RunnerError('E_SPEC', 'handoff 目标 URL 非法: ' + url); }
@@ -1594,12 +1643,15 @@
        * 等本流程彻底结束再写就晚了——交接已经把下一个标签页打开了。
        * 写失败不阻断交接（失败会进本地待写队列），因为随行参数里带了同一个值兜底。 */
       const stw = RunState.get() || {};
-      if (stw.task && stw.task.record_id && wbModeOf(spec) === 'auto') {
+      /* wbDone 存在 = 本次运行已经写过表（例如「交接准备 defer」先写、「同标签交接」再跳）。
+       * 没有这个判断，两步式交接会把同一份结果写两遍——飞书那边是覆盖，看不出错，
+       * 但会多一次写请求、且失败重试队列里可能出现两条互相矛盾的记录。 */
+      if (stw.task && stw.task.record_id && wbModeOf(spec) === 'auto' && !stw.wbDone) {
         const outs = {};
         Object.keys(spec.outputs || {}).forEach(function (k) {
           try { outs[k] = ENGINE.resolvePlaceholders(spec.outputs[k], scope); } catch (e) { outs[k] = ''; }
         });
-        log({ t: Date.now(), level: 'info', msg: step.id + ' 交接前先回写本次结果到业务表（下一段流程要读）…' });
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 交接准备：先把本次结果回写业务表（下一段流程要读）…' });
         const wr = await pushTaskResult(stw, true, outs, null);
         /* 绝不能写成 stw.final：收尾轮询器（setInterval 1500ms）只看 final，一看到就播报
          * 「流程完成」并 RunState.clear()——而交接步骤后面还有步骤要跑（退出登录）。
@@ -1609,6 +1661,51 @@
         RunState.set(stw);
       }
       SVC.pendSet({ record_id: rid, script_id: nextId, params: cp, handoff: true }, host);
+      const hdMode = handoff.defer === true ? 'defer' : (step.open === 'same-tab' ? 'same-tab' : 'new-tab');
+
+      /* ── defer：只把交接上下文与回写准备好，不打开任何页面 ─────────────────────
+       * 用途是「两段式交接」：业务要求先退出当前账号、再进下一环节（否则下一个标签页
+       * 的会话会被退出动作一起清掉）。但退出是一次整页跳转，跳完运行态就没了，
+       * 所以回写和交接上下文必须在**退出之前**落盘——这一步干这个，然后流程继续。 */
+      if (hdMode === 'defer') {
+        log({ t: Date.now(), level: 'info', msg: step.id + ' ⇢ 交接上下文已备好（记录 ' + rid +
+          '，随行参数 ' + (Object.keys(cp).join(',') || '无') + '），本步不打开页面——由后续步骤先退出、再跳转' });
+        stepLogs.push({
+          id: step.id, name: step.name, mode: 'navigate', fromCache: false,
+          assertResults: [{ assert: 'handoff.defer(script_id=' + nextId + ')', pass: true, detail: '已写入交接上下文与回写，未打开页面' }], extract: {},
+        });
+        onStep(step.id, 'passed');
+        return { initiated: false, handoff: true, deferred: true, stepId: step.id };
+      }
+
+      /* ── same-tab：本流程到此结束，用当前标签页进入下一环节 ─────────────────
+       * 为什么先清运行态：本页跳过去就是下一段流水线的起点（P3 会在那儿按 trigger 认领），
+       * 若留下 phase=await_nav_check，本场景脚本在新页面注入后会以为自己还要续跑，
+       * 跟下一个场景抢同一个页面。用 replace 而非 href：不给人留一条「后退回已退出页面」的历史。 */
+      if (hdMode === 'same-tab') {
+        RunState.clear();
+        log({ t: Date.now(), level: 'info', msg: step.id + ' ⇢ 交接给「' + nextId + '」（记录 ' + rid +
+          '，随行参数 ' + (Object.keys(cp).join(',') || '无') + '），本页跳转 ' + maskUrl(url) + '（本流程结束）' });
+        stepLogs.push({
+          id: step.id, name: step.name, mode: 'navigate', fromCache: false,
+          assertResults: [{ assert: 'handoff.same-tab(script_id=' + nextId + ')', pass: true, detail: '已写入交接上下文并替换当前标签页' }], extract: {},
+        });
+        onStep(step.id, 'passed');
+        await sleep(200);
+        const hrefBefore = String(location.href);
+        try { location.replace(url); } catch (e) { try { location.href = url; } catch (e2) {} }
+        await sleep(600);
+        /* 跳转没生效时**不抛异常**：这已经是本流程最后一步，抛了也只是把横幅变红。
+         * 给一条能照着做的提示更有用——表已回写、交接上下文已在本地，人手动点一下表里的
+         * 「开户邀请链接」，下一个场景 10 分钟内仍会认领这条记录。 */
+        if (String(location.href) === hrefBefore) {
+          log({ t: Date.now(), level: 'warn', msg: step.id + ' 当前标签页没有跳转：请手动打开表里的「开户邀请链接」继续开户（交接上下文已备好，10 分钟内有效）' });
+        } else {
+          log({ t: Date.now(), level: 'ok', msg: step.id + ' ✓ 已跳转 ' + maskUrl(String(location.href)) });
+        }
+        return { initiated: true, handoff: true, sameTab: true, stepId: step.id };
+      }
+
       log({ t: Date.now(), level: 'info', msg: step.id + ' ⇢ 交接给「' + nextId + '」（记录 ' + rid +
         '，随行参数 ' + (Object.keys(cp).join(',') || '无') + '），打开 ' + maskUrl(url) + '（本页继续走完剩余步骤）' });
       onStep(step.id, 'navigating');
@@ -1638,6 +1735,7 @@
     st.navExpect = step.expect || {};
     st.navAt = Date.now();
     st.extracted = extracted;   // 产物随行：落地页续跑时恢复变量表
+    st.params = persistableParams(spec, params);   // 参数随行（secret 剔除，续跑时重新取）
     st.stepLogs = stepLogs;     // 日志随行：落地后面板能看到完整时间线
     RunState.set(st);
     // 留时间让 UI 渲染日志；location.href 是异步的，页面真正卸载前脚本会继续走完
@@ -1754,9 +1852,11 @@
         if (!wchk.ok) throw new RunnerError('E_PERM', wchk.msg);
         writeCount++;
       }
-      if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i, extracted); continue; }
+      if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i, extracted, params); continue; }
       if (step.mode === 'navigate') {
         const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i);
+        /* 同标签交接＝本流程终点，继续往下走把 outputs 算出来正常收尾（不回 navInitiated）。 */
+        if (nav && nav.sameTab) continue;
         if (nav && nav.initiated) return { ok: true, navInitiated: true, stepId: step.id, stepLogs, extracted, resumed: true };
         continue;
       }
@@ -4051,7 +4151,12 @@
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '=== 执行完成 ===' });
         renderOutputs(result.outputs || {});
         // 广播最终结果：辅助标签页自毁，发起页弹窗展示
-        const role = (function(){ try { return sessionStorage.getItem('masrRole') || ''; } catch (e) { return ''; } })();
+        /* 续跑页就是「本流程的同一个标签页」，不能按 masrRole 判辅助页：
+         * masrRole 在 sessionStorage 里，而 sessionStorage **不跨域**——退出登录从
+         * id.cloud 跳到 id1.cloud 时它必然丢失，续跑页于是被判成辅助标签页，跑完 2 秒把自己关掉，
+         * 人连提示都看不清。 */
+        const role = resuming ? 'origin'
+          : (function(){ try { return sessionStorage.getItem('masrRole') || ''; } catch (e) { return ''; } })();
         const stc = RunState.get() || {};
         stc.phase = 'done';
         /* 保留「已回写」标记：交接型流程在打开下一个标签页之前就写过表了（见 execNavigate
@@ -4088,13 +4193,13 @@
             stc.final.consumed = true;
             const wbAlready = !!(stc.wbDone && stc.wbDone.written);
             if (wbAlready) {
-              /* 业务结果已经在交接前写成功了（例：「开户状态=管理式导入完成」），
+              /* 业务结果已经在交接准备阶段写成功了（例：「开户状态=管理式导入完成」），
                * 这次失败的只是交接之后的收尾步骤（例：退出登录没点上）。
                * 此时绝不能把表改写成失败——那会让业务以为成员根本没建成，进而重跑一次、
                * 多建一个成员。表里保留成功状态，失败原因只在面板上说清楚。 */
               stc.final.written = true;
-              UI.appendLog({ t: Date.now(), level: 'warn', msg: '表内业务结果已在交接前回写成功（' + code +
-                ' 发生在交接之后的步骤），本次不覆盖表内状态；请按上方提示人工处理这一处' });
+              UI.appendLog({ t: Date.now(), level: 'warn', msg: '表内业务结果已在交接准备阶段回写成功（' + code +
+                ' 发生在交接之后的收尾步骤），本次不覆盖表内状态；请按上方提示人工处理这一处' });
             } else if (stc.task && stc.task.record_id && !stc.final.written) {
               if (wbModeOf(spec) !== 'auto') {
                 // none 模式：填充失败不写表（记录保持原状态，可重试）；提示人现场处置
