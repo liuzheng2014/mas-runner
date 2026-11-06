@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.5
+// @version      0.9.6
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -523,6 +523,10 @@
     const readyMs = opts.ready_timeout_ms === undefined ? 10000 : Number(opts.ready_timeout_ms);
     const log = opts.log || function () {};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    /* read 动作的产物：{变量名: 文本}。由 execUi 并入步骤抽取（{{S3.xxx}} 通道），
+     * 用途：从页面上把「只有页面才知道」的值带回来（如新建成员的完整邮箱），
+     * 再回写业务表。引擎不认识业务含义，只认 spec 声明的 xpath 与变量名。 */
+    const readings = {};
 
     /* 单个动作。k 次重试的意义：下拉是联动的（选完一级，二级列表会重新请求重渲染），
      * 抢在重渲染前点下去会「点空」——节点在、点击也成功，但状态没变。
@@ -585,6 +589,9 @@
       /* assert_ui：只读确认，不做任何操作。用来在关键动作（尤其不可逆的提交）之前
        * 确认表单真实值，把「填了但没进去」挡在提交之前。
        * 与 until 的区别：until 看显隐（副作用），assert_ui 看文本（结果）。 */
+      /* assert_ui：只读确认，不做任何操作。用来在关键动作（尤其不可逆的提交）之前
+       * 确认表单真实值，把「填了但没进去」挡在提交之前。
+       * 与 until 的区别：until 看显隐（副作用），assert_ui 看文本（结果）。 */
       if (act === 'assert_ui') {
         const axp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
         const awant = ENGINE.resolvePlaceholders(String(a.text == null ? '' : a.text), scope);
@@ -595,6 +602,23 @@
             + (r.found ? r.actual : '<元素未找到>') + '」——' + (a.hint || '前面的动作没有真正写进表单'));
         }
         log('确认 ' + label + ' = ' + awant);
+        return;
+      }
+
+      /* read：从页面上把一个值带回来（只读，不点、不写）。
+       * 为什么需要：新建成员的完整邮箱只有页面知道（后缀由组织域名带出），
+       * 业务表要求回写它，而它不在任何请求参数里。spec 声明 target+var，引擎读取并交回
+       * 步骤抽取（{{步骤.var}}），后续 outputs/回写模板就能引用。 */
+      if (act === 'read') {
+        const rxp = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
+        let rel = null;
+        try { rel = ENGINE.uiFindByXPath(rxp); } catch (e1) { throw new Error('E_UI_TARGET read 选择器无效: ' + rxp); }
+        if (!rel && readyMs > 0) rel = await ENGINE.uiWaitByXPath(rxp, readyMs, sleep);
+        if (!rel) throw new Error('E_UI_TARGET 要读取的元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : ''));
+        const got = ENGINE.uiText(rel);
+        const key = String(a.var || ('v' + Object.keys(readings).length));
+        readings[key] = got;
+        log('读取 ' + label + ' = ' + (a.secret === true ? ENGINE.maskValue(got) : (got.length > 48 ? got.slice(0, 48) + '…' : got)));
         return;
       }
 
@@ -634,12 +658,56 @@
         if (!first && readyMs > 0) log('等待页面渲染（' + label + '，最多 ' + readyMs + 'ms）');
         const el = first || await ENGINE.uiWaitByXPath(target, readyMs, sleep);
         if (!el) {
+          /* optional：同一个入口可能有两种页面形态（如邀请链接可能落在注册页，也可能直接
+           * 落在登录页）。只有 spec 显式声明 optional 才允许跳过，并且必须留日志——
+           * 静默跳过会让「选择器写错了」看起来像「本来就没有这一步」。 */
+          if (a.optional === true) {
+            log('跳过 ' + label + '：页面没有这个元素（spec 声明 optional）');
+            return;
+          }
           throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '')
             + '——已等待 ' + (Date.now() - tFind) + 'ms 仍未出现：页面可能改版，或表单渲染比 ' + readyMs + 'ms 更慢');
         }
 
-        if (act === 'click') {
+        if (act === 'hover') {
+          /* 只为「悬浮才展开」的菜单存在（Element Plus el-dropdown 默认 trigger=hover）。
+           * el.click() 不会触发 mouseenter，所以下拉菜单用 click 永远打不开——而且不报错，
+           * 表现是「点了没反应」（2026-11-06 退出登录实测）。必须派发真实的悬浮事件。
+           * 一次派发不够：有的组件监听 pointerenter，有的监听 mouseenter，两个都发。 */
+          log('悬浮 ' + label);
+          const evs = ['pointerenter', 'mouseenter', 'mouseover'];
+          for (let e2 = 0; e2 < evs.length; e2++) {
+            try {
+              const Ctor = (evs[e2] === 'pointerenter' && typeof PointerEvent !== 'undefined') ? PointerEvent : MouseEvent;
+              el.dispatchEvent(new Ctor(evs[e2], { bubbles: !/enter$/.test(evs[e2]), cancelable: true, view: window }));
+            } catch (e3) { /* 老浏览器不支持 PointerEvent：mouseenter 兜底 */ }
+          }
+          if (until) {
+            const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
+            if (!ok) { lastErr = untilMs + 'ms 内未变为 ' + until; log('未生效（' + lastErr + '），重试 ' + label); continue; }
+          }
+          if (!(await verifyExpect())) continue;
+        } else if (act === 'click') {
+          /* nav_after：这一下会把整页带走。续跑状态必须在点之前落盘（页面一卸载，后面的
+           * 代码就再也不会执行）；点完页面还在 = 没跳，必须回滚状态并报错。 */
+          const navA = (a.nav_after && typeof a.nav_after === 'object') ? a.nav_after : null;
           log('点击 ' + label + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+          if (navA) {
+            const hrefB = String(location.href);
+            if (opts.onNavBefore) opts.onNavBefore(navA);
+            el.click();
+            await sleep(1500);
+            const moved = String(location.href) !== hrefB;
+            const urlOk = !navA.url_contains || String(location.href).indexOf(navA.url_contains) >= 0;
+            if (!(moved && urlOk)) {
+              if (opts.onNavAfter) opts.onNavAfter(false);
+              throw new Error('E_NAV ' + label + ' 声明了跳转（' + JSON.stringify(navA) + '），但页面没有跳转：当前地址 ' +
+                String(location.href).slice(0, 120) + '——点击可能没落到可点的节点上，或页面结构变了');
+            }
+            if (opts.onNavAfter) opts.onNavAfter(true);
+            log('已跳转到 ' + String(location.href).slice(0, 90));
+            return;
+          }
           el.click();
           if (until) {
             const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
@@ -770,7 +838,7 @@
         await runOne(b.items[0]);
       }
     }
-    return {};
+    return readings;
   };
 
   // ---------- cookie 派生变量 ----------
@@ -957,7 +1025,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.5',
+    RUNNER_VERSION: '0.9.6',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1218,13 +1286,11 @@
   function checkDryRunPermission(spec) {
     if (spec.status === 'draft') {
       const hasWrite = spec.steps.some(s => s.write === true || s.mode === 'human');
-      if (hasWrite) {
-        // draft 允许跑到写操作前一步：执行引擎会在遇 write 步骤时停下（见 runSpec）
-        return { dryRun: true, stopAtWrite: true };
-      }
-      return { dryRun: true, stopAtWrite: true }; // 纯读 draft：dry_run 即正常执行读步骤
+      /* draft 允许跑到写操作前一步：执行引擎会在遇 write 步骤时停下（见 runSpec）
+       * 纯读 draft：dry_run 即正常执行读步骤 */
+      return { dryRun: true, stopAtWrite: true, draft: true, hasWrite };
     }
-    return { dryRun: false, stopAtWrite: false };
+    return { dryRun: false, stopAtWrite: false, draft: false, hasWrite: false };
   }
 
   async function runSpec(spec, params, hooks) {
@@ -1232,14 +1298,19 @@
     const log = (entry) => { hooks.onLog(entry); };
     const onStep = hooks.onStep || (() => {});
     validateSpecShape(spec);
-    const { dryRun } = checkDryRunPermission(spec);
+    const { dryRun, draft, hasWrite } = checkDryRunPermission(spec);
 
     const { vars, problems } = prepareVars(spec);
     if (problems.length) {
       log({ t: Date.now(), level: 'info', msg: '派生变量延后求值（在使用它的步骤执行时现取）: ' + problems.join('；') });
     }
     log({ t: Date.now(), level: 'info', msg: '派生变量就绪: ' + Object.keys(vars).join(', ') });
-    log({ t: Date.now(), level: 'info', msg: (dryRun ? '[dry_run] ' : '[run] ') + spec.spec_id + ' v' + spec.version + ' (' + spec.status + ')' });
+    /* draft 的标签必须说实话：以前一律打 [dry_run]，但「没有写步骤的 draft」其实会真点真输入
+     * （典型是登录类 spec）——看到 dry_run 以为没真做事，是最容易出事的一种误解。 */
+    log({ t: Date.now(), level: 'info', msg: (draft ? (hasWrite ? '[draft·跑到写操作前一步] ' : '[draft·未验证，操作真实生效] ') : '[run] ') + spec.spec_id + ' v' + spec.version + ' (' + spec.status + ')' });
+    if (draft && !hasWrite) {
+      log({ t: Date.now(), level: 'warn', msg: '本 spec 仍是草稿：流程未全部验证过。它没有写步骤，所以下面的点击/输入/提交都会真实发生，不是空跑' });
+    }
 
     const gate = makeLimiter(spec.rate_limit);
     const extracted = {};
@@ -1284,7 +1355,7 @@
           continue;
         }
         if (step.mode === 'ui') {
-          await execUi(spec, step, scope, stepLogs, log, onStep, i);
+          await execUi(spec, step, scope, stepLogs, log, onStep, i, extracted);
           scope = buildScope(spec, params, extracted, vars);
           continue;
         }
@@ -1331,18 +1402,48 @@
 
   /* UI 步骤执行：纯页面填充（click/type/wait），无网络请求、无写操作。
    * 选择器与取值全部来自 spec 的 step.ui.actions（业务知识在 spec，引擎只做原语）。 */
-  async function execUi(spec, step, scope, stepLogs, log, onStep, idx) {
+  async function execUi(spec, step, scope, stepLogs, log, onStep, idx, extracted) {
     onStep(step.id, 'running');
     const ui = step.ui || {};
     const t0 = Date.now();
     log({ t: t0, level: 'info', msg: step.id + ' → 页面填充（' + ((ui.actions) || []).length + ' 个动作，间隔 ' + (Number(ui.gap_ms) || 400) + 'ms）' });
+    /* 点击可能整页跳走（例如「去登录」跳到 CAS 登录页）：续跑状态必须在**点之前**写进运行态，
+     * 否则页面一卸载就再没人执行后面的步骤。哪个动作会跳，由该动作自己的 nav_after 声明
+     * （不是整个 step）——因为同一个 step 里往往还有「元素不存在就跳过」的可选点击。
+     * 动作若没真的跳走，这里要把状态回滚并报错：不能留一个永远等不到落地的运行态。 */
+    const navWrote = { on: false };
+    function clearNav() {
+      const sb = RunState.get() || {};
+      sb.phase = 'running'; delete sb.navExpect; delete sb.navStepId; RunState.set(sb);
+      navWrote.on = false;
+    }
     try {
-      await ENGINE.execUiActions(ui.actions || [], scope, {
+      const rd = await ENGINE.execUiActions(ui.actions || [], scope, {
         gap_ms: ui.gap_ms,
         ready_timeout_ms: ui.ready_timeout_ms,
         log: function (m) { log({ t: Date.now(), level: 'info', msg: step.id + ' · ' + m }); },
+        onNavBefore: function (expect) {
+          const stn = RunState.get() || {};
+          stn.phase = 'await_nav_check';
+          stn.navStepId = step.id;
+          stn.navExpect = expect;
+          stn.navAt = Date.now();
+          stn.stepLogs = stepLogs;
+          RunState.set(stn);
+          navWrote.on = true;
+          log({ t: Date.now(), level: 'info', msg: step.id + ' 预期整页跳转（' + JSON.stringify(expect) + '），已预写续跑状态' });
+        },
+        onNavAfter: function (ok) { if (!ok) clearNav(); },
       });
+      /* read 动作的产物进步骤抽取，key 用「步骤ID.变量名」——与 api 步骤的抽取同一条通道，
+       * 因此 outputs / 回写模板都能直接用 {{S3.account_email}} 引用。 */
+      if (rd && typeof rd === 'object' && Object.keys(rd).length) {
+        const ks = Object.keys(rd);
+        ks.forEach(function (k) { if (extracted) extracted[step.id + '.' + k] = rd[k]; });
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 读取页面值：' + ks.map(function (k) { return k + '=' + rd[k]; }).join('，') });
+      }
     } catch (e) {
+      if (navWrote.on) clearNav();
       onStep(step.id, 'fail');
       stepLogs.push({ id: step.id, ms: Date.now() - t0, error: e.message });
       throw e; // 交给 runSpec 的 catch 走 on_fail / RunnerError 通道
@@ -1465,6 +1566,69 @@
     // navigate 前必须先把运行态落盘（导航会销毁当前 JS 环境）
     const url = ENGINE.resolvePlaceholders(step.url, scope);
     if (!/^https:\/\//.test(url)) throw new RunnerError('E_SPEC', 'navigate 目标非法: ' + url);
+
+    /* ── 交接（handoff）：本流程结束后，下一段流程在新标签页里接着跑 ──────────────
+     * 为什么需要独立语义：跨的是「业务环节」，不是「一次页面跳转」。下一段是另一个 spec、
+     * 另一套账号体系（管理台 → 广告平台），recordId 在新页面 URL 上不存在（邀请链接只带
+     * inviteCode），只能由本流程显式把它交出去。
+     * 与 open:new-tab 的区别：那个是「本流程在新标签页继续跑」，这个「本流程到此为止，
+     * 新标签页是下一条流水线的起点」——所以不写 await_nav_check，本页后续步骤（如退出登录）
+     * 照常执行，最后正常 final + 回写。
+     * 交出去的东西：record_id + 下游 script_id + 白名单参数（凭据绝不随行，下游自己 /task 取）。 */
+    const handoff = (step.handoff && step.handoff.script_id) ? step.handoff : null;
+    if (handoff) {
+      const st0h = RunState.get() || {};
+      const task0 = st0h.task || UI.currentTask || {};
+      const rid = String(task0.record_id || ENGINE.resolvePlaceholders('{{record_id}}', scope) || '');
+      if (!rid) throw new RunnerError('E_SPEC', 'handoff 需要 record_id：本流程没有任务上下文（standalone 直接跑无法交接到下一条流水线）');
+      const nextId = String(handoff.script_id);
+      const keep = Array.isArray(handoff.params) ? handoff.params : [];
+      const cp = {};
+      for (let i = 0; i < keep.length; i++) {
+        const v = scope[keep[i]];
+        if (v !== undefined && v !== null && String(v) !== '') cp[keep[i]] = String(v);
+      }
+      let host = '';
+      try { host = new URL(url).host; } catch (e) { throw new RunnerError('E_SPEC', 'handoff 目标 URL 非法: ' + url); }
+      /* 交接前先把本段结果写进业务表：下一段流程要读表（P3 的「邮箱账号」就是刚建的成员），
+       * 等本流程彻底结束再写就晚了——交接已经把下一个标签页打开了。
+       * 写失败不阻断交接（失败会进本地待写队列），因为随行参数里带了同一个值兜底。 */
+      const stw = RunState.get() || {};
+      if (stw.task && stw.task.record_id && wbModeOf(spec) === 'auto') {
+        const outs = {};
+        Object.keys(spec.outputs || {}).forEach(function (k) {
+          try { outs[k] = ENGINE.resolvePlaceholders(spec.outputs[k], scope); } catch (e) { outs[k] = ''; }
+        });
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 交接前先回写本次结果到业务表（下一段流程要读）…' });
+        const wr = await pushTaskResult(stw, true, outs, null);
+        /* 绝不能写成 stw.final：收尾轮询器（setInterval 1500ms）只看 final，一看到就播报
+         * 「流程完成」并 RunState.clear()——而交接步骤后面还有步骤要跑（退出登录）。
+         * 2026-11-06 基线录制时就是这么踩到的：S6 一条日志都没有，横幅却已显示完成。
+         * 换成独立标记 wbDone，由 doRun 收尾时合并进 final。 */
+        stw.wbDone = { ok: true, outputs: outs, at: Date.now(), specId: spec.spec_id, written: !!(wr && wr.written) };
+        RunState.set(stw);
+      }
+      SVC.pendSet({ record_id: rid, script_id: nextId, params: cp, handoff: true }, host);
+      log({ t: Date.now(), level: 'info', msg: step.id + ' ⇢ 交接给「' + nextId + '」（记录 ' + rid +
+        '，随行参数 ' + (Object.keys(cp).join(',') || '无') + '），打开 ' + maskUrl(url) + '（本页继续走完剩余步骤）' });
+      onStep(step.id, 'navigating');
+      const wh = window.open(url, '_blank');
+      if (!wh) {
+        /* 弹窗被拦时不能「假装交接成功」：下游根本没打开，本流程再正常结束就会让人
+         * 以为开户流程已经开始了。这里直接终止，页面保留，人可以允许弹窗后重跑。 */
+        log({ t: Date.now(), level: 'fatal', msg: step.id + ' 新标签页被浏览器拦截：请允许本站弹窗后重跑本流程（否则下一段不会开始）' });
+        throw new RunnerError('E_NAV_POPUP', '交接需要打开新标签页，但被浏览器拦截了（未授权弹窗）');
+      }
+      try { sessionStorage.setItem('masrTransit', '1'); } catch (e) {}
+      stepLogs.push({
+        id: step.id, name: step.name, mode: 'navigate', fromCache: false,
+        assertResults: [{ assert: 'handoff(script_id=' + nextId + ')', pass: true, detail: '已写入交接上下文并打开新标签页' }], extract: {},
+      });
+      onStep(step.id, 'passed');
+      await sleep(400);
+      return { initiated: false, handoff: true, openedTab: true, stepId: step.id };
+    }
+
     const newTab = step.open === 'new-tab';
     log({ t: Date.now(), level: 'info', msg: step.id + ' → ' + (newTab ? '新标签页打开 ' : '导航 ') + maskUrl(url) + '（运行态已保存）' });
     onStep(step.id, 'navigating');
@@ -1539,6 +1703,27 @@
       throw new RunnerError(of.error || 'E_SESSION', (of.message || '导航后校验失败') + '｜' + problems.join('；'));
     }
     log({ t: Date.now(), level: 'ok', msg: st.navStepId + ' ✓ 落地校验通过（' + location.href.slice(0, 80) + '…）' });
+    /* 续跑补凭据：运行态落盘时会剔除 secret 参数（本地存储是明文的，密码不落盘）。
+     * 跨页续跑的场景（如「点去登录 → 登录页继续填」）因此拿不到密码——这里按记录重新向
+     * 服务端取一次，而不是把凭据写进存储。取不到就如实记录，由后续步骤报「值为空」。 */
+    try {
+      const need = (spec.params || []).filter(function (p) { return p.secret === true && !params[p.name]; });
+      if (need.length) {
+        const rid = (st.task && st.task.record_id) || params.record_id || '';
+        const sid = (st.task && st.task.script_id) || spec.spec_id;
+        if (rid) {
+          const fresh = await SVC.record(rid, sid);
+          const fp = (fresh && fresh.params) || {};
+          const got = [];
+          need.forEach(function (p) { if (fp[p.name]) { params[p.name] = fp[p.name]; got.push(p.name); } });
+          log({ t: Date.now(), level: got.length ? 'info' : 'warn',
+            msg: got.length ? '续跑已重新取回凭据参数：' + got.join(',') + '（未落本地存储）'
+              : '续跑需要凭据参数 ' + need.map(function (p) { return p.name; }).join(',') + '，但 /task 没有下发（表里为空？）' });
+        }
+      }
+    } catch (e) {
+      log({ t: Date.now(), level: 'warn', msg: '续跑补取凭据失败：' + e.message + '（后续步骤可能因参数为空停下）' });
+    }
     // 导航步骤也进步骤表/日志（步骤表 ✓ 与结果导出完整）
     (st.stepLogs = st.stepLogs || []).push({
       id: st.navStepId, name: step.name, mode: 'navigate', fromCache: false,
@@ -1569,7 +1754,7 @@
         if (!wchk.ok) throw new RunnerError('E_PERM', wchk.msg);
         writeCount++;
       }
-      if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i); continue; }
+      if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i, extracted); continue; }
       if (step.mode === 'navigate') {
         const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i);
         if (nav && nav.initiated) return { ok: true, navInitiated: true, stepId: step.id, stepLogs, extracted, resumed: true };
@@ -2063,6 +2248,7 @@
          * （实测 5 层编码，解码后才是 `...index.html?recordId=xxx`）。只在 spec 显式声明
          * record_id_deep 时才做这层提取：别的站点 service 里也可能有同名参数，猜着捞会捞错记录。 */
         let rid = q(tr.record_id_query);
+        let ridFromPend = false;
         if (!rid && tr.record_id_deep === true && tr.record_id_query) {
           const names = (tr.cross_domain && Array.isArray(tr.cross_domain.service_query))
             ? tr.cross_domain.service_query : ['service', 'redirect_uri'];
@@ -2075,8 +2261,23 @@
             if (m) rid = SVC.decodeParam(m[1], 8);
           }
         }
+        /* recordId 的第三个来源：上一段流程的显式交接（record_id_pend）。
+         * 场景：P2 在管理台建成员 → 退出登录 → 打开「开户邀请链接」。邀请链接里只有 inviteCode，
+         * recordId 在任何一跳 URL 上都不存在（2026-11-06 实测：query / hash / 两处都加，302 后全丢）。
+         * 所以只能由交接方在打开新标签前写进本地，由本页认领。
+         * 只认「交接给本场景」的那一条（script_id 必须一致）：别的场景留下的上下文绝不借用，
+         * 否则会拿着 A 记录的凭据去跑 B 流程。新鲜度由 pendGet 的 TTL 保证。 */
+        if (!rid && tr.record_id_pend === true) {
+          const pd = SVC.pendGet();
+          if (pd && pd.t && pd.t.record_id &&
+              String(pd.t.script_id || '') === String(s.script_id)) {
+            rid = String(pd.t.record_id);
+            ridFromPend = true;
+          }
+        }
         hits.push({
           script_id: s.script_id, name: s.name, record_id: rid,
+          record_id_from_pend: ridFromPend,
           record_id_deep: (tr.record_id_deep === true),
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
@@ -2191,6 +2392,29 @@
     } catch (e) { return null; }
   };
   SVC.pendClear = function () { try { GM_setValue(SVC.PEND_KEY, ''); } catch (e) {} };
+  /* 交接参数补位：下游场景的参数以 /task 取表值为准，只有「表里还是空的」才用交接带来的值补。
+   * 为什么需要：P2 建完成员才知道完整邮箱账号，而这条记录要等 P2 结束才回写表；
+   * P3 在这之前就打开了，此时 /task 读到的是空串。谁有值用谁，表里的永远优先。 */
+  SVC.pendMerge = function (task) {
+    if (!task) return task;
+    const pd = SVC.pendGet();
+    if (!pd || !pd.t || String(pd.t.script_id || '') !== String(task.script_id || '')) return task;
+    if (!SVC.pendAccept(pd, location.host)) return task;
+    const src = (pd.t && pd.t.params) || {};
+    task.params = task.params || {};
+    let filled = 0;
+    Object.keys(src).forEach(function (k) {
+      const cur = task.params[k];
+      if (cur === undefined || cur === null || String(cur) === '') { task.params[k] = src[k]; filled++; }
+    });
+    if (filled) {
+      try {
+        UI.appendLog({ t: Date.now(), level: 'info',
+          msg: '交接上下文补位 ' + filled + ' 个参数（表里尚为空）：' + Object.keys(src).join(',') });
+      } catch (e) {}
+    }
+    return task;
+  };
   /* 按 script_id 找场景声明（跨域判定要用它声明的 hosts） */
   SVC.sceneById = function (scriptId) {
     const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
@@ -3222,14 +3446,21 @@
       const t0 = Date.now();
       UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
       try {
-        await writeWithRetry(payload);
+        const wr = await writeWithRetry(payload);
+        /* 服务端可能「按声明故意不写」：例如 writeback.fail 声明为空对象（业务表没有失败态字段），
+         * 它返回 written: []。这时候打印「已回写成功」是假的——表里一个字段都没动。
+         * 业务上两者差别很大：真写了才会看到「开户状态」变化，没写就得人工去表里补。 */
+        const wrote = !wr || !Array.isArray(wr.written) || wr.written.length > 0;
         UI.appendLog({
           t: Date.now(), level: 'ok',
-          msg: '✅ 已回写飞书：' + (ok ? '成功' : '失败（' + payload.error_type + '）') +
+          msg: (wrote ? '✅ 已回写飞书：' + (ok ? '成功' : '失败（' + payload.error_type + '）')
+            : '本场景该分支声明不回写（业务表无对应字段），已跳过写入') +
             '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
         });
         if (!UI._running) UI.renderTasks();
-        return { written: true, msg: '' };
+        /* written 的语义是「这次回写已经处理完、收尾不要再发一次」，不是「字段真的写了」。
+         * 空分支（noop）也算处理完——否则收尾会再发一遍请求。是否真写用 skipped 表达。 */
+        return { written: true, skipped: !wrote, msg: '' };
       } catch (e) {
         pwAdd(payload);
         const msg = String((e && e.message) || e);
@@ -3823,7 +4054,11 @@
         const role = (function(){ try { return sessionStorage.getItem('masrRole') || ''; } catch (e) { return ''; } })();
         const stc = RunState.get() || {};
         stc.phase = 'done';
-        stc.final = { ok: true, outputs: result.outputs || {}, at: Date.now(), specId: spec.spec_id };
+        /* 保留「已回写」标记：交接型流程在打开下一个标签页之前就写过表了（见 execNavigate
+         * 的 handoff 分支，标记在 wbDone 上），这里不能把它冲掉，否则收尾轮询器会再写一次。 */
+        const alreadyWritten = !!(stc.final && stc.final.written) || !!(stc.wbDone && stc.wbDone.written);
+        stc.final = { ok: true, outputs: result.outputs || {}, at: Date.now(), specId: spec.spec_id, written: alreadyWritten };
+        if (stc.wbDone) delete stc.wbDone;
         RunState.set(stc);
         CloseSig.mark(stc.runId);   // 广播收摊：链条上所有辅助页（含上游的子客门户）自毁，发起页留
         if (role !== 'origin') {
@@ -3851,7 +4086,16 @@
           if (role === 'origin') {
             // 本页直接展示过，轮询器不再重复播报；但「失败」同样要回写（错误类型要进飞书表）
             stc.final.consumed = true;
-            if (stc.task && stc.task.record_id && !stc.final.written) {
+            const wbAlready = !!(stc.wbDone && stc.wbDone.written);
+            if (wbAlready) {
+              /* 业务结果已经在交接前写成功了（例：「开户状态=管理式导入完成」），
+               * 这次失败的只是交接之后的收尾步骤（例：退出登录没点上）。
+               * 此时绝不能把表改写成失败——那会让业务以为成员根本没建成，进而重跑一次、
+               * 多建一个成员。表里保留成功状态，失败原因只在面板上说清楚。 */
+              stc.final.written = true;
+              UI.appendLog({ t: Date.now(), level: 'warn', msg: '表内业务结果已在交接前回写成功（' + code +
+                ' 发生在交接之后的步骤），本次不覆盖表内状态；请按上方提示人工处理这一处' });
+            } else if (stc.task && stc.task.record_id && !stc.final.written) {
               if (wbModeOf(spec) !== 'auto') {
                 // none 模式：填充失败不写表（记录保持原状态，可重试）；提示人现场处置
                 stc.final.manual = true;
@@ -4186,8 +4430,8 @@
           }
           return;
         }
-        UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' });
-        const task = await SVC.record(hit.record_id, hit.script_id);
+        UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' + (hit.record_id_from_pend ? '｜记录来自上游交接（本页地址不含 recordId）' : '') });
+        const task = SVC.pendMerge(await SVC.record(hit.record_id, hit.script_id));
         task.on_match = hit.on_match;
         // 中转页：当前页只是跳板，取到数就把这个标签页「原地替换」成业务页。
         // 用 replace 而不是 open+close：脚本无权关闭不是自己打开的标签页，close 会被浏览器拒绝；
@@ -4292,10 +4536,18 @@
       const pend = SVC.pendGet();
       if (pend && pend.t) {
         if (SVC.pendAccept(pend, location.host)) {
-          (async function () {
-            try { await UI.loadTriggeredTask(pend.t); SVC.pendClear(); }
-            catch (e) { UI.notice('已取到记录，但载入场景失败：' + e.message + '（可回业务表重新点按钮）', 'error'); }
-          })();
+          if (pend.t.handoff === true) {
+            /* 交接上下文不动手：它只是「上一条流水线把哪条记录交给了本场景」的凭据，
+             * 参数要由本页场景自己按 record_id 去 /task 取（凭据不下发到本地存储）。
+             * 这里点明一句，否则新标签页打开后一片空白，看不出到底接没接上。 */
+            UI.appendLog({ t: Date.now(), level: 'info', msg: '已接管上游交接的任务上下文（记录 ' +
+              pend.t.record_id + ' → 场景 ' + pend.t.script_id + '），由本页场景认领后取数' });
+          } else {
+            (async function () {
+              try { await UI.loadTriggeredTask(pend.t); SVC.pendClear(); }
+              catch (e) { UI.notice('已取到记录，但载入场景失败：' + e.message + '（可回业务表重新点按钮）', 'error'); }
+            })();
+          }
         }
       }
     }
