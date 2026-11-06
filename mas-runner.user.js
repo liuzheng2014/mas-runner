@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.4
+// @version      0.9.5
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -154,6 +154,13 @@
  *     → 登录页永远不被认领，表现仍是「点完按钮跳到登录页，插件没反应」。
  *     现在沿 service→redirect_uri 最多走 3 跳，链上任一 host 命中白名单才认领；
  *     链上没有任何本业务域（别人复用的登录页）照样不认领——不放大认领范围。
+ *   - v0.9.5：主动退出登录不再被自己登回去。
+ *     真机实测（2026-11-06）：在管理台点「退出」→ 落到 CAS 登录页 → 跨域场景照常认领 →
+ *     自动登录 → 8 秒后又回到原组织。人的退出被引擎撤销，等于**退不掉**；换账号时就卡死。
+ *     退出是人的动作，spec 无从得知，只能由引擎旁听：捕获阶段识别菜单项「退出/退出登录/登出/注销」
+ *     → 记一笔（时间 + 当时的 recordId + 站点主域）。下一次登录页认领时抑制一次（消费即作废）。
+ *     抑制范围刻意收窄：换一条记录、换站点、超过 3 分钟、spec 写 suppress_after_logout_ms:0
+ *     都不抑制——不能因为一次退出把人挡在外面。抑制时会写日志说明，不是静默跳过。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -950,7 +957,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.4',
+    RUNNER_VERSION: '0.9.5',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2075,6 +2082,9 @@
           redirect_to: tr.redirect_to || '',
           params: params,
           cross_domain: (tr.cross_domain && Array.isArray(tr.cross_domain.hosts)) ? tr.cross_domain.hosts.slice() : [],
+          /* 退出登录后多久内不再自动登录。缺省由 logoutGuard 给跨域场景 3 分钟，
+           * spec 显式写 0 可关掉（例如确实需要「退出即重登」的站点）。 */
+          logout_suppress_ms: (tr.suppress_after_logout_ms === undefined ? undefined : Number(tr.suppress_after_logout_ms)),
         });
       }
     }
@@ -2090,6 +2100,53 @@
   };
   SVC.matchTrigger = function (url) {
     return SVC.matchTriggerIn((SVC._sceneCache && SVC._sceneCache.list) || [], url);
+  };
+
+  /* ── 主动退出的抑制闸（2026-11-06 真机发现）─────────────────────────────
+   * 故障现场：人在管理台点「退出」→ 落到 CAS 登录页 → 跨域场景照常认领 → 自动登录
+   * → 8 秒后被登回原组织。人的退出被引擎自己撤销，切账号时完全出不去。
+   * 这不是业务场景能修的（退出是人的动作，spec 无从得知），只能由引擎记一笔。
+   *
+   * 语义：记下「刚刚有人主动退出」，**下一次登录页认领时抑制一次**（消费即作废），
+   * 之后（比如人重新点按钮进来）恢复正常自动登录。只抑制一次，不会把人永久挡在外面。 */
+  SVC.LOGOUT_KEY = 'masr_logout_v1';
+  SVC.LOGOUT_DEFAULT_MS = 180000;
+  SVC.siteOf = function (host) {
+    const h = String(host || '').toLowerCase();
+    const p = h.split('.');
+    return p.length >= 2 ? p.slice(-2).join('.') : h;   // huawei.com：id./id1./ads. 视为同一个站
+  };
+  SVC.markLogout = function (rid) {
+    const rec = { at: Date.now(), rid: String(rid || ''), site: SVC.siteOf(location.host) };
+    try { GM_setValue(SVC.LOGOUT_KEY, JSON.stringify(rec)); } catch (e) {}
+    try {
+      if (typeof UI !== 'undefined' && UI.appendLog) {
+        UI.appendLog({ t: Date.now(), level: 'info',
+          msg: '已记录「主动退出登录」：下一次落地登录页不会自动登录（防止刚退出又被登回去）' });
+      }
+    } catch (e) {}
+  };
+  /* 返回 null = 正常执行；返回 {msg} = 本次必须停手 */
+  SVC.logoutGuard = function (hit) {
+    if (!hit) return null;
+    const declared = hit.logout_suppress_ms;
+    let win = 0;
+    if (declared === 0) win = 0;                                   // spec 显式关闭
+    else if (Number(declared) > 0) win = Number(declared);
+    else if (hit.cross_domain && hit.cross_domain.length) win = SVC.LOGOUT_DEFAULT_MS;
+    if (!win) return null;
+    let m = null;
+    try { m = JSON.parse(GM_getValue(SVC.LOGOUT_KEY, 'null') || 'null'); } catch (e) { m = null; }
+    if (!m || !m.at || m.used) return null;                        // 没用过才抑制；消费一次即止
+    const age = Date.now() - Number(m.at);
+    if (!(age >= 0) || age > win) return null;
+    /* 换了一条记录 = 人主动去办别的任务，不该被上一条的退出挡住。
+     * 记录号取不到时（退出页没带 recordId）只能按站点判，宁可多抑制一次。 */
+    if (m.rid && hit.record_id && String(m.rid) !== String(hit.record_id)) return null;
+    if (m.site && m.site !== SVC.siteOf(location.host)) return null;
+    try { GM_setValue(SVC.LOGOUT_KEY, JSON.stringify({ at: m.at, rid: m.rid, site: m.site, used: 1 })); } catch (e) {}
+    return { msg: '检测到 ' + Math.round(age / 1000) + ' 秒前刚刚主动退出登录，本次不自动登录' +
+      '（否则会把你直接登回去，等于退不掉）。要重新进入这条记录，请回业务表再点一次按钮。' };
   };
   /* 同步预判：直接读存储里的场景缓存，用于「挂面板之前」判断当前页是不是中转页。
    * 中转页不能挂主面板（用户只是点了个按钮，不该看到工作台）。 */
@@ -4080,6 +4137,15 @@
           }
           return;
         }
+        /* 刚主动退出过就别再自动登录：否则 8 秒后又被登回原组织，人根本退不出去。
+         * 命中也要说出来——「明明匹配上了却什么都没发生」是最难排查的那种故障。 */
+        const lo = SVC.logoutGuard(hit);
+        if (lo) {
+          UI._triggerErr = lo.msg;
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: lo.msg });
+          UI.renderTrigger();
+          return;
+        }
         const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
         if (!hit.record_id && !hasUrlParams) {
           UI._triggerTask = null;
@@ -4167,7 +4233,36 @@
     return fire;
   }
 
+  /* 记一笔「人点了退出」：随后落到登录页时不再自动登录（见 SVC.logoutGuard）。
+   * 退出是人的动作，spec 无从得知，只能由引擎在捕获阶段旁听这一次点击。
+   * 只认菜单项文本精确等于退出语义的，避免把「退出全屏」之类误记成登出。 */
+  function watchLogoutClick() {
+    if (window.__masrLogoutWatch) return;
+    window.__masrLogoutWatch = true;
+    try {
+      document.addEventListener('click', function (ev) {
+        try {
+          let el = ev.target;
+          for (let i = 0; i < 5 && el; i++) {
+            const cls = String(el.className || '');
+            if (cls.indexOf('el-dropdown-menu__item') >= 0 || cls.indexOf('dropdown-item') >= 0) {
+              const t = String(el.textContent || '').replace(/\s+/g, '');
+              if (t === '退出' || t === '退出登录' || t === '登出' || t === '注销') {
+                let rid = '';
+                try { rid = new URLSearchParams(location.href.split('#')[0].split('?')[1] || '').get('recordId') || ''; } catch (e) {}
+                SVC.markLogout(rid);
+              }
+              break;
+            }
+            el = el.parentElement;
+          }
+        } catch (e) {}
+      }, true);
+    } catch (e) {}
+  }
+
   function boot() {
+    watchLogoutClick();
     // 中转页判定必须发生在「挂面板之前」：脚本同样注入在跳板域名（如业务表按钮打开的百度页）上，
     // 若先挂面板，用户日常打开那些页面就会看到工作台——那是污染，不是功能。
     if (!SVC.code()) { mountAll(); return; }
