@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.12
+// @version      0.9.13
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -208,6 +208,8 @@
  *     多打十几枪 /health?warm=1，白占连接）。
  *
  *   - v0.9.12：「检查更新」不能只看第一个源（2026-11-06 真机：点了更新还是旧版）。
+ *   - v0.9.13：①单次取数（read-once）：trigger.params_from_pend + 交接上下文优先于表 + TTL 10→60 分钟续期
+ *              ②S5 回写改异步（先入本机队列、后台补写），不再堵 40~50s（2026-11-06 真机 48.9s）。
  *     现象：面板点「检查更新」，显示「已是最新 v0.9.10」，可 jsDelivr 上早有 0.9.11。
  *     根因是旧实现「见第一个 200 就 return」——而排第一的自建源 mas.wankahuanju.top/runner.json
  *     背后是 KV 里的 commit，KV 没刷新时它**照样 200，只是内容是旧版本**，于是当场判定「无新版」，
@@ -1121,7 +1123,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.12',
+    RUNNER_VERSION: '0.9.13',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1739,18 +1741,36 @@
         Object.keys(spec.outputs || {}).forEach(function (k) {
           try { outs[k] = ENGINE.resolvePlaceholders(spec.outputs[k], scope); } catch (e) { outs[k] = ''; }
         });
-        log({ t: Date.now(), level: 'info', msg: step.id + ' 交接准备：先把本次结果回写业务表（下一段流程要读）…' });
-        const wr = await pushTaskResult(stw, true, outs, null);
+        /* 默认「先落盘、后台写」：交接之后的步骤（退出登录、跳下一环节）不依赖表，
+         * 没理由陪服务端在那里串行打三次飞书（真机最长 48.9s，这段时间页面上什么都不能做）。
+         * 只有下一段**只能读表**、随行参数又带不全时，才在 spec 里写 handoff.wait_write: true
+         * 退回同步等——这是场景可选的例外，不是默认。 */
+        const bgWrite = handoff.wait_write !== true;
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 交接准备：' +
+          (bgWrite ? '先存本机队列、后台回写业务表（不阻塞，页面继续退出/跳转）…'
+            : '先把本次结果回写业务表（本场景声明 wait_write，下一段只能读表）…') });
+        const wr = await pushTaskResult(stw, true, outs, null, bgWrite ? { background: true } : undefined);
         /* 绝不能写成 stw.final：收尾轮询器（setInterval 1500ms）只看 final，一看到就播报
          * 「流程完成」并 RunState.clear()——而交接步骤后面还有步骤要跑（退出登录）。
          * 2026-11-06 基线录制时就是这么踩到的：S6 一条日志都没有，横幅却已显示完成。
          * 换成独立标记 wbDone，由 doRun 收尾时合并进 final。 */
-        stw.wbDone = { ok: true, outputs: outs, at: Date.now(), specId: spec.spec_id, written: !!(wr && wr.written) };
+        stw.wbDone = {
+          ok: true, outputs: outs, at: Date.now(), specId: spec.spec_id,
+          written: !!(wr && wr.written), queued: !!(wr && wr.queued), background: !!(wr && wr.background),
+        };
         RunState.set(stw);
-        /* 写失败不阻断交接（随行参数兜着），但**必须说清后果**：真机上这里只留了一条
-         * 「已存本地待写队列」，人以为流程照常完成了，实际表里还是旧状态、没有邮箱账号。
-         * 后一段流程若超过 10 分钟才跑，交接上下文已过期，它就拿不到账号只能失败。 */
-        if (!stw.wbDone.written) {
+        if (stw.wbDone.queued) {
+          /* 后台模式：这条日志是人唯一能看到「已经安排上了」的地方，必须说清两件事——
+           * 表里此刻还没写；被打断也不用管（下个页面会自己补）。 */
+          log({
+            t: Date.now(), level: 'info',
+            msg: step.id + ' 结果已入本机队列，后台回写中（表里此刻可能还是旧状态）：' +
+              '写成功会自动出队；若被本站退出/跳转打断，下一个页面启动时会自动补写，不用手动点',
+          });
+        } else if (!stw.wbDone.written) {
+          /* 同步模式写失败不阻断交接（随行参数兜着），但**必须说清后果**：真机上这里只留了一条
+           * 「已存本地待写队列」，人以为流程照常完成了，实际表里还是旧状态、没有邮箱账号。
+           * 后一段流程若超过 10 分钟才跑，交接上下文已过期，它就拿不到账号只能失败。 */
           log({
             t: Date.now(), level: 'warn',
             msg: step.id + ' 回写没成功（已存本地待写队列）：表里此刻仍是旧状态，邮箱账号等产物还没进表；' +
@@ -1758,7 +1778,15 @@
           });
         }
       }
-      SVC.pendSet({ record_id: rid, script_id: nextId, params: cp, handoff: true }, host);
+      /* params_complete：告诉下游「这份参数是齐的，够你跑，不必再查表」。
+       * 只有 spec 在 handoff 上显式声明 params_complete:true 才写——是否「齐」是业务判断，
+       * 引擎不知道下游需要哪些字段，猜着标会让下游拿着缺项硬跑。
+       * display 一并带过去，下游面板还能显示「组织/成员姓名」这类标签。 */
+      SVC.pendSet({
+        record_id: rid, script_id: nextId, params: cp, handoff: true,
+        params_complete: handoff.params_complete === true,
+        display: (task0 && task0.display) || null,
+      }, host);
       const hdMode = handoff.defer === true ? 'defer' : (step.open === 'same-tab' ? 'same-tab' : 'new-tab');
 
       /* ── defer：只把交接上下文与回写准备好，不打开任何页面 ─────────────────────
@@ -2495,6 +2523,8 @@
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
           params: params,
+          /* read-once：声明了就优先用交接上下文里的参数，不查业务表（见 SVC.taskFromPend） */
+          params_from_pend: (tr.params_from_pend === true),
           cross_domain: (tr.cross_domain && Array.isArray(tr.cross_domain.hosts)) ? tr.cross_domain.hosts.slice() : [],
           /* 退出登录后多久内不再自动登录。缺省由 logoutGuard 给跨域场景 3 分钟，
            * spec 显式写 0 可关掉（例如确实需要「退出即重登」的站点）。 */
@@ -2590,7 +2620,12 @@
   /* 跨页传递：中转页取到的任务 → 业务页恢复。
    * 用 GM 存储（跨域共享），带时间戳防陈旧；业务页宿主要对得上才恢复，避免跑到别的媒体页面上。 */
   SVC.PEND_KEY = 'masr_pending_task_v1';
-  SVC.PEND_TTL_MS = 10 * 60 * 1000;
+  /* TTL 原来 10 分钟，只覆盖「跳转 + 页面渲染」这点时间。但这条链上有人工环节：
+   * 等邮箱验证码、等改密、等填表——真机 2026-11-06 就有一次停了半个多小时才回来。
+   * 过期 = 交接上下文被清空 = 下游拿不到参数只能回头读表，read-once 直接失效。
+   * 所以放宽到 60 分钟，并且每次读取都刷新一次时间戳（见 pendGet）：
+   * 只要这条链还在被使用，它就不会中途过期；停下来一小时以上才作废。 */
+  SVC.PEND_TTL_MS = 60 * 60 * 1000;
   SVC.pendSet = function (t, host) {
     try { GM_setValue(SVC.PEND_KEY, JSON.stringify({ t: t, host: host || '', ts: Date.now() })); } catch (e) {}
   };
@@ -2601,13 +2636,20 @@
       const o = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!o || !o.t) return null;
       if (Date.now() - Number(o.ts || 0) > SVC.PEND_TTL_MS) { SVC.pendClear(); return null; }
+      /* 用一次就续期一次：TTL 的语义是「闲置多久作废」，不是「签发多久作废」。
+       * 人工环节（验证码、改密、填表）之间常常隔十几分钟，不续期会在半路丢上下文。 */
+      try { o.ts = Date.now(); GM_setValue(SVC.PEND_KEY, JSON.stringify(o)); } catch (e) {}
       return o;
     } catch (e) { return null; }
   };
   SVC.pendClear = function () { try { GM_setValue(SVC.PEND_KEY, ''); } catch (e) {} };
-  /* 交接参数补位：下游场景的参数以 /task 取表值为准，只有「表里还是空的」才用交接带来的值补。
-   * 为什么需要：P2 建完成员才知道完整邮箱账号，而这条记录要等 P2 结束才回写表；
-   * P3 在这之前就打开了，此时 /task 读到的是空串。谁有值用谁，表里的永远优先。 */
+  /* 交接参数合并：**交接上下文优先，表只用来补缺口**（2026-11-06 反转，原来反着来）。
+   * 原来的规则是「表里的值永远优先，只有表里是空串才用交接值补」，理由是「表是权威」。
+   * 那个前提被异步回写打掉了：P2 建完成员时邮箱账号还在本地待写队列里，表里是空串/旧值，
+   * 而内存里是刚算出来的真值——此时「表优先」会稳定地选中错的那一份，而且看不出来。
+   * 所以现在的真值顺序：**交接上下文 > 表**；表只在上下文没有这个键时兜底。
+   * 冲突时必须留日志（只打字段名，不打值）：既要让人知道「用的不是表里的值」，
+   * 也不能把密码这类东西打进日志。 */
   SVC.pendMerge = function (task) {
     if (!task) return task;
     const pd = SVC.pendGet();
@@ -2615,18 +2657,53 @@
     if (!SVC.pendAccept(pd, location.host)) return task;
     const src = (pd.t && pd.t.params) || {};
     task.params = task.params || {};
-    let filled = 0;
+    const filled = [], over = [];
     Object.keys(src).forEach(function (k) {
+      const hasPend = !(src[k] === undefined || src[k] === null || String(src[k]) === '');
+      if (!hasPend) return;
       const cur = task.params[k];
-      if (cur === undefined || cur === null || String(cur) === '') { task.params[k] = src[k]; filled++; }
+      const hasTable = !(cur === undefined || cur === null || String(cur) === '');
+      if (!hasTable) { task.params[k] = src[k]; filled.push(k); return; }
+      if (String(cur) !== String(src[k])) { task.params[k] = src[k]; over.push(k); }
     });
-    if (filled) {
-      try {
+    try {
+      if (filled.length) {
         UI.appendLog({ t: Date.now(), level: 'info',
-          msg: '交接上下文补位 ' + filled + ' 个参数（表里尚为空）：' + Object.keys(src).join(',') });
-      } catch (e) {}
-    }
+          msg: '交接上下文补位 ' + filled.length + ' 个参数（表里为空）：' + filled.join(',') });
+      }
+      if (over.length) {
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '交接上下文覆盖 ' + over.length + ' 个参数（表里的值落后于本机流程，以本机为准）：' + over.join(',') });
+      }
+    } catch (e) {}
     return task;
+  };
+  /* 单次取数（read-once）：spec 在 trigger 上声明 params_from_pend 时，只要交接上下文里
+   * 参数是齐的（params_complete + script_id 对得上 + host 准入 + TTL 内），就直接用它开跑，
+   * **不再发 /task**。省掉的不只是一次网络往返，而是服务端那一次业务表回读（真机 4~8s）。
+   * 前置条件由校验器把关：只有 writeback.mode=none 的场景才允许声明——因为 /task 同时
+   * 签发回写票据（write_token），跳过它就没有票据，写表会用不了。 */
+  SVC.taskFromPend = function (hit) {
+    SVC.taskFromPend.lastReason = '';
+    if (!hit || hit.params_from_pend !== true) { SVC.taskFromPend.lastReason = 'not_declared'; return null; }
+    const pd = SVC.pendGet();
+    if (!pd || !pd.t) { SVC.taskFromPend.lastReason = 'no_pend_or_expired'; return null; }
+    if (String(pd.t.script_id || '') !== String(hit.script_id || '')) { SVC.taskFromPend.lastReason = 'script_mismatch'; return null; }
+    if (!SVC.pendAccept(pd, location.host)) { SVC.taskFromPend.lastReason = 'host_not_allowed'; return null; }
+    if (pd.t.params_complete !== true) { SVC.taskFromPend.lastReason = 'upstream_not_complete'; return null; }
+    const ps = (pd.t && pd.t.params) || {};
+    if (!Object.keys(ps).length) { SVC.taskFromPend.lastReason = 'empty_params'; return null; }
+    const out = {};
+    Object.keys(ps).forEach(function (k) { if (ps[k] !== undefined && ps[k] !== null && String(ps[k]) !== '') out[k] = ps[k]; });
+    if (!Object.keys(out).length) { SVC.taskFromPend.lastReason = 'all_blank'; return null; }
+    return {
+      record_id: String(pd.t.record_id || hit.record_id || ''),
+      script_id: hit.script_id,
+      params: out,
+      display: pd.t.display || null,
+      write_token: '',
+      from_pend: true,
+    };
   };
   /* 按 script_id 找场景声明（跨域判定要用它声明的 hosts） */
   SVC.sceneById = function (scriptId) {
@@ -3378,6 +3455,9 @@
       try { clearInterval(UI._warmTimer); } catch (e) {}
       SVC.stopWarm();
       if (btn) { btn.disabled = false; btn.textContent = old || '执行'; }
+      /* 本流程跑完再看一眼队列：后台回写若在跳转里被打断、而下一个页面又没及时注入，
+       * 这里是最后一次自动补救的机会（不成功也只是留在队列里等人工点重试）。 */
+      setTimeout(function () { autoFlushPending(); }, 1500);
     }
   };
 
@@ -3690,6 +3770,33 @@
     if (i >= 0) a[i] = item; else a.push(item);
     pwSave(a);
   }
+  /* 出队：后台回写成功后才调用。失败一律留在队列里——队列就是「还没进表」的唯一真值。 */
+  function pwDel(record_id) {
+    pwSave(pwList().filter(function (p) { return !p || p.record_id !== record_id; }));
+  }
+
+  /* 「这条记录的成功结果已经进表了」的跨页凭证。
+   * 为什么需要：回写改成异步后，成功可能发生在**上一张页面**（S5 入队 → S6 退出跳转 → 下个页面补写成功），
+   * 而 RunState 在交接时已被清空/冻结，收尾步骤再失败时拿不到 wbDone.written，
+   * 就会把表改写成「失败」——业务看到失败会重跑一条、多建一个成员（2026-11-06 真机踩过这个坑）。
+   * sessionStorage 在同标签页导航后仍然存活，正好覆盖「跳转之后才知道写成功了」这段窗口。 */
+  const WB_OK_KEY = 'masr_wb_ok_v1';
+  function wbOkList() {
+    try { return JSON.parse(sessionStorage.getItem(WB_OK_KEY) || '[]') || []; } catch (e) { return []; }
+  }
+  function markWbOk(record_id) {
+    if (!record_id) return;
+    try {
+      const a = wbOkList().filter(function (x) { return x && x.id !== record_id; });
+      a.push({ id: record_id, at: Date.now() });
+      sessionStorage.setItem(WB_OK_KEY, JSON.stringify(a.slice(-20)));
+    } catch (e) {}
+  }
+  function wbOkRecent(record_id, ms) {
+    if (!record_id) return false;
+    const t = Date.now() - (ms || 30 * 60 * 1000);
+    return wbOkList().some(function (x) { return x && x.id === record_id && (x.at || 0) >= t; });
+  }
 
   /* 回写：超时/断连自动再试一次（这类失败九成是连接抖了一下，重试就过；见 service fsFetch 注释） */
   async function writeWithRetry(payload, tries) {
@@ -3753,7 +3860,7 @@
 
   // 回写一条任务结果。返回 Promise<{written, msg}> —— 批量直接 await 这个真实结果，不用轮询猜状态。
   // 原有调用方（发起页轮询器 / 失败分支）不 await，行为与之前一致。
-  function pushTaskResult(st, ok, outputs, err) {
+  function pushTaskResult(st, ok, outputs, err, opt) {
     const task = st && st.task;
     if (!task || !task.record_id) return Promise.resolve({ written: false, msg: 'no-record' });
     const job = (async function () {
@@ -3773,6 +3880,17 @@
           });
           return { written: true, skipped: true, msg: 'pending-ok' };
         }
+        /* 异步化之后还有一个更晚的窗口：成功结果**已经**被后台写进表、队列也清了，
+         * 之后收尾步骤才失败。这时队列里查不到，但 sessionStorage 里留着成功凭证。
+         * 没有这一条，异步回写会把「不覆盖成功」的保护撕开一个洞。 */
+        if (wbOkRecent(task.record_id)) {
+          UI.appendLog({
+            t: Date.now(), level: 'warn',
+            msg: '这条记录的成功结果已经写进表了（本页或上一页后台写成功），本次失败不覆盖它：' +
+              '表里保留成功状态，失败原因只在面板上提示，请人工确认这一处是否需要处理',
+          });
+          return { written: true, skipped: true, msg: 'ok-already-written' };
+        }
       }
       // v0.5.0：不再拼任何业务字段名。只上报「成功/失败 + outputs」，
       // 写什么列、写什么值，由服务端按该 spec 的 scene.writeback 渲染（Runner 零场景知识）。
@@ -3789,6 +3907,49 @@
       if (!ok) {
         payload.error_type = ENGINE.failReason(err);
         payload.error_message = (err && (err.message || err.code)) || '';
+      }
+      /* ── 后台回写（opt.background）：先落盘、再发请求、不等结果 ──────────────
+       * 为什么要有这条路径：S5 交接准备必须写表（下一段流程要读），而一次回写要串行打三次
+       * 飞书（读 spec → 复验记录 → PUT），撞上 1254607 重试能拖 40~50s（真机 48.9s）。
+       * 这段等待纯粹是「等表写好」，页面本身已经没事干了——退出登录、交接下一段都不依赖它。
+       * 所以：结果先写进本机队列（跨页/断网/标签被关都不丢），再异步发；主线立刻往下走。
+       * 请求若被页面跳转打断，下一个页面启动时 autoFlushPending 会自己补写。 */
+      if (opt && opt.background) {
+        payload._expect_fields = wbDeclared(st, ok) || undefined;
+        pwAdd(payload);          // 先落盘：这一步成功了，后面无论怎么断都不会丢
+        UI.appendLog({ t: Date.now(), level: 'info',
+          msg: '结果已存入本机队列，后台开始回写（不阻塞流程，页面继续往下走）' });
+        const bgJob = (async function () {
+          const t0 = Date.now();
+          try {
+            const wr = await writeWithRetry(payload);
+            pwDel(task.record_id);        // 真写成功才出队
+            markWbOk(task.record_id);
+            const wrote = !wr || !Array.isArray(wr.written) || wr.written.length > 0;
+            UI.appendLog({
+              t: Date.now(), level: 'ok',
+              msg: (wrote ? '✅ 后台回写完成（上报状态=' + (ok ? '成功' : '失败 ' + payload.error_type) + '）'
+                : '本场景该分支声明不回写（业务表无对应字段），已跳过写入') +
+                '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）',
+            });
+            warnMissingFields(wbDeclared(st, ok), (wr && wr.written) || [], '回写');
+            if (!UI._running) UI.renderTasks();
+            return { written: true, skipped: !wrote, background: true, msg: '' };
+          } catch (e) {
+            const msg = String((e && e.message) || e);
+            UI.appendLog({
+              t: Date.now(), level: 'fatal',
+              msg: '⚠️ 后台回写失败：' + msg + ' —— 结果仍在本机队列（不会丢），到「任务」行点「重试回写」补写',
+            });
+            if (!UI._running) UI.renderTasks();
+            updResultWarn(pwList().length);
+            return { written: false, background: true, msg: msg };
+          }
+        })();
+        if (!UI._writeJobs) UI._writeJobs = {};
+        UI._writeJobs[task.record_id] = bgJob;
+        /* 对外语义仍是「这条已经处理了、收尾别再发一次」；是否真写成功由 background/queued 表达 */
+        return Promise.resolve({ written: true, queued: true, background: true, job: bgJob, msg: '' });
       }
       const t0 = Date.now();
       UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
@@ -3876,6 +4037,45 @@
     UI.appendLog({ t: Date.now(), level: okN ? 'ok' : 'warn', msg: '重试完成：成功 ' + okN + ' 条，剩余 ' + left.length + ' 条' });
     UI.renderTasks();
   };
+
+  /* 启动时自动补写队列：上一张页面把结果塞进队列就跳走了（S5 入队 → S6 退出 → 整页跳转），
+   * 在途请求会被导航打断，队列里就留一条。这件事不该让人知道——下次注入时自己补上就行。
+   * 为什么只补 30 分钟内的：更早的多半是当时后端就没起来，硬撞只会一条条超时，
+   * 那种情况留给人点「重试回写」（有人看着，能判断是不是服务没开）。 */
+  let _autoFlush = false;
+  async function autoFlushPending() {
+    /* 不因为「页面正在跑流程」就跳过：补写走的是后台 HTTP，不碰 DOM、不参与步骤编排，
+     * 和下一段流程可以并行。反倒是跳过之后没人再触发，队列会一直躺到下次页面加载。 */
+    if (_autoFlush || !SVC.base()) return;
+    const all = pwList().filter(function (p) {
+      return p && p.record_id && (Date.now() - (p.queued_at || 0)) < 30 * 60 * 1000;
+    });
+    if (!all.length) return;
+    _autoFlush = true;
+    UI.appendLog({ t: Date.now(), level: 'info',
+      msg: '发现 ' + all.length + ' 条结果还没进表（上一次被页面跳转打断了），后台自动补写…' });
+    for (const p of all) {
+      const body = Object.assign({}, p);
+      const expect = body._expect_fields || null;
+      delete body.queued_at;
+      delete body._expect_fields;          // 只在本地产物里，不往服务端发
+      try {
+        const wr = await writeWithRetry(body, 1);
+        pwDel(body.record_id);
+        markWbOk(body.record_id);
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 自动补写成功：' + body.record_id });
+        warnMissingFields(expect, (wr && wr.written) || [], '自动补写');
+      } catch (e) {
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '自动补写没成功（' + String((e && e.message) || e) + '）：结果还在本机队列，' +
+            '稍后到「任务」行点「重试回写」补写' });
+        break;   // 服务多半不通，别一条条硬撞
+      }
+    }
+    _autoFlush = false;
+    updResultWarn(pwList().length);
+    if (!UI._running) UI.renderTasks();
+  }
 
   /* 参数取值：只认服务端按 spec.scene.task_source.params 映射好的 params。
    * v0.5.0 删掉了「参数名 → 账户ID」那类业务特判——参数名映射属于场景，不该写在引擎里。 */
@@ -4347,7 +4547,11 @@
         // 数据源参数（子客ID 等）：人工输入框已移除，必须由任务行带入。
         // 没有任务上下文（standalone 粘贴 spec 直接点执行）时不再弹「必填参数」让人手填，而是提示走任务。
         if (p.required) {
-          alert('「' + (p.label || p.name) + '」需从任务带入：请先在「任务」里点一条待办的「执行」或「批量执行」，不要直接 standalone 跑这个 spec。');
+          /* 话要说准：这一支只说明「任务里没带这个字段」，最常见的原因是**业务表那一列是空的**
+           * （read-once 之后这条链只查一次表，缺项在 P2 就该拦住，而不是等到下游才发现）。
+           * 原来只说「请点一条待办执行」，人会以为自己点错了地方，实际是表里少填了一格。 */
+          alert('「' + (p.label || p.name) + '」没有取到值：任务参数里缺这一项——多半是业务表里这一列是空的。'
+            + '请先在表里补全再重跑（本条记录已按设计拦下，没有做任何操作）。');
           return;
         }
       }
@@ -4510,7 +4714,8 @@
           if (role === 'origin') {
             // 本页直接展示过，轮询器不再重复播报；但「失败」同样要回写（错误类型要进飞书表）
             stc.final.consumed = true;
-            const wbAlready = !!(stc.wbDone && stc.wbDone.written);
+            const wbAlready = !!(stc.wbDone && stc.wbDone.written) ||
+              wbOkRecent(stc.task && stc.task.record_id);
             if (wbAlready) {
               /* 业务结果已经在交接准备阶段写成功了（例：「开户状态=管理式导入完成」），
                * 这次失败的只是交接之后的收尾步骤（例：退出登录没点上）。
@@ -4676,8 +4881,14 @@
     const autoRun = String(t.on_match || 'fill') === 'fill_and_run';
     const head = fromUrl
       ? '已从页面地址读取参数：<b>' + trigEsc(view.name) + '</b>' + (t.record_id ? ' · ' + trigEsc(t.record_id) : '') + '—— 正在自动填充表单'
-      : '已按页面记录取数：<b>' + trigEsc(view.name) + '</b> · ' +
-        trigEsc(dv || t.record_id) + '（' + trigEsc(t.record_id) + '）—— 参数已填充，确认后点「运行」';
+      : (t.from_pend
+        /* read-once：参数来自上一段流程的交接上下文，本页**没有**查业务表。
+         * 卡面必须说实话——写「已按页面记录取数」会让人以为又读了一次表，
+         * 真去核对日志时就对不上（这行字是我唯一能看到「走的哪条路」的地方）。 */
+        ? '参数取自上游交接上下文（未查业务表）：<b>' + trigEsc(view.name) + '</b> · ' +
+          trigEsc(dv || t.record_id) + '（' + trigEsc(t.record_id) + '）—— 参数已填充，确认后点「运行」'
+        : '已按页面记录取数：<b>' + trigEsc(view.name) + '</b> · ' +
+          trigEsc(dv || t.record_id) + '（' + trigEsc(t.record_id) + '）—— 参数已填充，确认后点「运行」');
     box.innerHTML =
       '<div style="' + bar + 'background:#f0fff4;border:1px solid #b7eb8f">' +
         '<div style="font-size:11px;color:#1a7f45">' + head + '</div>' +
@@ -4749,7 +4960,9 @@
       .map(function (p) { return p.name; });
     UI.appendLog({
       t: Date.now(), level: 'ok',
-      msg: (task.from_url ? '已从页面地址读取参数' : '已按页面记录取数 ' + task.record_id) + '（' + s.spec_id + ' v' + s.version +
+      msg: (task.from_url ? '已从页面地址读取参数'
+        : (task.from_pend ? '参数取自上游交接上下文（本页未查业务表） ' + task.record_id
+          : '已按页面记录取数 ' + task.record_id)) + '（' + s.spec_id + ' v' + s.version +
         (cached ? '｜本地缓存，取 spec 用时 ' + (Date.now() - t0) + 'ms' : '｜联网取 spec 用时 ' + (Date.now() - t0) + 'ms') + '）' +
         (keys.length ? '；参数 ' + keys.map(function (k) {
           if (secretNames.indexOf(k) >= 0) return k + '=' + ENGINE.maskValue(ps[k]) + '（已打码）';
@@ -4854,13 +5067,28 @@
           }
           return;
         }
-        UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' + (hit.record_id_from_pend ? '｜记录来自上游交接（本页地址不含 recordId）' : '') });
-        /* 这一枪要服务端回读业务表（真机 4~8s，冷表更久），是「命中→开跑」这段空档的主要成分。
-         * 只在慢的时候报一行，快的不打——否则每个页面都多一行噪音。 */
-        const tRec = Date.now();
-        const task = SVC.pendMerge(await SVC.record(hit.record_id, hit.script_id));
-        const recMs = Date.now() - tRec;
-        if (recMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '取数 ' + (recMs / 1000).toFixed(1) + 's（/task 往返：服务端回读业务表）' });
+        /* read-once 优先：交接上下文齐了就直接开跑，省掉「服务端回读业务表」这一跳。
+         * 回退是隐式的——上下文缺参数/过期/不是给本场景的，就照旧查表一次，
+         * 并且打一行说明为什么回退，避免「说好只读一次却读两次」变成查不出来的谜。 */
+        let task = SVC.taskFromPend(hit);
+        if (task) {
+          UI.appendLog({ t: Date.now(), level: 'info',
+            msg: '参数取自上游交接上下文（按 read-once 约定，本页不查业务表）：' + Object.keys(task.params).join(',') });
+          task.on_match = hit.on_match;
+        } else {
+          if (hit.params_from_pend === true) {
+            UI.appendLog({ t: Date.now(), level: 'warn',
+              msg: '本场景声明「参数取自交接上下文」，但上下文不可用（' + (SVC.taskFromPend.lastReason || 'unknown') + '）→ 回退查表一次' });
+          }
+          UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' + (hit.record_id_from_pend ? '｜记录来自上游交接（本页地址不含 recordId）' : '') });
+          /* 这一枪要服务端回读业务表（真机 4~8s，冷表更久），是「命中→开跑」这段空档的主要成分。
+           * 只在慢的时候报一行，快的不打——否则每个页面都多一行噪音。 */
+          const tRec = Date.now();
+          task = SVC.pendMerge(await SVC.record(hit.record_id, hit.script_id));
+          const recMs = Date.now() - tRec;
+          if (recMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '取数 ' + (recMs / 1000).toFixed(1) + 's（/task 往返：服务端回读业务表）' });
+          task.on_match = hit.on_match;
+        }
         task.on_match = hit.on_match;
         // 中转页：当前页只是跳板，取到数就把这个标签页「原地替换」成业务页。
         // 用 replace 而不是 open+close：脚本无权关闭不是自己打开的标签页，close 会被浏览器拒绝；
@@ -5020,6 +5248,10 @@
         });
       }
     }
+    /* 队列里有货 → 上面那条提示照旧出现（人需要知道表里还没写），但别停在这儿等人工：
+     * 后台自己补写一遍。延迟 3s 把首次渲染/取 spec 的机会让出来；补不成功也只是留在队列里，
+     * 顶多回到「点重试回写」的老路，不会更差。 */
+    if (pw.length) setTimeout(function () { autoFlushPending(); }, 3000);
     // 自动恢复上次加载的 spec 与参数：刷新、跳转落地、新标签页都不用重新粘贴
     try {
       const lastSpec = GM_getValue(GV.LAST_SPEC_KEY, '');
@@ -5119,6 +5351,8 @@
        * update-source-smoke。只读引用，生产路径不经过这里。 */
       checkUpdate: UI.checkUpdate,
       newUrl: function () { return UI._newUrl || ''; },
+      /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
+      autoFlushPending: autoFlushPending, pwDel: pwDel, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
     };
   } catch (e) {
     window.__MASR_TEST_WB__ = {
@@ -5126,6 +5360,8 @@
       startPaceWatch: startPaceWatch,
       checkUpdate: UI.checkUpdate,
       newUrl: function () { return UI._newUrl || ''; },
+      /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
+      autoFlushPending: autoFlushPending, pwDel: pwDel, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
     };
   }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
