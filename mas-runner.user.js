@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.8
+// @version      0.9.9
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -171,6 +171,21 @@
  *     错误，绝不用它做比较；②confirm_gate 判定前先轮询等回填（when.ready_ms，缺省 3000），
  *     等不到才按「判不出来」E_GATE 终止。日志会写清「等待回填 → 已就绪」或「等待超时」，
  *     不静默。
+ *   - v0.9.9：修「交接跳走后，残留续跑状态把下一个场景劫持」+ 回写可靠性（2026-11-06 真机）。
+ *     现象：P2 建完成员 → 退出 → 同标签进邀请页 → P3 刚起来就重放了 P2 的 S1~S6，
+ *     在注册页上拿 S6 的 expect（等 loginAuth.html）去校验，报「退出没点上」E_UI 终止，
+ *     并把表回写成「失败」；日志里还同时出现「回写失败」和「✅ 已回写飞书：失败」。
+ *     根因三条：①same-tab 交接只 RunState.clear()，紧接着自己那条 log() 又把闭包里的旧状态
+ *     原样写回（phase 仍是 await_nav_check），新页面读到它就当「还要续跑」；
+ *     ②续跑判定只看 phase，不看本页是不是这一步的落点，于是 P3 拿着 P2 的 specJson 跑；
+ *     ③resumeAfterNavigate 同样 clear 之后继续 log()，继续复活。
+ *     收口：RunState 加 freeze/thaw（冻结后一切 set 无效），交接时冻结再清；续跑前用本步的
+ *     expect.url_contains 校验落点，对不上就清掉并按本页场景正常执行；落地成功改成
+ *     phase='running'（不再 clear），保住 task/runId 供收尾回写。
+ *     回写侧：飞书 1254607「Data not ready」按瞬时错误重试两次（S5 就是被它拖成「表里没写」）；
+ *     待写队列里已有同记录的 ok 时，后续 fail 不覆盖（否则业务看到失败会重跑、多建一个成员）；
+ *     队列按 record_id 去重；启动提示带上记录与上报状态并去重；「✅ 已回写飞书：失败」改成
+ *     「✅ 已回写飞书（请求成功，上报状态=失败 E_UI）」，不再让人误读成回写失败。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -1076,7 +1091,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.8',
+    RUNNER_VERSION: '0.9.9',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1096,9 +1111,18 @@
 
   // ---------- 运行态存取（GM 存储跨域共享，导航后由新页面恢复） ----------
   const RunState = {
+    /* 冻结位：同标签交接开始后，本页剩下的收尾代码（log 闭包、final 广播、失败回写）不许再把
+     * 运行态写回去。没有它就会出现「刚 clear 完、下一条 log 又把旧状态原样复活」——
+     * 0.9.8 真机就是被这条幽灵状态带到新页面去续跑的（见 v0.9.9 注释）。 */
+    _frozen: false,
     get() { try { return JSON.parse(GM_getValue(GV.RUN_KEY, 'null')); } catch (e) { return null; } },
-    set(st) { GM_setValue(GV.RUN_KEY, JSON.stringify(st)); },
+    set(st) {
+      if (this._frozen) return;
+      GM_setValue(GV.RUN_KEY, JSON.stringify(st));
+    },
     clear() { GM_deleteValue(GV.RUN_KEY); },
+    freeze() { this._frozen = true; },
+    thaw() { this._frozen = false; },
   };
   /* 收摊信号：一次流程结束只广播一次，所有「脚本打开的标签页」看到它都自毁。
    * 为什么单独存而不是复用 RunState.final：发起页收到结果后会把 final.consumed 置 true 并很快清掉运行态，
@@ -1693,6 +1717,16 @@
          * 换成独立标记 wbDone，由 doRun 收尾时合并进 final。 */
         stw.wbDone = { ok: true, outputs: outs, at: Date.now(), specId: spec.spec_id, written: !!(wr && wr.written) };
         RunState.set(stw);
+        /* 写失败不阻断交接（随行参数兜着），但**必须说清后果**：真机上这里只留了一条
+         * 「已存本地待写队列」，人以为流程照常完成了，实际表里还是旧状态、没有邮箱账号。
+         * 后一段流程若超过 10 分钟才跑，交接上下文已过期，它就拿不到账号只能失败。 */
+        if (!stw.wbDone.written) {
+          log({
+            t: Date.now(), level: 'warn',
+            msg: step.id + ' 回写没成功（已存本地待写队列）：表里此刻仍是旧状态，邮箱账号等产物还没进表；' +
+              '本次交接靠随行参数继续，但**跑完请点「重试回写」补写**，否则下一条记录/超时后再来会取不到这些值',
+          });
+        }
       }
       SVC.pendSet({ record_id: rid, script_id: nextId, params: cp, handoff: true }, host);
       const hdMode = handoff.defer === true ? 'defer' : (step.open === 'same-tab' ? 'same-tab' : 'new-tab');
@@ -1717,6 +1751,10 @@
        * 若留下 phase=await_nav_check，本场景脚本在新页面注入后会以为自己还要续跑，
        * 跟下一个场景抢同一个页面。用 replace 而非 href：不给人留一条「后退回已退出页面」的历史。 */
       if (hdMode === 'same-tab') {
+        /* 冻结 + 清空：本页马上被替换成下一段流程的起点，之后任何一次 log()/final 广播都不许
+         * 再把运行态写回来。0.9.8 只 clear 没冻结，S7 自己那条日志随即把旧的 await_nav_check
+         * 复活，新页面就拿它去续跑 P2 的 S6（真机 16:07 的整段混乱都出自这里）。 */
+        RunState.freeze();
         RunState.clear();
         log({ t: Date.now(), level: 'info', msg: step.id + ' ⇢ 交接给「' + nextId + '」（记录 ' + rid +
           '，随行参数 ' + (Object.keys(cp).join(',') || '无') + '），本页跳转 ' + maskUrl(url) + '（本流程结束）' });
@@ -1862,7 +1900,14 @@
       assertResults: [{ assert: 'expect(url_contains+cookie_exists)', pass: true, detail: '落地校验通过' }],
       extract: {},
     });
-    RunState.clear();
+    /* 不能在这里 RunState.clear()：后面每一条 log() 都会把闭包里这份状态原样写回（RunState.set(st)），
+     * 等于「刚清掉又活过来」，而且 phase 仍然是 await_nav_check —— 下一个页面会把它当成
+     * 「还要续跑」。0.9.9 改成把阶段推进到 running：既不会再被当落点续跑，又保住
+     * task/runId/stepLogs 供本次收尾正常回写（清空会让收尾拿到空对象，写表直接丢掉）。 */
+    st.phase = 'running';
+    delete st.navExpect;
+    delete st.navStepId;
+    RunState.set(st);
     // 继续执行后续步骤（抽取产物与日志从运行态恢复）
     return continueFrom(spec, params, stepIdx + 1, log, st.extracted || {}, st.stepLogs || []);
   }
@@ -3534,7 +3579,11 @@
   function pwSave(arr) { try { GM_setValue(PENDW_KEY, JSON.stringify(arr.slice(-100))); } catch (e) {} } // 上限 100：批量一次 50 条，留 20 会丢掉最早的结果
   function pwAdd(payload) {
     const a = pwList();
-    a.push(Object.assign({}, payload, { queued_at: Date.now() }));
+    /* 一条记录只留一条待写：失败重跑会越堆越多，而「重试回写」是按顺序逐条 PUT 的，
+     * 同一条记录的多份 payload 会互相覆盖，最后落表的可能反而是早就作废的那份。 */
+    const i = a.findIndex(function (p) { return p && p.record_id === payload.record_id; });
+    const item = Object.assign({}, payload, { queued_at: Date.now() });
+    if (i >= 0) a[i] = item; else a.push(item);
     pwSave(a);
   }
 
@@ -3542,14 +3591,28 @@
   async function writeWithRetry(payload, tries) {
     tries = tries || 2;
     let lastErr = null;
+    let notReadyTries = 0;
     for (let i = 0; i < tries; i++) {
       try { return await SVC.writeResult(payload); }
       catch (e) {
         lastErr = e;
-        const transient = /E_FS_TIMEOUT|E_FS_NET|E_SVC_TIMEOUT|E_SVC_NET/.test(String((e && e.message) || e));
+        const s = String((e && e.message) || e);
+        /* 飞书 1254607「Data not ready, please try again later」是**瞬时**的：刚建/刚改过的
+         * 记录索引还没就绪，隔一两秒再 PUT 基本就过。2026-11-06 真机 S5 就撞上它：整条流程
+         * 带着「表里没写」继续往下走，P3 只能靠交接随行参数兜，表里一直是旧状态。
+         * 这类失败单独给两次机会（1s/2s），且不占用「换连接」的次数。 */
+        if (/1254607|Data not ready/i.test(s) && notReadyTries < 2) {
+          notReadyTries++;
+          UI.appendLog({ t: Date.now(), level: 'warn',
+            msg: '飞书返回 1254607（Data not ready，索引未就绪），' + notReadyTries + ' 秒后自动重试…' });
+          await sleep(notReadyTries * 1000);
+          i--;                        // 不消耗本轮尝试次数，由 notReadyTries 单独封顶
+          continue;
+        }
+        const transient = /E_FS_TIMEOUT|E_FS_NET|E_SVC_TIMEOUT|E_SVC_NET/.test(s);
         if (i === tries - 1 || !transient) throw e;
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '回写超时/断连，1 秒后自动重试一次…' });
-        await new Promise(function (r) { setTimeout(r, 1000); });
+        await sleep(1000);
       }
     }
     throw lastErr;
@@ -3561,6 +3624,23 @@
     const task = st && st.task;
     if (!task || !task.record_id) return Promise.resolve({ written: false, msg: 'no-record' });
     const job = (async function () {
+      /* 失败结果不许盖掉「还没补写成功的成功结果」。
+       * 真机 2026-11-06：S5 的「管理式导入完成」因 1254607 进了待写队列，几分钟后 P3 的
+       * 收尾步骤失败，一条 fail 把同一条记录写成了「失败」——业务看到失败会以为成员没建成，
+       * 于是重跑一条、多建一个成员。队列里已有同记录的 ok，就以 ok 为准：这次 fail 不写。 */
+      if (!ok) {
+        const pendingOk = pwList().filter(function (p) {
+          return p && p.record_id === task.record_id && p.status === 'ok';
+        });
+        if (pendingOk.length) {
+          UI.appendLog({
+            t: Date.now(), level: 'warn',
+            msg: '这条记录的成功结果还在本地待写队列里（未补写成功），本次失败不覆盖它：' +
+              '请点「重试回写」把成功状态补进表，再人工确认这次失败是否需要处理',
+          });
+          return { written: true, skipped: true, msg: 'pending-ok' };
+        }
+      }
       // v0.5.0：不再拼任何业务字段名。只上报「成功/失败 + outputs」，
       // 写什么列、写什么值，由服务端按该 spec 的 scene.writeback 渲染（Runner 零场景知识）。
       const payload = {
@@ -3587,7 +3667,10 @@
         const wrote = !wr || !Array.isArray(wr.written) || wr.written.length > 0;
         UI.appendLog({
           t: Date.now(), level: 'ok',
-          msg: (wrote ? '✅ 已回写飞书：' + (ok ? '成功' : '失败（' + payload.error_type + '）')
+          /* 文案歧义修正：原先写「✅ 已回写飞书：失败」——「失败」到底是「回写失败」还是
+           * 「回写的是一次失败结果」，读的人分不清（2026-11-06 用户当场提出）。
+           * 现在把「请求成功」和「上报的状态」拆成两截说。 */
+          msg: (wrote ? '✅ 已回写飞书（请求成功，上报状态=' + (ok ? '成功' : '失败 ' + payload.error_type) + '）'
             : '本场景该分支声明不回写（业务表无对应字段），已跳过写入') +
             '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
         });
@@ -4042,9 +4125,29 @@
 
   UI.doRun = async function (opts) {
     opts = opts || {};
+    // 新一次执行：解除上一次「同标签交接」留下的写冻结（跳转失败、页面没换掉时才会用到）
+    RunState.thaw();
     // 续跑优先：落地页上 spec/参数从运行态恢复，不要求本页先粘贴 spec
     const st0 = RunState.get();
-    const resuming = !!(st0 && st0.phase === 'await_nav_check');
+    let resuming = !!(st0 && st0.phase === 'await_nav_check');
+    /* 续跑只在本页**确实是它的落点**时成立。
+     * 反例（2026-11-06 真机 16:07）：P2 的 S7 用同标签跳到邀请链接后，运行态没清干净，
+     * 残留是「等 loginAuth.html」；P3 在注册页启动时读到了它，于是丢下自己的 4 步，
+     * 拿 P2 的 specJson 从 S6 续起 —— 在注册页上找不到「退出」菜单，直接 E_UI 终止，
+     * 还把表写成了失败。判据就是本步自己声明的落地 URL：对不上就不叫续跑，叫别人的残影。
+     * 没有 url_contains 的（只声明 cookie_exists）无法判断，保持原行为不拦。 */
+    if (resuming) {
+      const wantUrl = String((st0.navExpect && st0.navExpect.url_contains) || '');
+      if (wantUrl && String(location.href).indexOf(wantUrl) < 0) {
+        UI.appendLog({
+          t: Date.now(), level: 'warn',
+          msg: '忽略一条不属于本页的续跑状态（' + (st0.navStepId || '?') + ' 在等 "' + wantUrl +
+            '"，当前页不是它的落点）：已清除，按本页场景正常执行',
+        });
+        RunState.clear();
+        resuming = false;
+      }
+    }
     let spec, params;
     if (resuming) {
       try { spec = JSON.parse(st0.specJson); }
@@ -4101,11 +4204,16 @@
         if (params[p.name] !== undefined) pubParams[p.name] = params[p.name];
       });
       if (secretNames.length) {
-        const hasNav = (spec.steps || []).some(function (s) { return s.mode === 'navigate'; });
-        if (hasNav) {
+        /* 只在「跳转**之后**还要用凭据」时才警告。原来的判据是「有 navigate 且有凭据」，
+         * 对 P2 0.5.0 这种「先填密码、最后一步才跳走」的 spec 完全是误报——
+         * 真机日志里它挂在正常流程中间，看着像出了问题，实际什么都没发生。 */
+        const navIdx = (spec.steps || []).findIndex(function (s) { return s.mode === 'navigate'; });
+        const tail = navIdx >= 0 ? JSON.stringify((spec.steps || []).slice(navIdx + 1)) : '';
+        const usedAfterNav = secretNames.filter(function (n) { return tail.indexOf('{{' + n + '}}') >= 0; });
+        if (usedAfterNav.length) {
           UI.appendLog({
             t: Date.now(), level: 'warn',
-            msg: '⚠️ 本 spec 同时含 navigate 与凭据参数：跨页后会丢弃凭据（安全策略），落地页需要能自行取得凭据，否则该步会失败',
+            msg: '⚠️ 跳转之后的步骤还要用凭据 ' + usedAfterNav.join(',') + '：跨页后会丢弃凭据（安全策略），落地页需自行从 /task 取，否则那些步骤会因值为空停下',
           });
         }
       }
@@ -4678,9 +4786,13 @@
           if (pend.t.handoff === true) {
             /* 交接上下文不动手：它只是「上一条流水线把哪条记录交给了本场景」的凭据，
              * 参数要由本页场景自己按 record_id 去 /task 取（凭据不下发到本地存储）。
-             * 这里点明一句，否则新标签页打开后一片空白，看不出到底接没接上。 */
-            UI.appendLog({ t: Date.now(), level: 'info', msg: '已接管上游交接的任务上下文（记录 ' +
-              pend.t.record_id + ' → 场景 ' + pend.t.script_id + '），由本页场景认领后取数' });
+             * 这里点明一句，否则新标签页打开后一片空白，看不出到底接没接上。
+             * 同一页会 mountAll 多次（路由变化/刷新），同一份交接只提示一次，别刷屏。 */
+            if (UI._pendLoggedFor !== pend.t.record_id) {
+              UI._pendLoggedFor = pend.t.record_id;
+              UI.appendLog({ t: Date.now(), level: 'info', msg: '已接管上游交接的任务上下文（记录 ' +
+                pend.t.record_id + ' → 场景 ' + pend.t.script_id + '），由本页场景认领后取数' });
+            }
           } else {
             (async function () {
               try { await UI.loadTriggeredTask(pend.t); SVC.pendClear(); }
@@ -4710,7 +4822,21 @@
     // 有没写进飞书的结果：提示一次，按钮在「任务」行
     const pw = pwList();
     if (pw.length) {
-      UI.appendLog({ t: Date.now(), level: 'warn', msg: '有 ' + pw.length + ' 条结果还没写进飞书（已存本地）：服务恢复后点「重试回写」' });
+      /* 同一份队列会在每次页面加载/每次注入时都提醒一遍（真机上 8 秒里刷了 4 次，全是同一件事）。
+       * 用「队列签名」去重：内容没变就只说一次，内容变了（新增/补写成功）才再说。
+       * 同时把记录和上报状态写清楚——只说「有 1 条」没法判断表里现在是什么状态。 */
+      const sig = pw.map(function (p) { return p.record_id + ':' + p.status + ':' + (p.queued_at || 0); }).join(',');
+      let seenSig = '';
+      try { seenSig = sessionStorage.getItem('masrPwWarnSig') || ''; } catch (e) {}
+      if (sig !== seenSig) {
+        try { sessionStorage.setItem('masrPwWarnSig', sig); } catch (e) {}
+        UI.appendLog({
+          t: Date.now(), level: 'warn',
+          msg: '有 ' + pw.length + ' 条结果还没写进飞书（已存本地）：' +
+            pw.map(function (p) { return p.record_id + '（上报状态=' + p.status + '）'; }).join('、') +
+            '——表里此刻还是旧状态，点「重试回写」补写后才算完',
+        });
+      }
     }
     // 自动恢复上次加载的 spec 与参数：刷新、跳转落地、新标签页都不用重新粘贴
     try {
@@ -4798,6 +4924,16 @@
 
   // 暴露引擎给测试与控制台（不影响页面）
   try { (unsafeWindow || window).__MASR_TEST__ = ENGINE; } catch (e) { window.__MASR_TEST__ = ENGINE; }
+  /* 回写与运行态的测试钩子：待写队列去重、「队列里有 ok 就不许写 fail」、冻结后不许复活，
+   * 这几条都只能从内部触发，但从 UI 端又很难稳定构造。它们每一个出错都意味着
+   * 「表里状态错」或「多建一个成员」，所以明确暴露出来给单测钉住（生产路径不会调用）。 */
+  try {
+    (unsafeWindow || window).__MASR_TEST_WB__ = {
+      pushTaskResult: pushTaskResult, pwList: pwList, pwSave: pwSave, RunState: RunState,
+    };
+  } catch (e) {
+    window.__MASR_TEST_WB__ = { pushTaskResult: pushTaskResult, pwList: pwList, pwSave: pwSave, RunState: RunState };
+  }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
   try { (unsafeWindow || window).__MASR_TEST_SVC__ = SVC; } catch (e) { window.__MASR_TEST_SVC__ = SVC; }
 
