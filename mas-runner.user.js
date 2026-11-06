@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.7
+// @version      0.9.8
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -161,6 +161,16 @@
  *     → 记一笔（时间 + 当时的 recordId + 站点主域）。下一次登录页认领时抑制一次（消费即作废）。
  *     抑制范围刻意收窄：换一条记录、换站点、超过 3 分钟、spec 写 suppress_after_logout_ms:0
  *     都不抑制——不能因为一次退出把人挡在外面。抑制时会写日志说明，不是静默跳过。
+ *   - v0.9.8：满员闸门不再拿「零占位」下判断（2026-11-06 真机误报）。
+ *     现象：组织 140/200 没满，导入管理式成员却在 S1 弹出「这个组织已经满员」，日志写
+ *     「左=0 >= 右=0 → 命中」。
+ *     根因在业务页而不在 spec：EAM 管理台 home 页把两个数字都过了一遍 `zeroFilter = t || 0`
+ *     （home-legacy.js），点进组织那一瞬间数据还没回来，DOM literally 是「成员人数0」和
+ *     「成员人数上限0」。而 0 >= 0 恒真 → 任何组织都被判成满员。
+ *     两处收口：①gateWhen 里带 ref_xpath 的比对，右值（上限）<= 0 一律当「数据未就绪」返回可重试
+ *     错误，绝不用它做比较；②confirm_gate 判定前先轮询等回填（when.ready_ms，缺省 3000），
+ *     等不到才按「判不出来」E_GATE 终止。日志会写清「等待回填 → 已就绪」或「等待超时」，
+ *     不静默。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -493,21 +503,30 @@
     if (legal.indexOf(op) < 0) return { error: 'op 非法: ' + op + '（只允许 ' + legal.join(' ') + '）' };
     const num = (xpRaw, patRaw, label) => {
       const xp = rp(xpRaw);
-      const el = ENGINE.uiFindByXPath(xp);
-      if (!el) return { error: label + ' 元素未找到: ' + xp };
+      let el = null;
+      try { el = ENGINE.uiFindByXPath(xp); } catch (e) { return { error: label + ' 选择器无效: ' + xp + '（' + e.message + '）' }; }
+      if (!el) return { error: label + ' 元素未找到: ' + xp, retryable: true };
       const txt = ENGINE.uiText(el);
       const pat = patRaw ? rp(patRaw) : '(\\d+)';
       let m = null;
       try { m = new RegExp(pat).exec(txt); } catch (e) { return { error: label + ' 正则非法: ' + pat }; }
-      if (!m) return { error: label + ' 文本里取不到数字（pattern=' + pat + '，实际「' + String(txt).slice(0, 60) + '」）' };
+      if (!m) return { error: label + ' 文本里取不到数字（pattern=' + pat + '，实际「' + String(txt).slice(0, 60) + '」）', retryable: true };
       const v = Number(m[1] === undefined ? m[0] : m[1]);
-      if (!isFinite(v)) return { error: label + ' 取到的不是数字: ' + (m[1] === undefined ? m[0] : m[1]) };
+      if (!isFinite(v)) return { error: label + ' 取到的不是数字: ' + (m[1] === undefined ? m[0] : m[1]), retryable: true };
       return { value: v, text: txt };
     };
     const left = num(when.xpath, when.pattern, '左值');
     if (left.error) return left;
     const right = num(when.ref_xpath, when.ref_pattern, '右值');
     if (right.error) return right;
+    /* 右值（上限）读到 0 = 页面数字还没回填，不是「上限真的是 0」。
+     * 业务页把未就绪的数字渲染成 0（EAM 管理台 home-legacy.js: zeroFilter = t || 0），
+     * 而 0 >= 0 恒真——2026-11-06 真机：140/200 的组织被判「已满员」并停了下来。
+     * 标记 retryable，交给 confirm_gate 先等回填；等不到就按「判不出来」终止，
+     * 绝不拿 0 参加比较。 */
+    if (when.ref_xpath && !(right.value > 0)) {
+      return { error: '右值（上限）读完是 0，页面数据还没回填（0 比大小的结果不可信）', retryable: true, values: [left.value, right.value] };
+    }
     const a = left.value, b = right.value;
     const hit = ENGINE.cmpNum(a, op, b);
     return {
@@ -556,7 +575,22 @@
         /* 判不出来一律终止（E_GATE），不能当作「没命中」继续往下走——
          * 那会在不知道是否满员的情况下建成员。这类是引擎/配置故障，不是「需要人工」。 */
         const engineFail = (m) => { const e = new Error(m); e.code = 'E_GATE'; e.noOnFail = true; return e; };
-        const gw = ENGINE.gateWhen(a.when, scope);
+        /* 闸门数据未就绪时先等（2026-11-06 真机误报满员，见 gateWhen 里「右值 0」的注释）。
+         * 只对「带 ref_xpath 的数值比对」等：exists 类闸门（如验证码容器）判的是「此刻在不在」，
+         * 等一等反而会错过时机。等不到才按「判不出来」终止，不拿旧值/零值蒙一个结论。 */
+        const scanGate = () => ENGINE.gateWhen(a.when, scope);
+        let gw = scanGate();
+        if (a.when && a.when.ref_xpath) {
+          const readyMs = Math.max(0, Number(a.when.ready_ms == null ? 3000 : a.when.ready_ms) || 0);
+          const t0 = Date.now();
+          let announced = false;
+          while (gw.error && gw.retryable && Date.now() - t0 < readyMs) {
+            if (!announced) { log('闸门数据还没回填（' + gw.error + '），等待页面渲染（最多 ' + readyMs + 'ms）…'); announced = true; }
+            await sleep(120);
+            gw = scanGate();
+          }
+          if (announced) log(gw.error ? ('闸门数据等待超时：' + gw.error) : ('闸门数据已就绪：' + gw.detail));
+        }
         if (gw.error) {
           throw engineFail('E_GATE 闸门条件无法判定：' + gw.error + '——已终止（不装作没看见）');
         }
@@ -1042,7 +1076,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.7',
+    RUNNER_VERSION: '0.9.8',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
