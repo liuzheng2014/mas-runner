@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.9
+// @version      0.9.10
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -186,6 +186,16 @@
  *     待写队列里已有同记录的 ok 时，后续 fail 不覆盖（否则业务看到失败会重跑、多建一个成员）；
  *     队列按 record_id 去重；启动提示带上记录与上报状态并去重；「✅ 已回写飞书：失败」改成
  *     「✅ 已回写飞书（请求成功，上报状态=失败 E_UI）」，不再让人误读成回写失败。
+ *   - v0.9.10：回写要核对「字段」，不能只看请求成功（2026-11-06 真机）。
+ *     现象：表里「开户状态」写成了「管理式导入完成」，「邮箱账号」一直是空的。用户问是不是没存。
+ *     真相：值算出来了、也发出去了，坏在 spec 的回写模板写成 `{{account_email}}`（少了 outputs.
+ *     前缀）——服务端模板上下文只有 {outputs, error, elapsed_ms, record_id, runner_version,
+ *     spec_version}，业务值全在 outputs 下面。取不到 → renderTpl 返回 undefined → 服务端按
+ *     「解析为空则不写」**跳过该字段，还照样返回 200**。所以日志显示成功、表里少一列。
+ *     收口：回写成功后拿服务端返回的 written（实际写进表的字段名）跟 spec.scene.writeback
+ *     声明对一遍，少了就点名 warn「这几个字段没写：…」；待写队列带上 _expect_fields，
+ *     补写成功同样核对。配套：validate_spec 硬校验模板占位符根必须在服务端作用域内
+ *     （裸写 {{x}} 直接拒绝发布），新增 writeback-template-smoke。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -1091,7 +1101,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.9',
+    RUNNER_VERSION: '0.9.10',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3618,6 +3628,35 @@
     throw lastErr;
   }
 
+  /* 回写字段核对：HTTP 200 只说明「这次请求成了」，不说明「每个字段都进表了」。
+   * 服务端按 spec.scene.writeback 逐字段渲染模板，**解析为空就跳过该字段**（避免抹掉已有值），
+   * 且照样返回 200。2026-11-06 真机就是这么静默丢字段的：模板写成 {{account_email}}
+   * （少了 outputs. 前缀）→ 取不到值 → 「开户状态」写进去、「邮箱账号」永远空着，
+   * 日志却显示「已回写成功」。用户看到的就是「状态有了，邮箱没写，是不是没存」。
+   * 所以要拿服务端返回的 written（实际写入的字段名）跟 spec 声明对一遍，少了就点名报出来。 */
+  function wbDeclared(st, ok) {
+    try {
+      const sp = st && st.specJson ? JSON.parse(st.specJson) : null;
+      const wb = sp && sp.scene && sp.scene.writeback;
+      const blk = wb ? wb[ok ? 'ok' : 'fail'] : null;
+      return (blk && typeof blk === 'object' && Object.keys(blk).length) ? Object.keys(blk) : null;
+    } catch (e) { return null; }
+  }
+  function wbMissing(declared, written) {
+    if (!declared || !Array.isArray(written) || !written.length) return [];
+    return declared.filter(function (k) { return written.indexOf(k) < 0; });
+  }
+  function warnMissingFields(declared, written, tag) {
+    const miss = wbMissing(declared, written);
+    if (!miss.length) return;
+    UI.appendLog({
+      t: Date.now(), level: 'warn',
+      msg: '⚠️ ' + (tag || '回写') + '只写进 ' + written.length + ' 个字段，这几个**没写**：' + miss.join('、') +
+        '——多半是回写模板里的占位符取不到值（业务值要写 {{outputs.xxx}}，裸写会被当成空）或值本身为空。' +
+        '表里这几列仍是旧值，别当成已经写好',
+    });
+  }
+
   // 回写一条任务结果。返回 Promise<{written, msg}> —— 批量直接 await 这个真实结果，不用轮询猜状态。
   // 原有调用方（发起页轮询器 / 失败分支）不 await，行为与之前一致。
   function pushTaskResult(st, ok, outputs, err) {
@@ -3675,10 +3714,14 @@
             '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）'
         });
         if (!UI._running) UI.renderTasks();
+        /* 字段级核对：写了几个、少了哪几个，当场说清（见 wbDeclared 上方注释） */
+        warnMissingFields(wbDeclared(st, ok), (wr && wr.written) || [], '回写');
         /* written 的语义是「这次回写已经处理完、收尾不要再发一次」，不是「字段真的写了」。
          * 空分支（noop）也算处理完——否则收尾会再发一遍请求。是否真写用 skipped 表达。 */
         return { written: true, skipped: !wrote, msg: '' };
       } catch (e) {
+        /* 带上「这次该写哪些字段」，补写成功后同样能核对，不至于补完还静默漏列 */
+        payload._expect_fields = wbDeclared(st, ok) || undefined;
         pwAdd(payload);
         const msg = String((e && e.message) || e);
         const local = /127\.0\.0\.1|localhost/.test(SVC.base() || '');
@@ -3721,11 +3764,15 @@
     let okN = 0;
     for (const p of all) {
       const body = Object.assign({}, p);
+      const expect = body._expect_fields || null;
       delete body.queued_at;
+      delete body._expect_fields;          // 只在本地产物里，不往服务端发
       try {
-        await writeWithRetry(body, 2);
+        const wr = await writeWithRetry(body, 2);
         okN++;
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
+        /* 补写成功 ≠ 字段补齐：模板取不到值时服务端照样 200 却跳过该字段 */
+        warnMissingFields(expect, (wr && wr.written) || [], '补写');
       } catch (e) {
         left.push(p);
         UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 补写仍失败：' + body.record_id + ' · ' + e.message });
