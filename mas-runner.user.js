@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.11
+// @version      0.9.12
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -206,6 +206,16 @@
  *     /health 预检超时 8s→4s：链路正常时它是亚秒级，8s 只会把「卡住的标签页」拖成更长的静默。
  *     预热定时器改成可停：runTask 收尾 clear，不再跑完流程后还每 6s 打一次（实测一次运行会
  *     多打十几枪 /health?warm=1，白占连接）。
+ *
+ *   - v0.9.12：「检查更新」不能只看第一个源（2026-11-06 真机：点了更新还是旧版）。
+ *     现象：面板点「检查更新」，显示「已是最新 v0.9.10」，可 jsDelivr 上早有 0.9.11。
+ *     根因是旧实现「见第一个 200 就 return」——而排第一的自建源 mas.wankahuanju.top/runner.json
+ *     背后是 KV 里的 commit，KV 没刷新时它**照样 200，只是内容是旧版本**，于是当场判定「无新版」，
+ *     后面两个源连问都没问。等于更新检查自己骗自己。
+ *     收口：①并发问所有源，取版本最大者；②安装地址用「胜出那条源自己的地址」，
+ *     自建源落后时自动改走 jsDelivr 直链（否则点更新还是被送回旧版，用户无法自救）；
+ *     ③有源报的版本比当前还旧时点名告警——那说明分发链坏了，不是「已是最新」。
+ *     判据：**多源聚合必须按值取最优，不能按顺序取第一个成功的**；"拿到回答"≠"拿到正确答案"。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -1111,7 +1121,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.11',
+    RUNNER_VERSION: '0.9.12',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4104,35 +4114,71 @@
     }
   }
 
+  /* 从 manifest 的地址推出「同一源上的脚本地址」。
+   * 为什么不用 manifest 里的 install_url：那个字段永远指向自建分发地址，
+   * 而自建地址的版本恰恰可能因为 KV 没刷新而落后 —— 这时候点「更新」会被送回旧版，
+   * 就是用户嘴里的「点了更新还是拉不到最新版」。用胜出那条源自己的地址，才能绕开坏指针。 */
+  function installUrlOf(r) {
+    const u = String((r && r.url) || '');
+    if (/\/manifest\.json(\?|$)/.test(u)) return u.replace(/manifest\.json(\?|$)/, 'mas-runner.user.js');
+    return (r && r.m && r.m.install_url) || GV.INSTALL_URL;
+  }
+
+  /* 更新检查：并发问所有源，取「版本最大」的那个。
+   * 旧实现是「见第一个 200 就 return」，看似省事，实则自欺：自建源 runner.json 背后是
+   * KV 里的 commit，KV 没刷新时它会**正常返回 200 + 旧版本**，于是直接判「已是最新」，
+   * 后面 jsDelivr/GitHub 上明明已有新版也永远看不到。2026-11-06 真机就是这样：
+   * 自建源给 0.9.7、jsDelivr @main 已是 0.9.11，面板却报「已是最新 v0.9.10」，
+   * 用户点「检查更新」什么反应都没有 —— 不是拉不到，是根本没去看。 */
   UI.checkUpdate = async function (silent) {
     if (!silent) updOut('检查中…');
-    let lastErr = '';
     const cur = UI.installedVersion();
-    for (const url of GV.UPDATE_MANIFEST) {
+    const got = await Promise.all(GV.UPDATE_MANIFEST.map(async function (url) {
       try {
         const res = await gmFetch(url, { method: 'GET' });
-        if (res.status !== 200) { lastErr = 'HTTP ' + res.status; continue; }
+        if (res.status !== 200) return { url: url, err: 'HTTP ' + res.status };
         const m = JSON.parse(res.text);
-        GM_setValue(UPD.CHK_KEY, String(Date.now()));
-        if (cmpVer(m.version, cur) > 0) {
-          UI._newUrl = m.install_url || GV.INSTALL_URL;
-          applyUpdateState(m.version);
-          updOut('<span style="color:#1a7f43">新版 v' + m.version + '</span>');
-          UI.appendLog({
-            t: Date.now(), level: 'warn',
-            msg: '发现新版本 Runner v' + m.version + '（当前 v' + cur + '）：' + (m.notes || '') +
-              ' —— 点右上角「更新 v' + m.version + '」安装，装完切回本页会自动重载'
-          });
-        } else {
-          applyUpdateState('');
-          if (!silent) updOut('<span style="color:#666">已是最新 v' + cur + '</span>');
-          if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + cur });
-        }
-        return;
-      } catch (e) { lastErr = e.message; }
+        if (!m || !m.version) return { url: url, err: '清单里没有 version 字段' };
+        return { url: url, m: m };
+      } catch (e) { return { url: url, err: String((e && e.message) || e) }; }
+    }));
+    const errs = got.filter(function (r) { return r.err; });
+    const oks = got.filter(function (r) { return !r.err; });
+    if (!oks.length) {
+      if (!silent) updOut('<span style="color:#b00">检查失败</span>');
+      if (!silent) UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '更新检查失败（' + (errs[0] ? errs[0].err : '没有可用的更新源') + '）——不影响使用，可稍后重试或手动到仓库安装' });
+      return;
     }
-    if (!silent) updOut('<span style="color:#b00">检查失败</span>');
-    if (!silent) UI.appendLog({ t: Date.now(), level: 'warn', msg: '更新检查失败（' + lastErr + '）——不影响使用，可稍后重试或手动到仓库安装' });
+    // 版本最大者胜；同版本优先排在前面的源（自建源带宽最好）
+    let best = oks[0];
+    oks.forEach(function (r) { if (cmpVer(r.m.version, best.m.version) > 0) best = r; });
+    GM_setValue(UPD.CHK_KEY, String(Date.now()));
+    const ver = best.m.version;
+    if (cmpVer(ver, cur) > 0) {
+      UI._newUrl = installUrlOf(best);
+      applyUpdateState(ver);
+      updOut('<span style="color:#1a7f43">新版 v' + ver + '</span>');
+      const viaSelf = installUrlOf(best).indexOf('mas.wankahuanju.top') >= 0;
+      UI.appendLog({
+        t: Date.now(), level: 'warn',
+        msg: '发现新版本 Runner v' + ver + '（当前 v' + cur + '）：' + (best.m.notes || '') +
+          ' —— 点右上角「更新 v' + ver + '」安装，装完切回本页会自动重载' +
+          (viaSelf ? '' : '（安装地址改走 ' + best.url.split('/')[2] + '，自建分发源版本落后）')
+      });
+      return;
+    }
+    applyUpdateState('');
+    if (!silent) updOut('<span style="color:#666">已是最新 v' + cur + '</span>');
+    if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + cur });
+    // 有源报的版本比当前装的还旧 = 那条分发链没跟上（最常见是 KV 里的 commit 没刷新）。
+    // 这种时候「检查更新」是瞎的：它只看得见旧版本，必须点名，否则用户会一直以为已是最新。
+    const stale = oks.filter(function (r) { return cmpVer(r.m.version, cur) < 0; });
+    if (stale.length && !silent) {
+      UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '⚠️ 有更新源给的版本比当前还旧（' + stale.map(function (r) { return 'v' + r.m.version; }).join(' / ') +
+          '）——那条分发链没刷新，自动更新会失灵：需要手动装一次，或由发布方重写分发指针' });
+    }
   };
 
   /* 装完自动重载：只有「当前页面不忙」时才动手，避免打断正在跑的任务 */
@@ -5069,11 +5115,17 @@
       /* 节奏探针只能在「主线程被真的占住」时验证，UI 上没法稳定构造；单独暴露给 pace-watch-smoke
        * （不暴露就只能靠真机等下一次卡顿，等于不验证）。生产路径不会调用。 */
       startPaceWatch: startPaceWatch,
+      /* 更新检查要能用「三个源互相矛盾」的假响应验证（真机很难等到这种现场），暴露给
+       * update-source-smoke。只读引用，生产路径不经过这里。 */
+      checkUpdate: UI.checkUpdate,
+      newUrl: function () { return UI._newUrl || ''; },
     };
   } catch (e) {
     window.__MASR_TEST_WB__ = {
       pushTaskResult: pushTaskResult, pwList: pwList, pwSave: pwSave, RunState: RunState,
       startPaceWatch: startPaceWatch,
+      checkUpdate: UI.checkUpdate,
+      newUrl: function () { return UI._newUrl || ''; },
     };
   }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
