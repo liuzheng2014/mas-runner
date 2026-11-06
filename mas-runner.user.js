@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.2
+// @version      0.9.3
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -133,6 +133,20 @@
  *     静默无反应（既不报错也不提示，只能干等缓存过期或手动清 GM 存储）。现在零命中且缓存
  *     超过 60s 就 force 拉一次（全局 60s 限流，避免每个无关页面都多打一次接口）；
  *     多场景歧义命中不在此列——那是「声明不足待人工」，刷了也一样歧义。
+ *   - v0.9.3：跨域登录页真的能接手了（0.9.0 只做了一半）。
+ *     ①recordId 深度提取：302 到 CAS 登录页后 recordId 不在顶层 query，而是被编进
+ *       service/redirect_uri（实测 5 层编码）。原先只取顶层 → 取到空串 → 判「命中但无记录」→
+ *       静默 return，人看到的就是「点完按钮跳登录页，插件没反应也没日志」。
+ *       spec 声明 trigger.record_id_deep 才做这层提取（别的站点 service 里也可能有同名参数，不猜）。
+ *     ②不再沉默：命中但取不到记录 / 多场景歧义 / 站在跨域落地域上零命中，三种情况都写日志，
+ *       并附当前地址片段——「什么都没发生」是最难排查的故障。
+ *     ③跨域安全阀收紧：service 与 redirect_uri 同时存在时只认第一个能解析出的落点
+ *       （原先是「有一个匹配就接管」→ service 指向别人、redirect_uri 带我们地址时会误接管）。
+ *     ④卡死的运行态会被指出来：页面被 302/关标签打断时 finally 跑不到，状态永远停在 running。
+ *       现在带 15s 心跳，超过 2 分钟没更新就标记为 interrupted 并写一条日志（只标记不清理，
+ *       别的标签页可能真在跑）。
+ *     ⑤面板配色抗宿主覆盖：color-scheme:light + 显式文字色 + -webkit-text-fill-color 归位。
+ *       宿主声明深色主题时 UA 会给 button/input 白字，而我们只设背景 → 白底白字看不见。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -929,7 +943,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.2',
+    RUNNER_VERSION: '0.9.3',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1575,7 +1589,14 @@
       @keyframes masr-pulse{0%,100%{opacity:1}50%{opacity:.45}}
       #masr-panel{position:fixed;right:18px;bottom:70px;z-index:2147483000;width:520px;max-height:70vh;overflow:auto;
         background:#fff;color:#222;border:1px solid #d9d9e3;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.2);
-        font:12px/1.6 -apple-system,'Segoe UI',sans-serif;padding:0 12px 12px;display:none}
+        font:12px/1.6 -apple-system,'Segoe UI',sans-serif;padding:0 12px 12px;display:none;
+        /* 面板挂在别人的页面上：宿主若声明了 color-scheme:dark，UA 会给 button/input 用
+         * 深色主题的系统色（白字），而我们只设了背景 → 白底白字，字直接看不见。
+         * 这里锁死 light，并把所有元素的 -webkit-text-fill-color 归位到自身 color
+         * （该属性可继承，宿主在 body 上设一次就会洗掉面板里所有文字）。 */
+        color-scheme:light}
+      #masr-panel, #masr-panel *{-webkit-text-fill-color:currentColor}
+      #masr-panel a{color:#1a66ff}
       #masr-panel h3{margin:2px 0 8px;font-size:13px}
       /* --- 顶部：两行，第一行身份/版本，第二行业务脚本（版本号拆开，避免互相混淆） --- */
       #masr-head{position:sticky;top:0;z-index:5;margin:0 -12px 8px;padding:9px 12px 7px;
@@ -1596,14 +1617,18 @@
       .masr-upd{font-size:11px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px}
       #masr-panel textarea{width:100%;height:110px;font:11px/1.5 Consolas,monospace;box-sizing:border-box}
       #masr-panel .row{margin:6px 0}
-      #masr-panel button{margin-right:6px;padding:3px 10px;border:1px solid #bbb;border-radius:6px;background:#f6f7fa;cursor:pointer;font-size:12px}
+      #masr-panel button{margin-right:6px;padding:3px 10px;border:1px solid #bbb;border-radius:6px;background:#f6f7fa;color:#1f2d3d;cursor:pointer;font-size:12px}
       #masr-panel button.primary{background:#1a66ff;color:#fff;border-color:#1a66ff}
-      #masr-panel .log{background:#101418;color:#cde3ff;font:11px/1.5 Consolas,monospace;padding:8px;border-radius:8px;
-        max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all}
-      #masr-panel .ok{color:#4caf7d}.fatal{color:#ff6b6b}.warn{color:#ffb84d}
+      #masr-panel button:disabled{color:#7a828c;background:#eceef2;border-color:#d4d7de;cursor:default}
+      #masr-panel .log{background:#101418;color:#d7e8ff;font:11px/1.5 Consolas,monospace;padding:8px;border-radius:8px;
+        max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;color-scheme:dark}
+      #masr-panel .ok{color:#63d193}.fatal{color:#ff8b8b}.warn{color:#ffc266}
       #masr-panel table{border-collapse:collapse;width:100%}
       #masr-panel td,#masr-panel th{border:1px solid #e3e3ec;padding:2px 6px;text-align:left;font-size:11px}
-      #masr-panel input{padding:2px 6px;border:1px solid #ccc;border-radius:4px;width:200px}
+      #masr-panel input,#masr-panel textarea{padding:2px 6px;border:1px solid #c6cad2;border-radius:4px;width:200px;
+        background:#fff;color:#1f2d3d;color-scheme:light}
+      #masr-panel input::placeholder,#masr-panel textarea::placeholder{color:#6b7785;opacity:1}
+      #masr-panel input:disabled,#masr-panel textarea:disabled{background:#f3f4f7;color:#6b7785}
       .masr-tag{display:inline-block;padding:0 6px;border-radius:8px;font-size:10px;margin-left:6px}
     `;
     document.head.appendChild(css);
@@ -1922,7 +1947,12 @@
       if (!name) return '';
       let v = '';
       try { v = new URLSearchParams((href.split('#')[1] || '').split('?')[1] || '').get(name) || ''; } catch (e) {}
-      if (!v) { try { v = new URLSearchParams(href.split('?')[1] || '').get(name) || ''; } catch (e) {} }
+      if (!v) {
+        /* 只取 ? 到 # 之间：按钮地址是 `index.html?recordId=xxx#/organization/orgList`，
+         * 直接 href.split('?')[1] 会把 `#/organization/orgList` 并进值里，
+         * 变成 recordId="xxx#/organization/orgList"，查记录必然查不到（2026-11-06 实测）。 */
+        try { v = new URLSearchParams(href.split('#')[0].split('?')[1] || '').get(name) || ''; } catch (e) {}
+      }
       return SVC.decodeParam(v);
     }
     /* 跨域登录页的安全阀：同一个 CAS 登录页服务很多站点，脚本装在这里不能见登录页就接管。
@@ -1943,9 +1973,18 @@
         if (!raw) continue;
         let h = '';
         try { h = new URL(raw).host; } catch (e) { h = ''; }
-        if (h && allow.indexOf(h) >= 0) return true;
+        if (!h) continue;          // 解不出主机名（相对路径/畸形值）：看下一个参数，不当成命中
+        /* 第一个能解析出主机名的参数就是「最终落点」，只认它。
+         * 不能「有一个匹配就算」：service 指向别人的站点、redirect_uri 却带着我们的地址时，
+         * 那样会把这页认领下来，登录页上就会跑本业务的脚本。 */
+        return allow.indexOf(h) >= 0;
       }
-      return false;
+      /* 一个 service/redirect_uri 都没有：分两种情况，必须由 spec 说清楚。
+       *   - 登录页（require_service:true）：CAS 登录页必然带 service，没有就是别人的登录入口
+       *     或者参数被改写 → 不认领，宁可不跑；
+       *   - 业务页（缺省）：自己的落地页本来就没有 service，这里拦会导致业务页永远不触发
+       *     （2026-11-06 实测：导入成员在管理台落地页被自己的安全阀挡掉了）。 */
+      return !(cd.require_service === true);
     }
 
     const hits = [];
@@ -1983,8 +2022,26 @@
             if (pv) params[pname] = pv;
           }
         }
+        /* recordId 的第二个来源：跨域登录页。
+         * 302 到 CAS 登录页时，recordId 已经不在顶层 query 里了——它被编进了 service/redirect_uri
+         * （实测 5 层编码，解码后才是 `...index.html?recordId=xxx`）。只在 spec 显式声明
+         * record_id_deep 时才做这层提取：别的站点 service 里也可能有同名参数，猜着捞会捞错记录。 */
+        let rid = q(tr.record_id_query);
+        if (!rid && tr.record_id_deep === true && tr.record_id_query) {
+          const names = (tr.cross_domain && Array.isArray(tr.cross_domain.service_query))
+            ? tr.cross_domain.service_query : ['service', 'redirect_uri'];
+          const rx = new RegExp('[?&]' + String(tr.record_id_query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^&#]+)');
+          for (let n = 0; n < names.length && !rid; n++) {
+            const raw = q(names[n]);
+            if (!raw) continue;
+            const dec = SVC.decodeParam(raw, 8);   // 证据里实测 5 层，留 3 层余量
+            const m = dec.match(rx);
+            if (m) rid = SVC.decodeParam(m[1], 8);
+          }
+        }
         hits.push({
-          script_id: s.script_id, name: s.name, record_id: q(tr.record_id_query),
+          script_id: s.script_id, name: s.name, record_id: rid,
+          record_id_deep: (tr.record_id_deep === true),
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
           params: params,
@@ -3182,7 +3239,7 @@
             ' value="' + esc(secret ? '' : (last[p.name] || '')) + '" placeholder="' + esc(p.description || '') + '"></div>';
         }
         return '<div class="row"><label>' + esc(p.label || p.name) + '：</label>' +
-          '<span style="font-size:11px;color:#8f959e">由任务带入（从「任务」点待办的「执行」或「批量执行」时自动填充）</span></div>';
+          '<span style="font-size:11px;color:#5a6b87">由任务带入（从「任务」点待办的「执行」或「批量执行」时自动填充）</span></div>';
       }).join('');
   };
 
@@ -3618,6 +3675,14 @@
         task: pubTask,
       });
     }
+    /* 心跳：给「这次运行还活着」留证据。页面被 302/关闭打断时 finally 跑不到，
+     * 下一张页面只能靠 startedAt/beatAt 判断这是「真在跑」还是「卡死」。 */
+    const beat = setInterval(function () {
+      try {
+        const s = RunState.get();
+        if (s && s.phase === 'running') { s.beatAt = Date.now(); RunState.set(s); }
+      } catch (e) { /* 心跳失败不影响执行 */ }
+    }, 15000);
     const hooks = { onLog: UI.appendLog, onStep: UI.markStep };
     try {
       let result;
@@ -3717,6 +3782,7 @@
         }
       } catch (e2) {}
     } finally {
+      clearInterval(beat);
       const st = RunState.get();
       if (st && st.phase === 'running') RunState.clear();
       UI.renderSelfCheck();
@@ -3958,11 +4024,43 @@
         await SVC.scenes();
         const hit = SVC.matchTrigger();
         UI._trigger = hit;
-        if (!hit) return;
+        if (!hit) {
+          /* 静默是这里最坏的选项：人站在登录页上，面板挂出来了、什么都没发生、
+           * 日志一行没有，只能猜是脚本坏了。两种情况必须说话：
+           *   ①多个场景同时命中（声明不足）；
+           *   ②命中但取不到 recordId（recordId 在 service 里且 spec 没声明 record_id_deep）。 */
+          const amb = SVC._triggerAmbiguous;
+          if (amb && amb.length > 1) {
+            UI._triggerErr = '当前地址同时匹配多个场景（' + amb.join('、') + '）：声明里缺少区分标记（action_query），引擎不做猜测，已跳过';
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr });
+            UI.renderTrigger();
+            return;
+          }
+          /* 站在「某个场景声明的跨域落地域」上却零命中 —— 必须说一句。
+           * 这多半是场景列表还是旧的（TTL 10 分钟，刚发布的场景不在里面），
+           * 或者登录页的 service 里根本没有回跳本业务的地址（被别的站点复用）。 */
+          const here = String(location.host || '').toLowerCase();
+          const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+          const owners = list.filter(function (x) {
+            const hs = (x.trigger && x.trigger.cross_domain && x.trigger.cross_domain.hosts) || [];
+            return hs.map(function (h) { return String(h).toLowerCase(); }).indexOf(here) >= 0;
+          }).map(function (x) { return x.name || x.script_id; });
+          if (owners.length) {
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: '当前在「' + here + '」（' + owners.join('、') +
+              ' 声明的跨域落地域），但没有场景认领本页：多半是场景列表还是旧缓存，或登录页 service 里没有回跳本业务的地址' });
+          }
+          return;
+        }
         const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
         if (!hit.record_id && !hasUrlParams) {
           UI._triggerTask = null;
           UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
+          /* 这条曾经只写进面板的错误条，而错误条挂在任务区、会被 renderTasks 重绘抹掉，
+           * 结果就是「点完按钮跳到登录页 → 没反应、没日志」。跨域登录页上 recordId 被编码进
+           * service 参数，必须显式告诉人「是取不到记录」，不是「脚本没加载」。 */
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr +
+            '｜当前地址：' + String(location.href).slice(0, 160) +
+            '（跨域登录页的 recordId 在 service 参数里，需 spec 声明 record_id_deep）' });
           UI.renderTrigger();
           return;
         }
@@ -4108,6 +4206,22 @@
       }
     } catch (e) { /* 恢复失败不影响手动粘贴 */ }
     const st = RunState.get();
+    /* 卡在 running 的运行态：页面被 302/关标签打断时，doRun 的 finally 根本没机会跑，
+     * 状态会永远停在 running。之前这种状态完全没人提——下一张页面既不复跑也不提示，
+     * 人只能看到「续跑状态=存在: running」和一片空白日志（2026-11-06 实测）。
+     * 心跳超过 2 分钟没有更新 → 判定为「被打断」，只标记不清理：
+     * 别的标签页可能真的在跑，清掉会拆掉别人正在用的状态。 */
+    if (st && st.phase === 'running' && Date.now() - Number(st.beatAt || st.startedAt || 0) > 120000) {
+      const when = new Date(Number(st.startedAt || 0));
+      st.phase = 'interrupted';
+      RunState.set(st);
+      UI.appendLog({
+        t: Date.now(), level: 'warn',
+        msg: '上一次执行「' + (st.specId || '?') + ' v' + (st.specVersion || '?') + '」没有跑完（' +
+          (st.startedAt ? when.toLocaleString('zh-CN') : '时间未知') + ' 开始，页面被跳转或关闭打断）：已标记为中断，' +
+          '不影响本页重新执行；需要彻底清掉就在任务区点「清除续跑状态」',
+      });
+    }
     if (st && st.phase === 'await_nav_check') {
       UI.replayStepLogs(st.stepLogs);
       // 自动续跑条件：①状态新鲜（10 分钟内）②当前页 URL 匹配本步 expect——避免在错误的标签页上误启动
