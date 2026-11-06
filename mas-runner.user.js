@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.3
+// @version      0.9.4
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -147,6 +147,13 @@
  *       别的标签页可能真在跑）。
  *     ⑤面板配色抗宿主覆盖：color-scheme:light + 显式文字色 + -webkit-text-fill-color 归位。
  *       宿主声明深色主题时 UA 会给 button/input 白字，而我们只设背景 → 白底白字看不见。
+ *   - v0.9.4：跨域安全阀会沿跳转链往下看。
+ *     真机实测（2026-11-06）：CAS 登录页的 service 指向统一登录网关
+ *     `oauth-login1.cloud.huawei.com/oauth2/v3/loginCallback`，真正的业务回跳目标压在他的
+ *     `redirect_uri` 里（再一层编码）。0.9.3 只比较 service 第一层的 host → 永远不等于白名单
+ *     → 登录页永远不被认领，表现仍是「点完按钮跳到登录页，插件没反应」。
+ *     现在沿 service→redirect_uri 最多走 3 跳，链上任一 host 命中白名单才认领；
+ *     链上没有任何本业务域（别人复用的登录页）照样不认领——不放大认领范围。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -943,7 +950,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.3',
+    RUNNER_VERSION: '0.9.4',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1963,21 +1970,43 @@
       if (!cd) return true;                       // 未声明跨域 → 老路径，不改变既有行为
       let here = '';
       try { here = new URL(href).host; } catch (e) { here = String(location.host || ''); }
-      const hosts = Array.isArray(cd.hosts) ? cd.hosts : [];
+      here = String(here).toLowerCase();
+      const hosts = Array.isArray(cd.hosts) ? cd.hosts.map(function (x) { return String(x).toLowerCase(); }) : [];
       if (!hosts.length || hosts.indexOf(here) < 0) return true;  // 不是登录域，不归本闸管
-      const allow = Array.isArray(cd.require_service_hosts) ? cd.require_service_hosts : [];
+      const allow = Array.isArray(cd.require_service_hosts)
+        ? cd.require_service_hosts.map(function (x) { return String(x).toLowerCase(); }) : [];
       if (!allow.length) return true;             // 声明了登录域但没给白名单：不额外拦（由 spec 作者负责）
       const svcNames = Array.isArray(cd.service_query) ? cd.service_query : ['service', 'redirect_uri'];
+      /* 沿跳转链收集主机名：真实链路里 CAS 登录页的 service 往往指向统一登录网关
+       * （oauth-login1.cloud.huawei.com），真正的业务回跳目标压在他的 redirect_uri 里，还要再剥一层。
+       * 只判第一层会把正确链路误杀——2026-11-06 真机实测：service=oauth-login1 → redirect_uri=id.cloud，
+       * 结果登录页上场景永远不被认领（表现还是「点完按钮没反应」）。 */
+      function chainHosts(raw, maxHops) {
+        const out = [];
+        let cur = SVC.decodeParam(raw, 8);
+        const hops = Math.max(1, maxHops || 3);
+        for (let i = 0; i < hops; i++) {
+          let u = null;
+          try { u = new URL(cur); } catch (e) { break; }
+          if (!u || !u.host) break;
+          out.push(String(u.host).toLowerCase());
+          let next = '';
+          for (let k = 0; k < svcNames.length && !next; k++) next = u.searchParams.get(svcNames[k]) || '';
+          if (!next) break;
+          cur = SVC.decodeParam(next, 8);         // 链路里每一层都可能再编码一次
+        }
+        return out;
+      }
       for (const n of svcNames) {
         const raw = q(n);
         if (!raw) continue;
-        let h = '';
-        try { h = new URL(raw).host; } catch (e) { h = ''; }
-        if (!h) continue;          // 解不出主机名（相对路径/畸形值）：看下一个参数，不当成命中
-        /* 第一个能解析出主机名的参数就是「最终落点」，只认它。
-         * 不能「有一个匹配就算」：service 指向别人的站点、redirect_uri 却带着我们的地址时，
+        const chain = chainHosts(raw, 3);
+        if (!chain.length) continue;   // 解不出主机名（相对路径/畸形值）：看下一个参数，不当成命中
+        /* 顶层第一个能解析出跳转链的参数就是「最终落点」，只认它；
+         * 但一条链上经过的主机都算数——回跳要经过本业务域，才认领。
+         * 不能「有一个顶层参数匹配就算」：service 指向别人的站点、redirect_uri 却带着我们的地址时，
          * 那样会把这页认领下来，登录页上就会跑本业务的脚本。 */
-        return allow.indexOf(h) >= 0;
+        return chain.some(function (h) { return allow.indexOf(h) >= 0; });
       }
       /* 一个 service/redirect_uri 都没有：分两种情况，必须由 spec 说清楚。
        *   - 登录页（require_service:true）：CAS 登录页必然带 service，没有就是别人的登录入口
