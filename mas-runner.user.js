@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.10
+// @version      0.9.11
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -196,6 +196,16 @@
  *     声明对一遍，少了就点名 warn「这几个字段没写：…」；待写队列带上 _expect_fields，
  *     补写成功同样核对。配套：validate_spec 硬校验模板占位符根必须在服务端作用域内
  *     （裸写 {{x}} 直接拒绝发布），新增 writeback-template-smoke。
+ *   - v0.9.11：把「时间去哪了」写进日志，别再让人对着静默段猜（2026-11-06 真机日志复盘）。
+ *     现象：一段流程里出现 27s、49s 的空白，面板上两条日志之间什么都没有。三种完全不同的原因
+ *     在日志上长得一模一样：①网络往返慢；②业务页把主线程占满（我们的定时器/XHR 回调全部排队）；
+ *     ③标签页被切到后台（浏览器直接冻结后台标签的 JS）。人只能猜，猜错方向就白改一通。
+ *     收口：执行期起一个「节奏探针」——1s 一跳，跳空了 >2.5s 就报「页面卡了 N s，脚本一行没跑」；
+ *     监听 visibilitychange，切走再回来报「在后台待了 N s」。同时给三段关键串行往返单独计时：
+ *     /task 取数、/health 预检、续跑补凭据（都只在 >800ms 时打一行，不刷屏）。
+ *     /health 预检超时 8s→4s：链路正常时它是亚秒级，8s 只会把「卡住的标签页」拖成更长的静默。
+ *     预热定时器改成可停：runTask 收尾 clear，不再跑完流程后还每 6s 打一次（实测一次运行会
+ *     多打十几枪 /health?warm=1，白占连接）。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -1101,7 +1111,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.10',
+    RUNNER_VERSION: '0.9.11',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1892,13 +1902,17 @@
         const rid = (st.task && st.task.record_id) || params.record_id || '';
         const sid = (st.task && st.task.script_id) || spec.spec_id;
         if (rid) {
+          const tCred = Date.now();
           const fresh = await SVC.record(rid, sid);
+          const credMs = Date.now() - tCred;
           const fp = (fresh && fresh.params) || {};
           const got = [];
           need.forEach(function (p) { if (fp[p.name]) { params[p.name] = fp[p.name]; got.push(p.name); } });
           log({ t: Date.now(), level: got.length ? 'info' : 'warn',
             msg: got.length ? '续跑已重新取回凭据参数：' + got.join(',') + '（未落本地存储）'
               : '续跑需要凭据参数 ' + need.map(function (p) { return p.name; }).join(',') + '，但 /task 没有下发（表里为空？）' });
+          if (credMs > 800) log({ t: Date.now(), level: 'info',
+            msg: '续跑取凭据耗时 ' + (credMs / 1000).toFixed(1) + 's（/task 往返；凭据不落盘，只能重新取）' });
         }
       }
     } catch (e) {
@@ -2669,11 +2683,13 @@
   };
 
   /* 探活：打 /health，顺便核对版本。没填地址时由调用方引导填写，不会走到这里 */
+  /* 超时 8s→4s（v0.9.11）：这是一个纯健康检查，链路正常时是亚秒级；给到 8s 只会让「标签页被冻住」
+   * 这类情况多挂 4 秒静默。真机 2026-11-06 的 27s 空白段里，脚本唯一在等的东西就是它。 */
   SVC.ping = function () {
     const base = SVC.base();
     return new Promise(function (resolve, reject) {
       GM_xmlhttpRequest({
-        method: 'GET', url: base + '/health', timeout: 8000,
+        method: 'GET', url: base + '/health', timeout: 4000,
         onload: function (r) {
           let j = {};
           try { j = JSON.parse(r.responseText || '{}'); } catch (e) {}
@@ -2682,7 +2698,7 @@
           resolve({ mode: 'svc', version: j.version || '?' });
         },
         onerror: function () { reject(new Error('连不上 ' + base)); },
-        ontimeout: function () { reject(new Error('超时（8 秒）' + base)); },
+        ontimeout: function () { reject(new Error('超时（4 秒）' + base)); },
       });
     });
   };
@@ -2769,6 +2785,17 @@
    * 流程跑一趟要十几秒，正好用来把表捂热，等真回写时就是热路径。
    * 失败一律忽略——预热只是加速，不是依赖。 */
   let _warming = false;
+  /* 预热定时器登记表：以前 warmStart 只把 interval 返回给调用方，没人 clear，也没有「提前停」的入口。
+   * 实测一次运行结束后它还在打 /health?warm=1（每 6s 一枪、最长 120s），既费请求也和回写抢连接。
+   * 现在统一登记，流程收尾一句 SVC.stopWarm() 全部停掉。 */
+  const _warmTimers = new Set();
+  SVC.stopWarm = function () {
+    _warmTimers.forEach(function (x) {
+      try { clearInterval(x.iv); } catch (e) {}
+      try { clearTimeout(x.to); } catch (e) {}
+    });
+    _warmTimers.clear();
+  };
   SVC.warm = function (scriptId) {
     if (!SVC.base() || _warming) return;
     _warming = true;
@@ -2781,9 +2808,11 @@
   SVC.warmStart = function (ms, scriptId) {
     if (!SVC.base()) return null;
     SVC.warm(scriptId);
-    const t = setInterval(function () { SVC.warm(scriptId); }, 6000);
-    setTimeout(function () { clearInterval(t); }, ms || 90000);
-    return t;
+    const rec = { iv: null, to: null };
+    rec.iv = setInterval(function () { SVC.warm(scriptId); }, 6000);
+    rec.to = setTimeout(function () { clearInterval(rec.iv); _warmTimers.delete(rec); }, ms || 90000);
+    _warmTimers.add(rec);
+    return rec.iv;
   };
 
   SVC.bindMeta = function () { return SVC.call('GET', '/bind/meta'); };
@@ -3236,9 +3265,54 @@
 
   // 点一条待办：拉 active spec → 自动填账户ID → 提示点执行
   /* 点待办里的「执行」= 载入 + 立刻开跑，不需要再点下面那个按钮 */
+  /* ---------- 执行期「节奏探针」：把静默段归因，而不是让人猜（v0.9.11） ----------
+   * 真机日志里出现过 27s / 49s 的空白段：面板上两条日志之间什么都没有。三种原因的日志长相一样：
+   *   ① 网络往返慢          → 阶段计时（/task 取数、/health 预检、回写）能对上，见各调用点；
+   *   ② 主线程被业务页占满  → 1s 定时器整体漂移，脚本一行都没跑（EAM 这类大 SPA 首屏就会这样）；
+   *   ③ 标签页被切到后台    → Chrome 直接冻结后台标签的 JS，定时器和 XHR 回调一起停。
+   * ②③ 的共同点是「不是我们的请求慢」，靠 timer 漂移 + visibilitychange 区分。只在执行期挂着，
+   * 空闲时零开销；阈值取得比正常抖动大，正常流程一条都不会多打（golden trace 因此仍 0 diff）。 */
+  function startPaceWatch() {
+    let last = Date.now();
+    let lastTap = 0;
+    const iv = setInterval(function () {
+      const now = Date.now();
+      const drift = now - last - 1000;
+      last = now;
+      if (drift > 2500 && now - lastTap > 5000) {
+        lastTap = now;
+        UI.appendLog({
+          t: now, level: 'warn',
+          msg: '⏱ 页面卡了 ' + (drift / 1000).toFixed(1) + 's：这段时间脚本一行都没跑' +
+            '（业务页占满主线程，或标签页被浏览器冻结）——不是回写/取数慢，别往网络上找',
+        });
+      }
+    }, 1000);
+    let hiddenAt = 0;
+    function onVis() {
+      if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+      if (!hiddenAt) return;
+      const d = Date.now() - hiddenAt;
+      hiddenAt = 0;
+      if (d > 1500) {
+        UI.appendLog({
+          t: Date.now(), level: 'info',
+          msg: '⏸ 标签页在后台待了 ' + (d / 1000).toFixed(1) + 's（后台标签会被降频/冻结，流程只能等着；' +
+            '真机要跑就别切走，或把该站点加进「保持活跃」）',
+        });
+      }
+    }
+    try { document.addEventListener('visibilitychange', onVis); } catch (e) {}
+    return function stop() {
+      clearInterval(iv);
+      try { document.removeEventListener('visibilitychange', onVis); } catch (e) {}
+    };
+  }
+
   UI.runTask = async function (task, btn) {
     if (UI._running) return;
     UI._running = true;
+    const paceStop = startPaceWatch();
     const old = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
     try {
@@ -3269,6 +3343,7 @@
       const needWrite = wbModeOf(s.spec) === 'auto';
       if (needWrite) {
         // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
+        const tPing = Date.now();
         try { await SVC.ping(); }
         catch (e) {
           connOut = '<span style="color:#c02a0a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
@@ -3276,7 +3351,10 @@
           UI.renderConn();
           return;
         }
-        SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
+        const pingMs = Date.now() - tPing;
+        // 只报慢的，快的不打——省得每单多一行噪音（也保住 golden 基线）
+        if (pingMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '预检后端 ' + (pingMs / 1000).toFixed(1) + 's（/health 往返，慢在链路上）' });
+        UI._warmTimer = SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
       }
       UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + (s.spec_id || scene) + ' v' + s.version + '（任务参数已带入）' });
       await UI.doRun({ keepLog: true });
@@ -3284,6 +3362,11 @@
       UI.appendLog({ t: Date.now(), level: 'fatal', msg: '执行失败（载入阶段）：' + e.message });
     } finally {
       UI._running = false;
+      paceStop();
+      // 预热是「跑的时候顺手捂热」，跑完就该停：实测它会在流程结束后继续每 6s 打一次 /health?warm=1，
+      // 一个标签页挂 90s 就是十几枪白请求，还要跟真正的回写抢连接。
+      try { clearInterval(UI._warmTimer); } catch (e) {}
+      SVC.stopWarm();
       if (btn) { btn.disabled = false; btn.textContent = old || '执行'; }
     }
   };
@@ -3402,6 +3485,7 @@
       await Promise.allSettled(writeSettles);
     }
     UI.renderBatchReport(recs, { total: total, skipN: skipN, okN: okN, failN: failN, unknownN: unknownN, batchStart: batchStart, view: view });
+    SVC.stopWarm();   // 批量跑完就停预热，别让定时器在后台一直打 /health?warm=1
   };
 
   // 批次收尾报告：失败清单（可一键复制）+ 对账 + 耗时/错误码分布
@@ -4725,7 +4809,12 @@
           return;
         }
         UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' + (hit.record_id_from_pend ? '｜记录来自上游交接（本页地址不含 recordId）' : '') });
+        /* 这一枪要服务端回读业务表（真机 4~8s，冷表更久），是「命中→开跑」这段空档的主要成分。
+         * 只在慢的时候报一行，快的不打——否则每个页面都多一行噪音。 */
+        const tRec = Date.now();
         const task = SVC.pendMerge(await SVC.record(hit.record_id, hit.script_id));
+        const recMs = Date.now() - tRec;
+        if (recMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '取数 ' + (recMs / 1000).toFixed(1) + 's（/task 往返：服务端回读业务表）' });
         task.on_match = hit.on_match;
         // 中转页：当前页只是跳板，取到数就把这个标签页「原地替换」成业务页。
         // 用 replace 而不是 open+close：脚本无权关闭不是自己打开的标签页，close 会被浏览器拒绝；
@@ -4977,9 +5066,15 @@
   try {
     (unsafeWindow || window).__MASR_TEST_WB__ = {
       pushTaskResult: pushTaskResult, pwList: pwList, pwSave: pwSave, RunState: RunState,
+      /* 节奏探针只能在「主线程被真的占住」时验证，UI 上没法稳定构造；单独暴露给 pace-watch-smoke
+       * （不暴露就只能靠真机等下一次卡顿，等于不验证）。生产路径不会调用。 */
+      startPaceWatch: startPaceWatch,
     };
   } catch (e) {
-    window.__MASR_TEST_WB__ = { pushTaskResult: pushTaskResult, pwList: pwList, pwSave: pwSave, RunState: RunState };
+    window.__MASR_TEST_WB__ = {
+      pushTaskResult: pushTaskResult, pwList: pwList, pwSave: pwSave, RunState: RunState,
+      startPaceWatch: startPaceWatch,
+    };
   }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
   try { (unsafeWindow || window).__MASR_TEST_SVC__ = SVC; } catch (e) { window.__MASR_TEST_SVC__ = SVC; }
