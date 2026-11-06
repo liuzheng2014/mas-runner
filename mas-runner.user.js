@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.1
+// @version      0.9.2
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -128,6 +128,11 @@
  *       type 支持 skip_if_empty（可空字段原来只能填假值或整步失败）
  *   - v0.9.1：补漏——「已按页面记录取数」那行日志把 params 原样打印，参数级脱敏漏了这一处，
  *     等于密码照样进日志（0.9.0 的 golden trace 基线里就躺着明文）。secret 参数改走 maskValue。
+ *   - v0.9.2：场景列表零命中时强刷一次。缓存 TTL 10 分钟，而「刚发布的新场景」必然不在
+ *     旧缓存里；过去零命中被当成「这页没场景」直接挂面板，导致发布后第一次点业务按钮
+ *     静默无反应（既不报错也不提示，只能干等缓存过期或手动清 GM 存储）。现在零命中且缓存
+ *     超过 60s 就 force 拉一次（全局 60s 限流，避免每个无关页面都多打一次接口）；
+ *     多场景歧义命中不在此列——那是「声明不足待人工」，刷了也一样歧义。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -924,7 +929,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.1',
+    RUNNER_VERSION: '0.9.2',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1821,6 +1826,12 @@
     // 加新场景 = 加一份 spec —— 这里一行不改，也不认识任何表 ID / 业务列名。
     SCENES_KEY: 'masr_scenes_v1',
     SCENES_TTL_MS: 10 * 60 * 1000,
+    // 场景列表是「10 分钟缓存」：刚发布的新场景不在旧缓存里，而「零命中」又被当成
+    // 「这页确实没场景」静默跳过 → 发版后第一次点按钮什么都不会发生（2026-11-06
+    // 发 P2 两个场景时踩到，用户只能干等 10 分钟或清存储）。零命中时强刷一次，
+    // 用这个键全局限流，避免在每个无关页面（飞书/跳板）上都多打一次接口。
+    SCENES_FORCE_KEY: 'masr_scenes_forced_at',
+    SCENES_FORCE_MIN_MS: 60 * 1000,
   };
   /* 场景元数据缓存（进程内 + GM 存储双份，跨页/重开不用重拉）。
    * _scenePending 做在途去重：启动与点「拉待办」几乎同时发生时只打一次 /scenes。 */
@@ -1852,6 +1863,23 @@
       return (SVC._sceneCache && SVC._sceneCache.list) || [];
     });
     return SVC._scenePending;
+  };
+  /* 零命中时强刷一次场景列表，再判一遍。
+   * 为什么需要：缓存 TTL 10 分钟，而「刚发布的场景」必然不在旧缓存里；此时零命中
+   * 不等于「这页没场景」，直接挂面板 = 用户点完按钮什么都没发生，也看不出原因。
+   * 限流 60s（全局一次），所以代价是每个页面最多每分钟一次额外请求，而不是每次加载。 */
+  SVC.scenesWhenUnmatched = function (url) {
+    const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
+    const hit = SVC.matchTriggerIn(list, url);
+    // 多场景歧义命中时 matchTriggerIn 返回 null，但那是「声明不足待人工」，不是「没场景」——
+    // 不该为了它去强刷（刷了也一样歧义），原样返回 null 让上层按歧义处理。
+    if (hit || SVC._triggerAmbiguous) return Promise.resolve(hit);
+    const last = Number(GM_getValue(SVC.SCENES_FORCE_KEY, '0') || 0);
+    if (Date.now() - last < SVC.SCENES_FORCE_MIN_MS) return Promise.resolve(null);
+    try { GM_setValue(SVC.SCENES_FORCE_KEY, String(Date.now())); } catch (e) {}
+    return SVC.scenes(true).then(function () {
+      return SVC.matchTriggerIn((SVC._sceneCache && SVC._sceneCache.list) || [], url);
+    }).catch(function () { return null; });
   };
   SVC.sceneById = function (scriptId) {
     const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
@@ -4021,7 +4049,13 @@
     SVC.scenes().then(function () {                    // 慢路径：首次安装/缓存过期，先取规则再决定
       const hit = SVC.matchTrigger();
       if (hit && hit.redirect_to) { try { armUrlTrigger(); } catch (e) {} return; }
-      mountAll();
+      if (hit) { mountAll(); return; }
+      /* 零命中：可能只是「刚发布的新场景不在旧缓存里」（TTL 10 分钟），不是「这页没场景」。
+       * 强刷一次再判（内部 60s 限流），否则发版后第一次点按钮会静默无反应。 */
+      return SVC.scenesWhenUnmatched(location.href).then(function (fresh) {
+        if (fresh && fresh.redirect_to) { try { armUrlTrigger(); } catch (e) {} return; }
+        mountAll();
+      });
     }).catch(function () { mountAll(); });
   }
 
