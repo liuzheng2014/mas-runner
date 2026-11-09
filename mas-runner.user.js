@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.14
+// @version      0.9.15
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -321,6 +321,52 @@
     if (!assigned) throw new Error('E_UI 赋值后 input.files 仍为空——浏览器没有接受这次赋值（不是上传失败）');
     inp.dispatchEvent(new Event('change', { bubbles: true }));
     return { assigned: assigned, size: bytes.length, filename: file.name, mime: file.type };
+  };
+  /* 从一次性地址取文件字节（0.9.15，方案 D）。
+   * 为什么必须走 GM_xhr 而不是页面 fetch：业务页 CSP 的 connect-src 会拦外域——
+   * 2026-11-06 实测 ads.huawei.com 把自家 Worker 的请求整条拒掉（同一个 URL 在 example.com
+   * 返回 200，证明是页面 CSP 而不是服务端）。GM_xhr 走扩展上下文，不受页面 CSP 约束，
+   * 且 @connect * 已在头部声明。
+   * 不用 .js 中转形态：那要求服务端把整个文件 base64 一遍，免费 Workers 的 10ms CPU 撑不住。 */
+  ENGINE.uiFetchBytes = function (url) {
+    return new Promise(function (resolve, reject) {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('E_ENV 当前环境没有 GM_xmlhttpRequest，无法从 URL 取文件字节（不能退回页面 fetch：会被页面 CSP 拦）'));
+        return;
+      }
+      let done = false;
+      const fail = function (msg) { if (!done) { done = true; reject(new Error(msg)); } };
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: url,
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        onload: function (r) {
+          if (done) return;
+          if (r.status === 410) {
+            fail('E_UI_FILE_SRC 地址已过期（410）：' + url + '；重新取一次数（/task）会签发新地址');
+            return;
+          }
+          if (r.status === 404) {
+            fail('E_UI_FILE_SRC 地址不存在（404）：' + url + '；可能是 KV 已被清理，重跑一次取数');
+            return;
+          }
+          if (r.status !== 200) {
+            fail('E_UI_FILE_SRC 取文件失败 HTTP ' + r.status + '：' + url);
+            return;
+          }
+          const ab = r.response;
+          if (!ab || typeof ab.byteLength !== 'number') {
+            fail('E_UI_FILE_SRC 没拿到二进制响应（responseType=arraybuffer 未生效？）：' + url);
+            return;
+          }
+          done = true;
+          resolve(ab);
+        },
+        onerror: function () { fail('E_UI_FILE_SRC 网络错误：' + url); },
+        ontimeout: function () { fail('E_UI_FILE_SRC 取文件超时（60s）：' + url); },
+      });
+    });
   };
   /* 等元素出现：命中即刻返回（正常路径零额外耗时），未命中每 100ms 重试至超时。
    * 为什么必须等（2026-11-06 事故）：业务页是 SPA，URL 触发时 document-idle 只代表
@@ -745,17 +791,32 @@
         const uxp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
         if (!uxp) throw new Error('E_SPEC upload 缺 xpath（必须指向 input[type=file]）');
         const b64 = String(ENGINE.resolvePlaceholders(String(a.base64 || ''), scope) || '').replace(/\s+/g, '');
-        if (!b64) throw new Error('E_SPEC upload 的 base64 为空（' + (a.base64 || '未声明') + '）——多半是业务表这一列没有附件');
+        /* src（0.9.15）：一次性地址，字节由 GM_xhr 取。与 base64 二选一——
+         * 老 spec 的 base64 写法一行不改继续可用。 */
+        const src = String(ENGINE.resolvePlaceholders(String(a.src || ''), scope) || '').trim();
+        if (!b64 && !src) {
+          const declared = a.base64 || a.src;
+          throw new Error('E_SPEC upload 的 base64 / src 都是空（' + (declared || '两者都未声明') + '）'
+            + '——声明的是占位符时，多半是业务表这一列没有附件');
+        }
         const fname = ENGINE.resolvePlaceholders(String(a.filename || 'upload.bin'), scope);
         const mm = ENGINE.resolvePlaceholders(String(a.mime || 'application/octet-stream'), scope);
 
         const inp = ENGINE.uiFindByXPath(uxp);
         if (!inp) throw new Error('E_UI_TARGET upload 目标未找到：' + (a.name || uxp));
 
-        let bin;
-        try { bin = atob(b64); } catch (e) { throw new Error('E_SPEC upload 的 base64 无法解码：' + e.message); }
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        let bytes;
+        if (b64) {
+          let bin;
+          try { bin = atob(b64); } catch (e) { throw new Error('E_SPEC upload 的 base64 无法解码：' + e.message); }
+          bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        } else {
+          if (!/^https?:\/\//i.test(src)) throw new Error('E_SPEC upload 的 src 必须是 http(s) 地址，实际「' + src + '」');
+          const ab = await ENGINE.uiFetchBytes(src);
+          bytes = new Uint8Array(ab);
+        }
+        if (!bytes.length) throw new Error('E_UI_FILE_SRC ' + (a.name || '') + '：取到 0 字节（源文件为空或下载被截断）');
 
         const put = ENGINE.uiPutFile(inp, bytes, fname, mm);
         log('已塞入文件 ' + put.filename + '（' + put.size + ' 字节，' + put.mime + '）→ ' + (a.name || label)
@@ -1201,7 +1262,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.14',
+    RUNNER_VERSION: '0.9.15',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
