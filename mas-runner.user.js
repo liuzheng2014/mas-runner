@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.15
+// @version      0.9.16
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -772,7 +772,18 @@
         try { rel = ENGINE.uiFindByXPath(rxp); } catch (e1) { throw new Error('E_UI_TARGET read 选择器无效: ' + rxp); }
         if (!rel && readyMs > 0) rel = await ENGINE.uiWaitByXPath(rxp, readyMs, sleep);
         if (!rel) throw new Error('E_UI_TARGET 要读取的元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : ''));
-        const got = ENGINE.uiText(rel);
+        let got = ENGINE.uiText(rel);
+        /* regex（0.9.16）：从页面文本里只取一段。典型场景是结果页那行「账户ID 2077792760467029248」——
+         * 要回写进业务表的是纯数字，整段写进去会把「账户ID 」四个字一起塞进「客仓ID」列，
+         * 而且不报错（看起来「有值」）。取不到必须报错指名正则与实际文本，禁止退回整段。 */
+        if (a.regex != null && String(a.regex).length) {
+          let m = null;
+          try { m = new RegExp(String(a.regex)).exec(got); }
+          catch (e) { throw new Error('E_SPEC read 的 regex 非法: ' + a.regex + '（' + e.message + '）'); }
+          if (!m) throw new Error('E_UI_READ ' + label + '：文本里没有匹配 /' + a.regex + '/ 的内容（实际「'
+            + String(got).slice(0, 80) + '」）');
+          got = m[0];
+        }
         const key = String(a.var || ('v' + Object.keys(readings).length));
         readings[key] = got;
         log('读取 ' + label + ' = ' + (a.secret === true ? ENGINE.maskValue(got) : (got.length > 48 ? got.slice(0, 48) + '…' : got)));
@@ -901,6 +912,32 @@
               const Ctor = (evs[e2] === 'pointerenter' && typeof PointerEvent !== 'undefined') ? PointerEvent : MouseEvent;
               el.dispatchEvent(new Ctor(evs[e2], { bubbles: !/enter$/.test(evs[e2]), cancelable: true, view: window }));
             } catch (e3) { /* 老浏览器不支持 PointerEvent：mouseenter 兜底 */ }
+          }
+          if (until) {
+            const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
+            if (!ok) { lastErr = untilMs + 'ms 内未变为 ' + until; log('未生效（' + lastErr + '），重试 ' + label); continue; }
+          }
+          if (!(await verifyExpect())) continue;
+        } else if (act === 'check') {
+          /* 幂等勾选（0.9.16）：把目标勾选到期望状态，已经处于期望状态就不再点。
+           * 为什么非要有这条原语：复选框的「点击」不是幂等的。同意项、三证合一这类开关，
+           * 已经勾上的再点一次就取消了，页面不报任何错，直到提交才炸；更坏的情况是把
+           * 「三证合一」点掉——资质区整块从「1 张执照」换成「三证分开」，后面所有上传位全错。
+           * 所以判据只认控件当前状态（input.checked / aria-checked），不认「我点过了」。 */
+          const want = a.checked === false ? false : true;
+          const cur = () => (el.checked === true) || el.getAttribute('aria-checked') === 'true';
+          if (cur() === want) {
+            log('已是目标状态（' + (want ? '已勾选' : '未勾选') + '），不重复点击：' + label);
+          } else {
+            log((want ? '勾选 ' : '取消勾选 ') + label + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+            el.click();
+            /* 等一拍再读：Vue 的 model 更新要 nextTick，立即读会读到旧状态而误判成失败 */
+            await sleep(120);
+          }
+          if (cur() !== want) {
+            lastErr = '勾选后状态不符（期望 ' + (want ? '勾上' : '未勾') + '，实际 ' + (cur() ? '勾上' : '未勾') + '）';
+            log('未生效（' + lastErr + '），重试 ' + label);
+            continue;
           }
           if (until) {
             const ok = await ENGINE.uiWaitState(target, until, untilMs, sleep);
@@ -1262,7 +1299,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.15',
+    RUNNER_VERSION: '0.9.16',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
