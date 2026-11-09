@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.23
+// @version      0.9.24
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1693,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.23',
+    RUNNER_VERSION: '0.9.24',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2863,8 +2863,9 @@
         if (hit && hit.script_id) { sid = String(hit.script_id); sidFrom = '当前页命中'; }
       }
       const ids = [];
-      if (sid) ids.push(sid);
-      else scenes.forEach(function (s) { if (s && s.script_id) ids.push(String(s.script_id)); });
+      const push = function (x) { if (x && ids.indexOf(x) < 0) ids.push(x); };
+      if (sid) push(sid);
+      else scenes.forEach(function (s) { if (s && s.script_id) push(String(s.script_id)); });
       if (sid) {
         UI.appendLog({ t: Date.now(), level: 'info', msg: '同步目标：' + sid + '（' + sidFrom + '），其余场景不动' });
       } else {
