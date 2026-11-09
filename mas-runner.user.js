@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.17
+// @version      0.9.18
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -225,6 +225,22 @@
  *     自建源落后时自动改走 jsDelivr 直链（否则点更新还是被送回旧版，用户无法自救）；
  *     ③有源报的版本比当前还旧时点名告警——那说明分发链坏了，不是「已是最新」。
  *     判据：**多源聚合必须按值取最优，不能按顺序取第一个成功的**；"拿到回答"≠"拿到正确答案"。
+ *   - v0.9.18：两件开户链路上的硬需求（2026-11-09 真机复盘）。
+ *     ①**pick_date 原语**：华为开户「授权有效期」是 el-date-editor--daterange（受控组件）。
+ *       type 只改到 DOM 的 input.value，组件模型不变——真机症状是「值看着在、点提交被
+ *       『请选择授权有效期』拦下」。要自动化只能点面板，而面板**没有年份视图**，跨十年的结束
+ *       日期要点 10 次「后一年」，点击次数取决于记录里的年份差，写不进 spec。所以把
+ *       「按目标年月翻页 + 点日 + 回读校验」放进引擎，spec 只声明 xpath/from/to。
+ *       判据两条：起点格出现 td.start-date 标记；两个 .el-range-input 的显示值归一后与目标一致。
+ *       **不看 el-range__close-icon**（它受 hover/展开影响，空模型时也可能显示，反过来当判据会
+ *       把「没写进去」判成「写进去了」）。
+ *     ②**when 支持按参数分支**（action 级 when + gateWhen.param）。现场：同一个账号「改没改过
+ *       密码」决定用初始密码还是正式密码登录，而这一点在登录页上**看不出来**（只能从业务表
+ *       「密码修改结果」知道）。以前只能把所有相关动作写成 optional，结果是「本来就没有弹层」
+ *       和「选择器写错了」长得一模一样（都静默跳过），两种前态还得写两份重复步骤。
+ *       现在：{"param":"pwd_change_result","equals":"修改成功"} —— 不命中就跳过**这一个动作**
+ *       并留日志（写明实际值与条件），其余照跑。参数没取到按空串算（表里该列本来就常为空，
+ *       是正常前态，不是配置错误），但拼错的参数名由校验器拦下（永远不命中 = 静默跳过）。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -632,15 +648,55 @@
     });
   };
   /* 闸门条件：判断「此刻该不该弹闸门」。
-   * 业务上有两类必须拦的情况，都不能靠人盯着：
+   * 业务上必须拦的三类情况，都不能靠人盯着：
    *   ① 元素出现即代表异常/需要人工（如 .hwid-authentication-root = 要短信验证码）
    *   ② 两个数字比大小（如「成员人数 139」vs「成员人数上限 200」，满了就不能再建）
-   * 引擎只做「取文本 → 正则提数 → 按运算符比较」，业务含义全部由 spec 声明（pattern/op）。
+   *   ③ 参数值等于/不等于某个值（0.9.18：同一份 spec 要覆盖两种业务前态，见下）
+   * 引擎只做「取文本 → 正则提数 → 按运算符比较」/「取参数 → 逐字比较」，
+   * 业务含义全部由 spec 声明（pattern/op/param+equals）。
    * 返回 {hit, detail} 或 {error}：**判不出来必须报错，不能当成「没命中」放过去**——
    * 判不出来还继续，等于在不知道是否满员的情况下建成员。 */
   ENGINE.gateWhen = function (when, scope) {
     const rp = (s) => ENGINE.resolvePlaceholders(String(s == null ? '' : s), scope || {});
     if (!when || typeof when !== 'object') return { hit: true, detail: '无条件闸门' };
+
+    /* param（0.9.18）：按参数值分支。
+     * 为什么需要：华为开户「密码改没改过」决定两件事——用初始密码还是正式密码登录、
+     * 页面上还会不会弹「设置新密码」。这是**业务前态**，页面上看不出来（只能在登录之后才知道），
+     * 所以必须按参数在动作执行前分支。以前没有这条，只能让每个动作都 optional，
+     * 结果是「弹层不在」和「选择器写错」长得一模一样（都静默跳过），
+     * 而且两种前态要写两份重复的步骤。
+     *   {"param":"pwd_change_result","equals":"修改成功"}
+     *   {"param":"pwd_change_result","not_equals":"修改成功"}
+     * 参数不存在/为空 → 当前值按空串算（业务表该列本来就可能为空，这是正常前态，不是配置错误）；
+     * 但 `when.param` 指向一个 spec 没声明过的名字时由校验器拦（拼错的名字永远不命中，
+     * 会让「本该执行的分支」静默跳过，比报错危险得多）。 */
+    if (when.param) {
+      const name = String(when.param);
+      const has = !!(scope && Object.prototype.hasOwnProperty.call(scope, name));
+      const cur = has && scope[name] != null ? String(scope[name]) : '';
+      const show = when.secret === true ? String(ENGINE.maskValue(cur)) : (cur.length > 40 ? cur.slice(0, 40) + '…' : cur);
+      const label = when.name || ('参数 ' + name);
+      const cands = [];
+      if (when.equals !== undefined) cands.push({ op: '==', want: rp(String(when.equals)) });
+      if (when.not_equals !== undefined) cands.push({ op: '!=', want: rp(String(when.not_equals)) });
+      if (Array.isArray(when.in)) when.in.forEach((x) => cands.push({ op: 'in', want: rp(String(x)) }));
+      if (!cands.length) return { error: 'when.param 必须配 equals / not_equals / in 之一（' + name + '）' };
+      /* 多个条件 = 全部满足（and）。逐条算，命中与否都要落进 detail —— 排查时最需要的是
+       * 「实际值是什么」，而不是一句「条件不满足」。 */
+      let hit = true;
+      const parts = [];
+      for (const c of cands) {
+        const ok = c.op === '==' ? (cur === c.want) : c.op === '!=' ? (cur !== c.want) : (cur === c.want);
+        if (!ok) hit = false;
+        parts.push(c.op + '「' + (when.secret === true ? String(ENGINE.maskValue(c.want)) : c.want) + '」→' + (ok ? '成立' : '不成立'));
+      }
+      return {
+        hit: hit,
+        detail: label + ' 实际' + (has ? '' : '（未取到，按空串算）') + '「' + show + '」；' + parts.join('，'),
+        values: [cur],
+      };
+    }
 
     if (when.exists) {
       const xp = rp(when.exists);
@@ -689,6 +745,211 @@
       values: [a, b],
     };
   };
+  /* ==================== 日期区间选择（0.9.18）====================
+   * 为什么必须有这个原语：Element Plus 的 el-date-editor--daterange 是**受控组件**，
+   * type 只改到 DOM 的 input.value，改不到组件内部模型（2026-11-09 真机：填完值、提交时
+   * 仍被「请选择授权有效期」拦下）。而面板没有年份视图，跨十年的结束日期要点 10 次
+   * 「后一年」——点击次数取决于记录里的年份差，写不进 spec。所以把「按目标日期翻月 + 点日」
+   * 这段算法放进引擎，spec 只声明 xpath + from/to。
+   *
+   * 取到的页面事实（2026-11-09，真实 Element Plus 2.x）：
+   *   · 打开面板：对 .el-date-editor 派发 mousedown（click 不够）
+   *   · 面板：.el-date-range-picker 内两个 .el-date-range-picker__content.is-left / .is-right
+   *   · 表头：两枚 .el-date-range-picker__header-label，依次是「年」「月」
+   *   · 翻页按钮：左框 d-arrow-left（前一年）/ arrow-left（前一月），
+   *              右框 d-arrow-right（后一年）/ arrow-right（后一月）；**按 class 找，不按
+   *              aria-label**——label 会随站点语言变（中文站点是「后一年」）
+   *   · 日期格：td.available + span.el-date-table-cell__text，跨月格带 prev-month/next-month
+   *   · 选中起点后有 td.start-date 标记；两个都选完 model 才落地
+   * 判据（必须两条都过）：①起点格出现 start-date 标记；②两个 .el-range-input 的显示值
+   * 归一成 年-月-日 后与目标一致。**不看 el-range__close-icon**：它是否显示取决于 hover/展开，
+   * 空模型时也可能显示、有模型时也可能藏着，拿它当判据会得出反向结论（0.3.3 踩过）。 */
+  ENGINE.parseYmd = function (raw) {
+    const m = String(raw == null ? '' : raw).match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+    if (!m) return null;
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    /* 「11 月」这种只有年份+月份+日 才算数；范围外的一律当解析失败，不猜。 */
+    if (!(y >= 1900 && y <= 2199) || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+    return { y: y, m: mo, d: d };
+  };
+  ENGINE.MONTH_NAME = {
+    january: 1, february: 2, march: 3, april: 4, may: 5, june: 6, july: 7,
+    august: 8, september: 9, october: 10, november: 11, december: 12,
+    jan: 1, feb: 2, mar: 3, apr: 4, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12,
+  };
+  /* 表头两枚 label → {y, m}。月份标签可能是数字（中文站点「11 月」）或月名（英文 locale），
+   * 两种都认；都认不出来就报错指名原文，**绝不猜一个月**——猜错会静默点到别的日期。 */
+  ENGINE.parsePanelHead = function (box) {
+    if (!box) return { error: '面板里没有这一半（.el-date-range-picker__content）' };
+    const labels = Array.prototype.slice.call(box.querySelectorAll('.el-date-range-picker__header-label'))
+      .map(function (el) { return ENGINE.uiText(el); });
+    if (labels.length < 2) return { error: '表头标签不足 2 枚（实际 ' + labels.length + ' 枚：' + labels.join('|') + '）' };
+    const ym = String(labels[0]).match(/(\d{4})/);
+    if (!ym) return { error: '表头里取不到年份：「' + labels[0] + '」' };
+    const mRaw = String(labels[1]).trim();
+    const mNum = mRaw.match(/(\d{1,2})/);
+    let mo = mNum ? Number(mNum[1]) : (ENGINE.MONTH_NAME[mRaw.toLowerCase().replace(/[^a-z]/g, '')] || 0);
+    if (!(mo >= 1 && mo <= 12)) {
+      return { error: '表头里认不出月份：「' + mRaw + '」（只认数字月或英文月名，认不出不猜）' };
+    }
+    return { y: Number(ym[1]), m: mo };
+  };
+  /* 选一个日期区间。返回 {from, to}（实际落地的两个值）。
+   * 全程只用「点」：翻月按钮 + 日期格，不写 input.value。 */
+  ENGINE.pickDateRange = async function (o) {
+    const doc = (o.doc || document);
+    const sleep = o.sleep;
+    const log = o.log || function () {};
+    const from = ENGINE.parseYmd(o.from);
+    const to = ENGINE.parseYmd(o.to);
+    if (!from || !to) {
+      throw new Error('E_SPEC pick_date 的 from/to 必须是可解析的日期（如 2026-11-09）：from=「'
+        + o.from + '」 to=「' + o.to + '」');
+    }
+    const key = (d) => d.y * 10000 + d.m * 100 + d.d;
+    if (key(from) > key(to)) {
+      throw new Error('E_SPEC pick_date 的起点晚于终点（from=' + o.from + '，to=' + o.to
+        + '）——业务表「开始日期/结束日期」两列多半填反了');
+    }
+    const ed = o.editor;
+    if (!ed) throw new Error('E_UI_PICKDATE 日期控件未找到（xpath 解析为空）');
+
+    const findPanel = function () {
+      const all = Array.prototype.slice.call(doc.querySelectorAll('.el-date-range-picker'));
+      const vis = all.filter(function (p) { return ENGINE.uiIsVisible(p); });
+      if (vis.length > 1) log('警告：页面上有 ' + vis.length + ' 个可见的日期区间面板，取第一个（' + vis.length + ' 个说明同时开了多个选择器）');
+      return vis[0] || null;
+    };
+    const open = async function () {
+      let p = findPanel();
+      if (p) return p;
+      /* mousedown 是真实入口：click 不会展开（Element Plus 绑定在 onMousedown 上） */
+      ed.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: doc.defaultView }));
+      await sleep(350);
+      p = findPanel();
+      if (!p) {
+        ed.click();
+        await sleep(350);
+        p = findPanel();
+      }
+      if (!p) {
+        throw new Error('E_UI_PICKDATE 点开日期面板失败：派发 mousedown/click 后页面上没有可见的 .el-date-range-picker'
+          + '（可能控件结构变了，或这个 xpath 指的不是 el-date-editor）');
+      }
+      return p;
+    };
+    const boxes = function (p) {
+      return {
+        left: p.querySelector('.el-date-range-picker__content.is-left'),
+        right: p.querySelector('.el-date-range-picker__content.is-right'),
+      };
+    };
+    const clickN = async function (p, dir, n) {
+      const b = boxes(p);
+      const box = dir === 'next' ? b.right : b.left;
+      const cls = dir === 'next' ? 'd-arrow-right' : 'd-arrow-left';
+      const btn = box && box.querySelector('button.' + cls);
+      if (!btn) throw new Error('E_UI_PICKDATE 找不到翻年按钮 button.' + cls + '（面板结构变了）');
+      for (let i = 0; i < n; i++) { btn.click(); await sleep(40); }
+    };
+    const clickM = async function (p, dir, n) {
+      const b = boxes(p);
+      const box = dir === 'next' ? b.right : b.left;
+      const cls = dir === 'next' ? 'arrow-right' : 'arrow-left';
+      const btn = box && box.querySelector('button.' + cls);
+      if (!btn) throw new Error('E_UI_PICKDATE 找不到翻月按钮 button.' + cls + '（面板结构变了）');
+      for (let i = 0; i < n; i++) { btn.click(); await sleep(40); }
+    };
+    /* 把左面板翻到目标月（右面板恒为左+1，翻任何一边都是整块平移） */
+    const gotoMonth = async function (p, target) {
+      for (let guard = 0; guard < 6; guard++) {
+        const cur = ENGINE.parsePanelHead(boxes(p).left);
+        if (cur.error) throw new Error('E_UI_PICKDATE ' + cur.error);
+        const diff = (target.y * 12 + target.m) - (cur.y * 12 + cur.m);
+        if (diff === 0) return;
+        const years = diff > 0 ? Math.floor(diff / 12) : Math.ceil(diff / 12);
+        if (years !== 0) { await clickN(p, years > 0 ? 'next' : 'prev', Math.abs(years)); await sleep(90); continue; }
+        const months = diff;
+        if (months !== 0) { await clickM(p, months > 0 ? 'next' : 'prev', Math.abs(months)); await sleep(90); continue; }
+        throw new Error('E_UI_PICKDATE 翻月没有进展（目标 ' + target.y + '-' + target.m + '，当前 ' + cur.y + '-' + cur.m + '）');
+      }
+      const cur = ENGINE.parsePanelHead(boxes(p).left);
+      throw new Error('E_UI_PICKDATE 连续 6 轮都没翻到目标月 ' + target.y + '-' + target.m
+        + '（当前 ' + (cur.error || cur.y + '-' + cur.m) + '）——面板年份范围可能被 mindate/maxdate 限住');
+    };
+    /* 在面板里点目标那一天 */
+    const clickDay = function (p, target) {
+      const b = boxes(p);
+      const tries = [b.left, b.right];
+      for (let i = 0; i < tries.length; i++) {
+        const box = tries[i];
+        if (!box) continue;
+        const ym = ENGINE.parsePanelHead(box);
+        if (ym.error || ym.y !== target.y || ym.m !== target.m) continue;
+        const tds = Array.prototype.slice.call(box.querySelectorAll('td')).filter(function (td) {
+          const cell = td.querySelector('.el-date-table-cell__text') || td;
+          if (String(ENGINE.uiText(cell)) !== String(target.d)) return false;
+          const cls = ' ' + String(td.className || '') + ' ';
+          if (cls.indexOf(' prev-month ') >= 0 || cls.indexOf(' next-month ') >= 0) return false;
+          if (cls.indexOf(' disabled ') >= 0) return false;
+          return cls.indexOf(' available ') >= 0;
+        });
+        if (tds.length !== 1) {
+          throw new Error('E_UI_PICKDATE ' + target.y + '-' + target.m + '-' + target.d
+            + ' 在「' + target.y + '-' + target.m + '」格子里命中 ' + tds.length
+            + ' 个可选日期格（期望 1 个）——该日期可能被 mindate/maxdate 禁用（disabled 的格子不算可选）');
+        }
+        tds[0].click();
+        return;
+      }
+      throw new Error('E_UI_PICKDATE 面板里没有「' + target.y + '-' + target.m + '」这一格（左右两半都没有）');
+    };
+    const readRange = function () {
+      const ins = Array.prototype.slice.call(ed.querySelectorAll('.el-range-input'));
+      return ins.length >= 2 ? [ins[0].value, ins[1].value] : null;
+    };
+
+    let p = await open();
+    log('日期面板已打开（左 ' + (function () { const h = ENGINE.parsePanelHead(boxes(p).left); return h.error || (h.y + '-' + h.m); })() + '）');
+    await gotoMonth(p, from);
+    clickDay(p, from);
+    await sleep(180);
+    /* 起点标记：Element Plus 给起点格加 td.start-date。没有它说明那一下没落到格子上，
+     * 后面的结束日期会被当成新的起点（区间变成「结束那天起」），必须当场发现。 */
+    p = findPanel() || p;
+    const startMark = Array.prototype.slice.call(p.querySelectorAll('td.start-date'))
+      .map(function (td) { return ENGINE.uiText(td.querySelector('.el-date-table-cell__text') || td); });
+    if (startMark.length !== 1 || String(startMark[0]) !== String(from.d)) {
+      throw new Error('E_UI_PICKDATE 点了起点 ' + o.from + '，但面板里标记为起点的格子是 ['
+        + startMark.join(',') + ']（期望 [' + from.d + ']）——起点没落上，不能继续点结束日期');
+    }
+    log('起点已选：' + o.from);
+    await gotoMonth(p, to);
+    clickDay(p, to);
+    await sleep(250);
+
+    const got = readRange();
+    if (!got) throw new Error('E_UI_PICKDATE 控件里找不到 .el-range-input（结构变了）');
+    const g0 = ENGINE.parseYmd(got[0]), g1 = ENGINE.parseYmd(got[1]);
+    const same = function (a, b) { return a && b && a.y === b.y && a.m === b.m && a.d === b.d; };
+    if (!same(g0, from) || !same(g1, to)) {
+      throw new Error('E_UI_PICKDATE 选完回读不符：期望 ' + o.from + ' ~ ' + o.to
+        + '，控件里是「' + got[0] + '」~「' + got[1] + '」——组件没接受（受控组件只认面板点击）');
+    }
+    log('区间已写入控件：' + got[0] + ' ~ ' + got[1]);
+    /* 收起面板：Escape → 仍开着就点空白处（面板是绝对定位，挡着后面的按钮会点空）。
+     * 收不起来只告警不失败：值已经落地，后面 submit 的红字才是真门。 */
+    const esc = new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true });
+    const first = ed.querySelector('.el-range-input') || ed;
+    try { first.dispatchEvent(esc); } catch (e) {}
+    await sleep(200);
+    if (findPanel()) {
+      try { doc.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: doc.defaultView })); } catch (e) {}
+      await sleep(200);
+    }
+    if (findPanel()) log('警告：日期面板没有收起（值已落地，不影响提交），如挡住后面的按钮请手动点一下空白处');
+    return { from: got[0], to: got[1] };
+  };
   ENGINE.execUiActions = async function (actions, scope, opts) {
     opts = opts || {};
     const gap = Number(opts.gap_ms) || 400;
@@ -706,6 +967,21 @@
      * 所以 click 支持声明 until=hidden/visible：动作后校验是否真的生效，没生效就重做。 */
     async function runOne(a) {
       const act = String(a.do || '');
+      /* 动作级 when（0.9.18）：条件不成立就**这一步动作**跳过，其余照做。
+       * 与步骤级 step.when 的分工：step.when 只能整步跳过，而「同一份 spec 覆盖两种业务前态」
+       * 往往只差一个动作（如登录密码：改过密用正式密码、没改过用初始密码——两个动作同一个输入框）。
+       * confirm_gate 自己会评估 when（那里 hit = 要弹闸门），不在这里重复判。 */
+      if (a.when && act !== 'confirm_gate') {
+        const w = ENGINE.gateWhen(a.when, scope);
+        if (w.error) {
+          throw new Error('E_GATE 动作条件无法判定：' + w.error + '（' + (a.name || act) + '）');
+        }
+        if (!w.hit) {
+          log('跳过 ' + (a.name || act) + '：条件不满足（' + w.detail + '）');
+          return;
+        }
+        log('条件成立（' + w.detail + '），执行 ' + (a.name || act));
+      }
       if (act === 'wait') { await sleep(Number(a.ms) || gap); return; }
       /* 关页是纯本地动作：不等网络、不依赖任何元素。调用后页面可能立刻销毁，
        * 所以不做「关掉了吗」的回读——那是自欺欺人（页面没了就读不到了）。 */
@@ -867,6 +1143,35 @@
         const key = String(a.var || ('v' + Object.keys(readings).length));
         readings[key] = got;
         log('读取 ' + label + ' = ' + (a.secret === true ? ENGINE.maskValue(got) : (got.length > 48 ? got.slice(0, 48) + '…' : got)));
+        return;
+      }
+
+      /* pick_date（0.9.18）：按 from/to 在日期面板里翻月 + 点日，把区间真正写进受控组件。
+       * 声明：{"do":"pick_date","xpath":"<form-item 或 .el-date-editor>","from":"{{start_date}}","to":"{{end_date}}"}
+       * 为什么不是 type：el-date-editor--daterange 只认面板点击，写 input.value 不进模型
+       * （真机症状：值看着在、提交被「请选择授权有效期」拦下）。详见 ENGINE.pickDateRange。 */
+      if (act === 'pick_date') {
+        const pxp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
+        if (!pxp) throw new Error('E_SPEC pick_date 缺 xpath（指向日期控件或其外层 form-item）');
+        const pfrom = String(ENGINE.resolvePlaceholders(String(a.from == null ? '' : a.from), scope) || '').trim();
+        const pto = String(ENGINE.resolvePlaceholders(String(a.to == null ? '' : a.to), scope) || '').trim();
+        let host = null;
+        try { host = ENGINE.uiFindByXPath(pxp); } catch (e1) { throw new Error('E_UI_TARGET pick_date 选择器无效: ' + pxp); }
+        if (!host && readyMs > 0) host = await ENGINE.uiWaitByXPath(pxp, readyMs, sleep);
+        if (!host) {
+          if (a.optional === true) { log('跳过 ' + label + '：页面没有这个日期控件（spec 声明 optional）'); return; }
+          throw new Error('E_UI_TARGET pick_date 的日期控件未找到: ' + pxp);
+        }
+        /* 允许 xpath 指到外层（form-item / 单元格），自动收窄到 .el-date-editor */
+        let editor = host;
+        if (String(editor.className || '').indexOf('el-date-editor') < 0) {
+          editor = (editor.closest && editor.closest('.el-date-editor'))
+            || (editor.querySelector && editor.querySelector('.el-date-editor'))
+            || editor;
+        }
+        log('选择日期区间 ' + label + '：' + pfrom + ' ~ ' + pto + '（点面板，不写 input.value）');
+        const r = await ENGINE.pickDateRange({ doc: document, editor: editor, from: pfrom, to: pto, sleep: sleep, log: log });
+        if (a.var) readings[String(a.var)] = r.from + '~' + r.to;
         return;
       }
 
@@ -1379,7 +1684,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.17',
+    RUNNER_VERSION: '0.9.18',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
