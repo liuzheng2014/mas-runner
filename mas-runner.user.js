@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.22
+// @version      0.9.23
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1693,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.22',
+    RUNNER_VERSION: '0.9.23',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2812,6 +2812,18 @@
    * 后刷新页面面板仍是 0.4.3）。场景列表另有 10 分钟 TTL，触发规则发新版后同理。
    * 语义刻意做成「强制」：绕开两级 TTL，失败不清缓存（旧版还能跑，只是没升上去），
    * 流程执行中直接拒绝（跑一半换 spec 会让后续步骤与已执行步骤错位）。 */
+  /* 同步失败的原因要说人话（0.9.23）：E_SVC_TIMEOUT 是**真的等到点**，不是「不需要更新」。
+   * 2026-11-09 用户看到三条 TIMEOUT 在问到底怎么回事——日志间隔正好 20.0s，是 GM 请求预算耗尽；
+   * 真因是当时把 7 个场景全拉了一遍，那三个根本不用同步。 */
+  UI.syncErrText = function (e) {
+    const m = String((e && e.message) || '');
+    if (/E_SVC_TIMEOUT/.test(m)) return '取 spec 超时（45 秒内没返回，后端/链路慢）：过一会儿再点一次，旧缓存仍在';
+    if (/E_NOT_FOUND/.test(m)) return '线上没有发布这个场景的 spec（404，不是超时）';
+    if (/E_SVC_WATCHDOG/.test(m)) return '脚本管理器网络通道无响应（已自动重发一次）：刷新页面再试';
+    if (/E_SVC_NET/.test(m)) return '连不上后端（网络层直接失败）：先确认服务在跑';
+    return m;
+  };
+
   UI.forceSyncSpec = async function () {
     const btn = document.getElementById('masr-spec-upgrade');
     if (UI._running) {
@@ -2831,15 +2843,34 @@
       } catch (e) {
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '场景触发规则同步失败（' + e.message + '）：继续同步 spec，触发规则仍是本机旧版' });
       }
-      // ② 目标场景：面板已加载的 → 当前任务的 → 当前页命中的；都没有就逐个同步全部场景。
-      let sid = (UI._specCache && UI._specCache.script_id) || (UI.currentTask && UI.currentTask.script_id) || '';
+      /* ② 目标场景（0.9.23）：只同步「人正看着的那一份」，不碰别的场景。
+       * 顺序：当前任务 → 面板已加载 → 面板里正显示的 spec（spec_id → script_id）→ 当前页命中。
+       * 之前只看前两项，而刷新页面时面板的 spec 是从本地原文恢复的（applySpec{fromStore}），
+       * _specCache 是空的 → 认不出面板那份 → 退化成「同步全部 7 个」（98s、3 条假失败），
+       * 更糟的是 applySpec 从不被调用 → 缓存升到 0.4.4 而徽标还是 0.4.3（2026-11-09 用户报）。 */
+      let sid = (UI.currentTask && UI.currentTask.script_id) || (UI._specCache && UI._specCache.script_id) || '';
+      let sidFrom = sid ? '当前任务' : '';
+      if (!sid && UI.spec && UI.spec.spec_id) {
+        // spec_id 是点号（huawei-ads.xxx），script_id 是下划线；约定可推导，但必须拿场景列表核一遍，
+        // 免得把一份对不上的 spec 塞进面板（历史上只有 get-api-key 不符合这个约定）。
+        const guess = String(UI.spec.spec_id).replace(/[.\-]/g, '_');
+        if (!scenes.length || scenes.some(function (x) { return x && String(x.script_id) === guess; })) {
+          sid = guess; sidFrom = '面板当前这份';
+        }
+      }
       if (!sid && scenes.length) {
         const hit = SVC.matchTriggerIn(scenes, location.href);
-        if (hit && hit.script_id) sid = hit.script_id;
+        if (hit && hit.script_id) { sid = String(hit.script_id); sidFrom = '当前页命中'; }
       }
       const ids = [];
       if (sid) ids.push(sid);
       else scenes.forEach(function (s) { if (s && s.script_id) ids.push(String(s.script_id)); });
+      if (sid) {
+        UI.appendLog({ t: Date.now(), level: 'info', msg: '同步目标：' + sid + '（' + sidFrom + '），其余场景不动' });
+      } else {
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '认不出「当前这份 spec」属于哪个场景（面板没加载、当前页也没命中）：改为同步全部 ' + ids.length + ' 个场景，会慢一些' });
+      }
       if (!ids.length) {
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '没有可同步的业务脚本：面板没加载 spec、当前页没命中场景、场景列表也拿不到。先打开一次业务页面或点「加载 spec」再试' });
         return;
@@ -2849,7 +2880,9 @@
         const id = ids[i];
         const before = SVC.specCache.get(id);
         try {
-          const s = await SVC.spec(id);
+          /* 手动同步是人在等的一次性动作：给 45s（默认 20s 在这条链路上经常不够——2026-11-09
+           * 真机三次失败都正好 20.0s 到点）。真宕机由看门狗兜底，不会无限等。 */
+          const s = await SVC.spec(id, { timeout: 45000 });
           SVC.specCache.put(id, s);
           const oldV = before ? String(before.version) : '';
           if (oldV && oldV === String(s.version)) {
@@ -2860,16 +2893,23 @@
             UI.appendLog({ t: Date.now(), level: 'ok',
               msg: 'spec 已升级：' + id + ' ' + (oldV ? 'v' + oldV + ' → ' : '（本机无缓存）→ ') + 'v' + s.version + '（本地缓存已更新）' });
           }
-          // 只把「面板当前这份 / 当前页命中的这份」换上来；别的场景只更新缓存，不动面板内容
-          const isPanelOne = (UI._specCache && UI._specCache.script_id === id) || (!UI._specCache && ids.length === 1);
+          /* 只有「面板正显示的那一份」才换上面板，别的场景只更新缓存。
+           * 判据用 spec_id（徽标上显示的就是它），不用 script_id：刷新页面时面板是从本地原文
+           * 恢复的、_specCache 为空，只有 UI.spec.spec_id 认得出面板到底摆着哪一份。
+           * 不调 applySpec 的后果就是 0.9.22 那个 bug：缓存升到 0.4.4，徽标还写着 0.4.3。 */
+          const panelSpecId = (UI.spec && UI.spec.spec_id) ? String(UI.spec.spec_id) : '';
+          const respSpecId = (s.spec && s.spec.spec_id) ? String(s.spec.spec_id) : '';
+          const isPanelOne = panelSpecId ? panelSpecId === respSpecId : (ids.length === 1);
           if (isPanelOne) {
             UI._specCache = { script_id: id, spec: s.spec, version: s.version };
             UI.applySpec(JSON.stringify(s.spec), { persist: true });
+            UI.appendLog({ t: Date.now(), level: 'ok',
+              msg: '面板已切到 v' + s.version + '（本地缓存同步更新，刷新后也是这一版）' });
           }
         } catch (e) {
           bad++;
           UI.appendLog({ t: Date.now(), level: 'warn',
-            msg: 'spec 同步失败：' + id + '（' + e.message + '）' + (before ? '——本机缓存 v' + before.version + ' 保留，仍可执行' : '——本机没有该场景缓存') });
+            msg: 'spec 同步失败：' + id + '（' + UI.syncErrText(e) + '）' + (before ? '——本机缓存 v' + before.version + ' 保留，仍可执行' : '——本机没有该场景缓存') });
         }
       }
       UI.appendLog({ t: Date.now(), level: bad && !ups ? 'fatal' : 'info',
@@ -3521,10 +3561,10 @@
       return j.item;
     });
   };
-  SVC.spec = function (scriptId) {
+  SVC.spec = function (scriptId, opts) {
     const id = scriptId || SVC.scriptFor();
     if (!id) return Promise.reject(new Error('E_SCENE 未能确定场景：该行没有 script_id，且当前不止一个场景'));
-    return SVC.call('GET', '/spec', { script_id: id });
+    return SVC.call('GET', '/spec', { script_id: id }, null, opts && opts.timeout ? { timeout: opts.timeout } : null);
   };
 
   /* ---------- spec 本地缓存（v0.8.1） ----------
