@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.16
+// @version      0.9.17
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -299,6 +299,37 @@
     const r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
     return r.singleNodeValue;
   };
+  /* Runner 自己的界面（面板 / 悬浮球 / 人工弹窗 / 日志区）绝不能被当成业务页面。
+   * 2026-11-09 事故：3A 的等待条件 `//*[contains(normalize-space(.),'录入企业信息与行业信息')]`
+   * 命中的是面板里的 #masr-spec-text（spec.json 原文预览）——spec 自己写着这串字，面板又把它
+   * 渲染出来，条件于是**永远为真**：验证码还没输就「检测到开户流程页」，落点断言永远通过。
+   * 这种假绿比报错危险得多：流程看着跑通了，实际一步没做成，还会把后续动作带错页面。 */
+  ENGINE.uiIsRunnerUI = function (el) {
+    let cur = el;
+    while (cur && cur.nodeType === 1) {
+      if (String(cur.id || '').indexOf('masr-') === 0) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  };
+  /* 「文本包含」类判定专用的查找：按文档顺序取第一个**业务**元素。
+   * 与 uiFindByXPath 的区别只有两点，但都是必须的：
+   *   ① 跳过 #masr-* 子树（面板里有 spec 原文、日志、步骤名，全是业务文案的复印件）；
+   *   ② 跳过 body/html —— 它们的 textContent 必然包含面板，contains 一样会中。
+   * click/type 不用它（目标都是具体控件，面板里不存在同名元素，用快的那条路径即可）。 */
+  ENGINE.uiFindBusinessByXPath = function (xp) {
+    if (typeof document === 'undefined') throw new Error('E_ENV ui 步骤需要 DOM 环境');
+    const r = document.evaluate(xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    for (let i = 0; i < r.snapshotLength; i++) {
+      const n = r.snapshotItem(i);
+      if (!n || n.nodeType !== 1) continue;
+      const tag = String(n.tagName || '').toUpperCase();
+      if (tag === 'BODY' || tag === 'HTML') continue;
+      if (ENGINE.uiIsRunnerUI(n)) continue;
+      return n;
+    }
+    return null;
+  };
   /* 把字节塞进 input[type=file]（0.9.14，3B 开户信息页的上传位用）。
    * 脚本不能改 input.value，但 new File + new DataTransfer 赋给 input.files 再派发 change 是通的
    * —— 2026-11-06 真机实测 Element Plus 的 el-upload 会接收并立刻发出
@@ -445,7 +476,7 @@
    * 结论：动作是否生效必须校验【结果】（字段显示值），不能校验【副作用】（浮层显隐）。
    */
   ENGINE.uiExpectText = function (xp, want) {
-    const el = ENGINE.uiFindByXPath(xp);
+    const el = ENGINE.uiFindBusinessByXPath(xp);
     const actual = ENGINE.uiText(el);
     const w = String(want == null ? '' : want);
     return { ok: !!el && actual.indexOf(w) >= 0, actual: actual, found: !!el };
@@ -614,7 +645,7 @@
     if (when.exists) {
       const xp = rp(when.exists);
       let el = null;
-      try { el = ENGINE.uiFindByXPath(xp); } catch (e) { return { error: 'exists 选择器无效: ' + xp + '（' + e.message + '）' }; }
+      try { el = ENGINE.uiFindBusinessByXPath(xp); } catch (e) { return { error: 'exists 选择器无效: ' + xp + '（' + e.message + '）' }; }
       /* 「找不到」和「找到了但被 display:none 藏住」是两件事：都算未命中，但日志必须说实话。
        * 把后者说成「不存在」，排查时会被引到「选择器写错了」的错误方向。 */
       const vis = !!el && ENGINE.uiIsVisible(el);
@@ -723,6 +754,48 @@
         if (!gr.confirmed) {
           throw engineFail('E_GATE 无法显示确认框（' + (gr.error || '未知原因') + '）——已终止，不在无人知晓的情况下继续往下跑');
         }
+        /* continue_after（0.9.17）：闸门是「告知 + 等人做完」，不是终点。
+         * 场景：首次登录要短信验证码，脚本代填不了（两个渠道都遮码）。以前点完「我知道了」
+         * 就按 E_CAPTCHA 终止，人输完验证码后页面进了「设置新密码」，但流程已经死了，
+         * 只能手动再点一次面板——这就是「接不上」。
+         * 声明 continue_after 后：人点按钮 → 遮罩关闭 → 轮询 await 条件直到命中 → 继续下一步。
+         * 缺省（不声明）仍是终止，与 0.8.x~0.9.16 行为逐字节一致。
+         *
+         * await 不能省：点完按钮的那一刻页面还没变（人刚要去输码），立刻继续会在旧页面上
+         * 执行下一步。必须等一个「人做完了」的页面证据。 */
+        if (a.continue_after === true) {
+          log('✓ 人工已确认（' + gTitle + '），继续（本闸门不是终点）');
+          const aw = a.await || null;
+          const conds = aw ? (Array.isArray(aw.any_of) ? aw.any_of : (aw.exists ? [aw] : [])) : [];
+          if (conds.length) {
+            const tmo = Math.max(1000, Number(aw.timeout_ms) || 180000);
+            const t0 = Date.now();
+            log('等待页面出现预期状态（最多 ' + Math.round(tmo / 1000) + ' 秒）…');
+            let hit = null;
+            while (!hit && Date.now() - t0 < tmo) {
+              for (let ci = 0; ci < conds.length; ci++) {
+                const c = conds[ci] || {};
+                let el = null;
+                try { el = ENGINE.uiFindBusinessByXPath(ENGINE.resolvePlaceholders(String(c.exists || ''), scope)); }
+                catch (e) { el = null; }
+                if (el && ENGINE.uiIsVisible(el)) { hit = c; break; }
+              }
+              if (!hit) await sleep(400);
+            }
+            if (!hit) {
+              /* 等不到不能装作没看见继续跑：下一批动作会在登录页/验证码页上乱写。
+               * 带 human 标记（这不是故障，是人没做完），但不诱导原样重跑——重跑会再登一次。 */
+              const te = new Error(gTitle + '｜等待超时：' + Math.round(tmo / 1000)
+                + ' 秒内页面没有出现预期状态（' + conds.map(function (c) { return c.name || c.exists; }).join(' / ')
+                + '）——已终止，请人工看一眼当前页面');
+              te.code = String(aw.error || 'E_HUMAN_TIMEOUT');
+              te.human = true;
+              throw te;
+            }
+            log('✓ 检测到：' + (hit.name || String(hit.exists).slice(0, 60)) + '，继续下一步');
+          }
+          return;
+        }
         log('✓ 人工已确认（' + gTitle + '），按 spec 声明终止本流程');
         /* 这里是「按设计停下等人」，不是故障。必须带自己的错误码（spec 的 action.error，
          * 缺省 E_HUMAN_CONFIRM）和 human 标记抛出去：
@@ -771,7 +844,14 @@
         let rel = null;
         try { rel = ENGINE.uiFindByXPath(rxp); } catch (e1) { throw new Error('E_UI_TARGET read 选择器无效: ' + rxp); }
         if (!rel && readyMs > 0) rel = await ENGINE.uiWaitByXPath(rxp, readyMs, sleep);
-        if (!rel) throw new Error('E_UI_TARGET 要读取的元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : ''));
+        if (!rel) {
+          /* optional（0.9.17）：与 click/type 同一语义——元素不在就跳过并留日志。
+           * 用于「同一个 spec 要覆盖两种页面形态」的场景（如首次登录才有的改密弹层）：
+           * 弹层不在是正常分支，不是故障。仍然必须打日志，静默跳过会让「选择器写错了」
+           * 看起来像「本来就没有这一步」。 */
+          if (a.optional === true) { log('跳过 ' + label + '：页面没有这个元素（spec 声明 optional）'); return; }
+          throw new Error('E_UI_TARGET 要读取的元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : ''));
+        }
         let got = ENGINE.uiText(rel);
         /* regex（0.9.16）：从页面文本里只取一段。典型场景是结果页那行「账户ID 2077792760467029248」——
          * 要回写进业务表的是纯数字，整段写进去会把「账户ID 」四个字一起塞进「客仓ID」列，
@@ -1299,7 +1379,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.16',
+    RUNNER_VERSION: '0.9.17',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1613,6 +1693,25 @@
       try {
         ensureStepVars(spec, step, vars);
         scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域（vars 可能刚更新）
+        /* 步骤级条件（0.9.17）：不满足就整步跳过，而不是让每个动作各自 optional 等超时。
+         * 典型场景：首次登录才有的「改密 → 协议 → 信任」三段弹层。以前只能把每个动作都标
+         * optional，弹层不存在时 6 个动作各等 12 秒 —— 整条链白拖一分钟，还把「等到了」和
+         * 「本来就没有」混成一件事。条件由 spec 声明（exists / 数值比较），引擎不认识业务含义。
+         * 判不出来必须终止（E_GATE）：不确定该不该执行时「跳过」和「执行」都可能造成错误写入。 */
+        if (step.when && typeof step.when === 'object') {
+          const sw = ENGINE.gateWhen(step.when, scope);
+          if (sw.error) {
+            log({ t: Date.now(), level: 'fatal', msg: step.id + ' 执行条件无法判定：' + sw.error + '——已终止（不猜该不该执行）' });
+            throw new RunnerError('E_GATE', step.id + ' 执行条件无法判定：' + sw.error);
+          }
+          if (!sw.hit) {
+            log({ t: Date.now(), level: 'info', msg: step.id + ' 跳过：执行条件未命中（' + sw.detail + '）' });
+            onStep(step.id, 'skipped');
+            stepLogs.push({ id: step.id, ms: 0, skipped: true });
+            continue;
+          }
+          log({ t: Date.now(), level: 'info', msg: step.id + ' 执行条件命中（' + sw.detail + '），开始执行' });
+        }
         if (step.write === true) {
           const wchk = checkWriteAllowed(spec, step, writeCount, dryRun);
           if (!wchk.ok) {
@@ -1626,7 +1725,7 @@
           throw new RunnerError('E_PERM', 'human 断点原语 v0.2 提供，本步骤无法执行: ' + step.id);
         }
         if (step.mode === 'navigate') {
-          const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, i);
+          const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, i, params);
           if (nav && nav.sameTab) {
             /* 同标签交接：本流程已经结束，页面正在被下一个环节接管。
              * 不能走下面「导航已发起，请点执行续跑」的提示——那句是给「本流程还要在同一
@@ -1869,7 +1968,7 @@
     return out;
   }
 
-  async function execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, idx) {
+  async function execNavigate(spec, step, scope, extracted, stepLogs, log, onStep, idx, params) {
     // navigate 前必须先把运行态落盘（导航会销毁当前 JS 环境）
     const url = ENGINE.resolvePlaceholders(step.url, scope);
     if (!/^https:\/\//.test(url)) throw new RunnerError('E_SPEC', 'navigate 目标非法: ' + url);
@@ -2171,7 +2270,7 @@
       }
       if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i, extracted, params); continue; }
       if (step.mode === 'navigate') {
-        const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i);
+        const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i, params);
         /* 同标签交接＝本流程终点，继续往下走把 outputs 算出来正常收尾（不回 navInitiated）。 */
         if (nav && nav.sameTab) continue;
         if (nav && nav.initiated) return { ok: true, navInitiated: true, stepId: step.id, stepLogs, extracted, resumed: true };
