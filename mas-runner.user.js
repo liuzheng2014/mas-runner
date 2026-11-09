@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.18
+// @version      0.9.19
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -241,6 +241,15 @@
  *       现在：{"param":"pwd_change_result","equals":"修改成功"} —— 不命中就跳过**这一个动作**
  *       并留日志（写明实际值与条件），其余照跑。参数没取到按空串算（表里该列本来就常为空，
  *       是正常前态，不是配置错误），但拼错的参数名由校验器拦下（永远不命中 = 静默跳过）。
+ *   - v0.9.19：**spec 缓存版本校验提前到开跑前**（2026-11-09 真机事故）。
+ *     现场：本地缓存里是 open-account-login 0.2.0、线上已 0.4.0，服务端 /scenes、/spec 都正常，
+ *     但引擎「缓存优先」的语义是「本次仍按缓存版执行，下次自动生效」→ 于是照旧跑了 0.2.0：
+ *     验证码处**按旧版设计硬终止**（新版是人工确认后继续）、日期用 type 写 DOM（假绿）、
+ *     表里新增的「密码修改结果 / 客仓ID」全都没参与。人的感受是「说好的自动接管没接管」。
+ *     缓存是为了省那 14s 的 /spec，但不能拿「跑错版本」当代价。修法不新增网络：
+ *     服务端 /task 回包带上 `spec_version`（0.6.10），引擎拿它跟缓存版本比，
+ *     **不一致就当场重取 /spec 并按新版跑**（只在版本真的变了时多一次请求）；
+ *     老服务没有该字段 → 行为不变（仍缓存优先 + 后台提示）。
  *
  * 未实现（v0.2，需先建 spec_index/task 表 + 实测鉴权通道）：
  *   - Bitable 轮询领任务、结果回写（在线模式）
@@ -1684,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.18',
+    RUNNER_VERSION: '0.9.19',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -5499,6 +5508,22 @@
     let s = cached
       ? { spec_id: cached.spec_id || task.script_id, version: cached.version, status: cached.status || '', spec: cached.spec }
       : null;
+    /* 缓存版本 vs 线上版本（0.9.19）：/task 会把线上 spec 的版本号一起带回来（服务端 0.6.10+）。
+     * 对不上就**本次就换新版**，而不是「本次仍按缓存版执行，下次生效」。
+     *
+     * 为什么改：2026-11-09 真机连续踩三次同一个坑——缓存里是 0.2.0、线上是 0.4.0，
+     * 于是照旧跑旧流程：验证码处硬终止（旧版设计就是终止）、日期用 type 写 DOM 假绿、
+     * 表里漏读新字段。人看到的现象是「说好的自动接管没有」。缓存是加速手段，
+     * 不能拿「跑错版本」当代价；这里多花的只是一次 /spec（仅在版本真的变了时）。
+     * 服务端没下发该字段（老服务）→ 保持原行为，不影响兼容。 */
+    const onlineVer = String(task.spec_version || '');
+    if (s && onlineVer && String(s.version) !== onlineVer) {
+      UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '本地缓存的 spec 是 v' + s.version + '，线上已是 v' + onlineVer + '：本次改用线上版（重取一次，避免拿旧流程跑新数据）' });
+      SVC.specCache.drop(task.script_id);
+      s = null;
+    }
+    let usedCache = !!s;
     if (!s) {
       s = await SVC.spec(task.script_id);
       SVC.specCache.put(task.script_id, s);
@@ -5508,6 +5533,7 @@
     let applied = UI.applySpec(JSON.stringify(s.spec), { persist: true });
     if (!applied && cached) {
       // 本地那份坏掉（格式/校验不通过）：丢掉重取，绝不让坏缓存把流程卡死
+      usedCache = false;
       UI.appendLog({ t: Date.now(), level: 'warn', msg: '本地缓存的 spec 无法加载，改为联网重取…' });
       SVC.specCache.drop(task.script_id);
       s = await SVC.spec(task.script_id);
@@ -5516,11 +5542,13 @@
       UI._specCache = { script_id: task.script_id, spec: s.spec, version: s.version };
       applied = UI.applySpec(JSON.stringify(s.spec), { persist: true });
     }
-    if (cached) {
+    /* 只有「这次真的用了缓存」才需要后台校验版本：刚重取过新版（usedCache=false 的反面）再校验
+     * 就是同一秒里的第二次 /spec，纯浪费（真机上这一跳 0.5~14s）。 */
+    if (usedCache) {
       // 后台校验版本：变了只提示、不打断本次（选择器若真被换掉，页面填充的断言会自己报错，不会静默填错）
       SVC.specRefresh(task.script_id).then(function (r) {
         if (r && r.changed) {
-          UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到新版 spec v' + r.version + '（本地缓存 v' + r.oldVersion + '）：本次仍按缓存版执行，下次自动生效' });
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到新版 spec v' + r.version + '（本地缓存 v' + r.oldVersion + '）：本次仍按缓存版执行，下次自动生效' + (onlineVer ? '' : '（本次取数没带回线上版本号，只能跑完再提示）') });
         }
       }).catch(function () { /* 校验失败静默：不能因为刷新失败就否定缓存 */ });
     }
@@ -5933,6 +5961,11 @@
       newUrl: function () { return UI._newUrl || ''; },
       /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
       autoFlushPending: autoFlushPending, pwDel: pwDel, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
+      /* spec 缓存版本校验（0.9.19）：要验证「缓存 0.2.0 / 线上 0.4.0 → 本次就换新版」，
+       * 只能从 /task 回包里带版本号那条路走，UI 上没法稳定构造（线上不会配合同时发两个版本）。
+       * 生产路径不会调用。 */
+      loadTriggeredTask: UI.loadTriggeredTask,
+      appliedSpecVersion: function () { return (UI._specCache || {}).version || ''; },
     };
   } catch (e) {
     window.__MASR_TEST_WB__ = {
@@ -5942,6 +5975,11 @@
       newUrl: function () { return UI._newUrl || ''; },
       /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
       autoFlushPending: autoFlushPending, pwDel: pwDel, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
+      /* spec 缓存版本校验（0.9.19）：要验证「缓存 0.2.0 / 线上 0.4.0 → 本次就换新版」，
+       * 只能从 /task 回包里带版本号那条路走，UI 上没法稳定构造（线上不会配合同时发两个版本）。
+       * 生产路径不会调用。 */
+      loadTriggeredTask: UI.loadTriggeredTask,
+      appliedSpecVersion: function () { return (UI._specCache || {}).version || ''; },
     };
   }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）

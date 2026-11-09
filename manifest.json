@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.18",
+  "version": "0.9.19",
   "file": "mas-runner.user.js",
-  "sha256": "604535edacd9eb6745548b21a96c358a74c67d8ced6b3fc7338d150e78ff2b18",
-  "bytes": 365556,
-  "published_at": "2026-11-09T14:38:12+08:00",
+  "sha256": "d20da37cf58a74f45e8ca5cf1953af7316156219fc32da02a55ddf750ddb7ec8",
+  "bytes": 368979,
+  "published_at": "2026-11-09T15:03:12+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "0.9.18: pick_date 原语（Element Plus 日期区间面板）+ when.param 参数分支"
+  "notes": "0.9.19: spec 缓存版本校验提前到开跑前（不再「本次仍按旧版跑」）"
 }
