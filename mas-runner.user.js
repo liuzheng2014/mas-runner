@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.21
+// @version      0.9.22
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1693,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.21',
+    RUNNER_VERSION: '0.9.22',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2680,6 +2680,8 @@
         <div class="h-row" title="业务脚本 = 这一步要跑的 spec（版本由业务方维护，与解释器版本无关）">
           <span class="lbl">业务脚本</span>
           <span id="masr-spec-badge"><span class="lbl">未加载</span></span>
+          <span class="grow"></span>
+          <button class="masr-mini" id="masr-spec-upgrade" title="联网强制同步：场景触发规则（绕开 10 分钟缓存）+ 当前业务脚本的最新 spec（绕开本地缓存）。流程执行中不允许点。">同步 spec</button>
         </div>
       </div>
       <div class="row" id="masr-selfcheck"></div>
@@ -2754,6 +2756,7 @@
       UI.appendLog({ t: Date.now(), level: 'info', msg: 'SHA-256（全文，供 spec_index 登记）: ' + h });
     });
     document.getElementById('masr-run').addEventListener('click', () => UI.doRun());
+    document.getElementById('masr-spec-upgrade').addEventListener('click', () => UI.forceSyncSpec());
     document.getElementById('masr-export').addEventListener('click', () => {
       if (!UI.lastResult) { alert('还没有运行结果'); return; }
       const blob = new Blob([JSON.stringify(UI.lastResult, null, 2)], { type: 'application/json' });
@@ -2803,6 +2806,81 @@
       (spec.owner ? ' <span class="lbl">owner ' + esc(spec.owner) + '</span>' : '');
   };
 
+  /* 手动同步（0.9.22）：一个显式入口把「触发规则」和「业务脚本」都强制拉到线上最新。
+   * 为什么需要：spec 是三级缓存（内存 → 本地持久 → 联网），TTL 只看 7 天陈旧，
+   * 平时刷新页面**不会**重取——不跑任务就永远看不到新版（2026-11-09 用户报：发布 0.4.4
+   * 后刷新页面面板仍是 0.4.3）。场景列表另有 10 分钟 TTL，触发规则发新版后同理。
+   * 语义刻意做成「强制」：绕开两级 TTL，失败不清缓存（旧版还能跑，只是没升上去），
+   * 流程执行中直接拒绝（跑一半换 spec 会让后续步骤与已执行步骤错位）。 */
+  UI.forceSyncSpec = async function () {
+    const btn = document.getElementById('masr-spec-upgrade');
+    if (UI._running) {
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '正在执行流程：等这一趟跑完再同步 spec（跑到一半换 spec 会让后面的步骤对不上）' });
+      return;
+    }
+    const oldLabel = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = '同步中…'; }
+    const T0 = Date.now();
+    try {
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '开始同步：场景触发规则 + 业务脚本 spec（联网，绕开本地缓存）' });
+      // ① 场景触发规则：强刷（绕 10 分钟 TTL）。失败不致命——最多是触发规则旧，spec 仍可同步。
+      let scenes = [];
+      try {
+        scenes = await SVC.scenes(true);
+        UI.appendLog({ t: Date.now(), level: 'ok', msg: '场景触发规则已同步（' + scenes.length + ' 个场景）' });
+      } catch (e) {
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '场景触发规则同步失败（' + e.message + '）：继续同步 spec，触发规则仍是本机旧版' });
+      }
+      // ② 目标场景：面板已加载的 → 当前任务的 → 当前页命中的；都没有就逐个同步全部场景。
+      let sid = (UI._specCache && UI._specCache.script_id) || (UI.currentTask && UI.currentTask.script_id) || '';
+      if (!sid && scenes.length) {
+        const hit = SVC.matchTriggerIn(scenes, location.href);
+        if (hit && hit.script_id) sid = hit.script_id;
+      }
+      const ids = [];
+      if (sid) ids.push(sid);
+      else scenes.forEach(function (s) { if (s && s.script_id) ids.push(String(s.script_id)); });
+      if (!ids.length) {
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: '没有可同步的业务脚本：面板没加载 spec、当前页没命中场景、场景列表也拿不到。先打开一次业务页面或点「加载 spec」再试' });
+        return;
+      }
+      let ups = 0, same = 0, bad = 0;
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i];
+        const before = SVC.specCache.get(id);
+        try {
+          const s = await SVC.spec(id);
+          SVC.specCache.put(id, s);
+          const oldV = before ? String(before.version) : '';
+          if (oldV && oldV === String(s.version)) {
+            same++;
+            UI.appendLog({ t: Date.now(), level: 'info', msg: 'spec 已是最新：' + id + ' v' + s.version });
+          } else {
+            ups++;
+            UI.appendLog({ t: Date.now(), level: 'ok',
+              msg: 'spec 已升级：' + id + ' ' + (oldV ? 'v' + oldV + ' → ' : '（本机无缓存）→ ') + 'v' + s.version + '（本地缓存已更新）' });
+          }
+          // 只把「面板当前这份 / 当前页命中的这份」换上来；别的场景只更新缓存，不动面板内容
+          const isPanelOne = (UI._specCache && UI._specCache.script_id === id) || (!UI._specCache && ids.length === 1);
+          if (isPanelOne) {
+            UI._specCache = { script_id: id, spec: s.spec, version: s.version };
+            UI.applySpec(JSON.stringify(s.spec), { persist: true });
+          }
+        } catch (e) {
+          bad++;
+          UI.appendLog({ t: Date.now(), level: 'warn',
+            msg: 'spec 同步失败：' + id + '（' + e.message + '）' + (before ? '——本机缓存 v' + before.version + ' 保留，仍可执行' : '——本机没有该场景缓存') });
+        }
+      }
+      UI.appendLog({ t: Date.now(), level: bad && !ups ? 'fatal' : 'info',
+        msg: '同步完成（' + ((Date.now() - T0) / 1000).toFixed(1) + 's）：升级 ' + ups + '、已是最新 ' + same + '、失败 ' + bad +
+          (bad && !ups ? '——后端连不上时先把服务起来，再点一次「同步 spec」' : '') });
+    } catch (e) {
+      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '同步失败：' + e.message });
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = oldLabel || '同步 spec'; }
+    }
+  };
   // 粘贴输入框：行内强制样式防站点 CSS 吞掉；若仍不可见则降级为 contenteditable div
   UI.makeSpecInput = function () {
     const box = document.getElementById('masr-spec-box');
@@ -6037,6 +6115,9 @@
        * 生产路径不会调用。 */
       loadTriggeredTask: UI.loadTriggeredTask,
       appliedSpecVersion: function () { return (UI._specCache || {}).version || ''; },
+      /* 手动同步 spec（0.9.22）：要验证「强制绕开缓存 / 失败不清旧缓存 / 只换当前这份」，
+       * 只能构造「本机缓存旧、线上新」的假响应，真机等不到。生产路径不会调用。 */
+      forceSyncSpec: function () { return UI.forceSyncSpec(); },
     };
   } catch (e) {
     window.__MASR_TEST_WB__ = {
@@ -6051,6 +6132,9 @@
        * 生产路径不会调用。 */
       loadTriggeredTask: UI.loadTriggeredTask,
       appliedSpecVersion: function () { return (UI._specCache || {}).version || ''; },
+      /* 手动同步 spec（0.9.22）：要验证「强制绕开缓存 / 失败不清旧缓存 / 只换当前这份」，
+       * 只能构造「本机缓存旧、线上新」的假响应，真机等不到。生产路径不会调用。 */
+      forceSyncSpec: function () { return UI.forceSyncSpec(); },
     };
   }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
