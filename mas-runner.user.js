@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.19
+// @version      0.9.20
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1693,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.19',
+    RUNNER_VERSION: '0.9.20',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3327,23 +3327,45 @@
     const q = query || {};
     const ks = Object.keys(q);
     if (ks.length) url += '?' + ks.map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(q[k]); }).join('&');
+    const budget = (opts && opts.timeout) || 20000;
     return new Promise(function (resolve, reject) {
-      GM_xmlhttpRequest({
-        method: method,
-        url: url,
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mas-code': SVC.code() },
-        data: body ? JSON.stringify(body) : null,
-        // 回写要等飞书返回（服务端自己还有 15s×2 的超时预算），所以按调用类型给不同上限
-        timeout: (opts && opts.timeout) || 20000,
-        onload: function (r) {
-          let j = {};
-          try { j = JSON.parse(r.responseText || '{}'); } catch (e) { return reject(new Error('E_SVC_PARSE http=' + r.status)); }
-          if (r.status >= 400 || j.ok === false) return reject(new Error(j.error || ('E_SVC ' + r.status)));
-          resolve(j);
-        },
-        onerror: function () { reject(new Error('E_SVC_NET ' + url)); },
-        ontimeout: function () { reject(new Error('E_SVC_TIMEOUT ' + url)); },
-      });
+      /* 看门狗（0.9.20）：GM_xmlhttpRequest 的三个回调在个别页面会**集体失联**——
+       * 2026-11-09 ads.huawei.com SPA 实测 /task 静默挂死 4 次：onload/onerror/ontimeout 一个都不来，
+       * 连 20s 的 ontimeout 都不触发（脚本管理器通道层挂死；页面 fetch 又被 CSP 拦死，
+       * 页面侧无法兜底）。setTimeout 不依赖 GM 事件循环，一定能响：
+       * 超预算+5s 还没有任何回调 → 自动重发一次；再超 → 显式报错终止，绝不静默挂着。
+       * GM 回调事后才到也没关系：settled 挡住迟到的 resolve/reject，且每次回调先清掉看门狗。 */
+      let settled = false, retried = false, wd = null;
+      const margin = Math.min(5000, budget);   // 余量不小于预算的怪比例：小预算（测试/探针）不用陪等 5s
+      const send = function () {
+        clearTimeout(wd);
+        wd = setTimeout(function () {
+          if (settled) return;
+          if (!retried) { retried = true; send(); return; }
+          settled = true;
+          reject(new Error('E_SVC_WATCHDOG ' + method + ' ' + path +
+            '：脚本管理器网络通道无响应（重发一次仍无回调）。这个站点的扩展环境把请求吞了：'
+            + '刷新页面重试，或换一个页面/域名发起；同一服务在别的域名的页面上往往是好的。'));
+        }, budget + margin);
+        GM_xmlhttpRequest({
+          method: method,
+          url: url,
+          headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mas-code': SVC.code() },
+          data: body ? JSON.stringify(body) : null,
+          // 回写要等飞书返回（服务端自己还有 15s×2 的超时预算），所以按调用类型给不同上限
+          timeout: budget,
+          onload: function (r) {
+            if (settled) return; settled = true; clearTimeout(wd);
+            let j = {};
+            try { j = JSON.parse(r.responseText || '{}'); } catch (e) { return reject(new Error('E_SVC_PARSE http=' + r.status)); }
+            if (r.status >= 400 || j.ok === false) return reject(new Error(j.error || ('E_SVC ' + r.status)));
+            resolve(j);
+          },
+          onerror: function () { if (settled) return; settled = true; clearTimeout(wd); reject(new Error('E_SVC_NET ' + url)); },
+          ontimeout: function () { if (settled) return; settled = true; clearTimeout(wd); reject(new Error('E_SVC_TIMEOUT ' + url)); },
+        });
+      };
+      send();
     });
   };
 
@@ -5332,7 +5354,17 @@
     } finally {
       clearInterval(beat);
       const st = RunState.get();
+      /* 0.9.20：清态规则——
+       * ① running：被打断的残影（原行为）；
+       * ② done 且 final 已被消费：发起页轮询器消费完会自己清（1.5s 延迟），这里兜一道，
+       *    防轮询器那趟没跑页面就关了。
+       * 未消费的 final 绝不清：'origin' 的播报/补回写、'helper' 的自毁都还指着它；
+       * 没人消费的陈年残留由 mountAll 的 2 分钟兜底压掉（见下）。
+       * 注意 role 要现读：doRun 开跑时才把 masrRole 设成 'origin'，入口快照恒为 ''，不可靠。 */
+      const roleNow = (function () { try { return sessionStorage.getItem('masrRole') || ''; } catch (e) { return ''; } })();
       if (st && st.phase === 'running') RunState.clear();
+      else if (st && st.phase === 'done' && st.final && st.final.consumed) RunState.clear();
+      else if (st && st.phase === 'done' && !st.final && roleNow !== 'helper') RunState.clear();
       UI.renderSelfCheck();
     }
   };
@@ -5517,13 +5549,33 @@
      * 不能拿「跑错版本」当代价；这里多花的只是一次 /spec（仅在版本真的变了时）。
      * 服务端没下发该字段（老服务）→ 保持原行为，不影响兼容。 */
     const onlineVer = String(task.spec_version || '');
+    /* usedCache 语义（勿动）：「**本次要跑的这份 spec** 是不是来自缓存」。
+     * 必须在重取之前求值——刚联网取过新版就不再叠加后台校验（同一秒的第二次 /spec，纯浪费）；
+     * 回退缓存版的分支要改回 true，让后台 specRefresh 接着尝试升缓存。 */
+    let usedCache = !!s;
     if (s && onlineVer && String(s.version) !== onlineVer) {
       UI.appendLog({ t: Date.now(), level: 'warn',
         msg: '本地缓存的 spec 是 v' + s.version + '，线上已是 v' + onlineVer + '：本次改用线上版（重取一次，避免拿旧流程跑新数据）' });
+      const stale = s;
       SVC.specCache.drop(task.script_id);
       s = null;
+      usedCache = false;                     // 重取成功 → 这份是刚联网拿的，不需要后台再校验
+      try {
+        s = await SVC.spec(task.script_id);
+        SVC.specCache.put(task.script_id, s);
+      } catch (eSpec) {
+        /* 0.9.20：重取失败（超时/网络抖动/GM 通道挂死）不再中止整次运行——
+         * 2026-11-09 真机实测：同一次运行里 /task 5.8s 成功、/spec 20s 超时，
+         * 任务被卡死在「校验版本」这一步，而缓存版明明可用。回退缓存版继续跑并如实记录；
+         * usedCache=true 的分支会后台 specRefresh，成功后缓存自动升版，下次生效。 */
+        if (!stale) throw eSpec;
+        SVC.specCache.put(task.script_id, stale);
+        s = stale;
+        usedCache = true;                    // 跑的是缓存版 → 后台继续校验/升版
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '重取线上 spec 失败（' + eSpec.message + '）：本次回退本地缓存 v' + stale.version + ' 继续执行（后台会再试升级缓存）' });
+      }
     }
-    let usedCache = !!s;
     if (!s) {
       s = await SVC.spec(task.script_id);
       SVC.specCache.put(task.script_id, s);
@@ -5884,6 +5936,14 @@
           (st.startedAt ? when.toLocaleString('zh-CN') : '时间未知') + ' 开始，页面被跳转或关闭打断）：已标记为中断，' +
           '不影响本页重新执行；需要彻底清掉就在任务区点「清除续跑状态」',
       });
+    }
+    /* 0.9.20 兜底：done 且 final 未消费、躺了 2 分钟以上 → 压掉重播（不再重复弹结果）。
+     * 老版本留下的残留 / 发起页已关掉没人消费的 final 都归这里；2 分钟内的留着，
+     * 给发起页轮询器留出消费窗口（结果展示 + 补回写）。 */
+    if (st && st.phase === 'done' && st.final && !st.final.consumed &&
+        Date.now() - Number(st.final.at || 0) > 120000) {
+      st.final.consumed = true;
+      RunState.set(st);
     }
     if (st && st.phase === 'await_nav_check') {
       UI.replayStepLogs(st.stepLogs);
