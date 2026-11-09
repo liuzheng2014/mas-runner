@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.25
+// @version      0.9.26
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -707,6 +707,46 @@
       };
     }
 
+    /* url_matches / url_not_matches（0.9.26）：按「本步该在哪类页面上执行」分支。
+     * 为什么需要（2026-11-09 19:33 真机）：走「邀请链接已过期」重新登录时，登录一成功
+     * SPA 直接落到 `#/corp-registry/choose-auth-means`，页面被 3A 的 trigger 重新认领后
+     * 从 S1 重跑整段登录流程 —— 那里根本没有账号输入框，S4 白等 15000ms 才报 E_LOGIN，
+     * 把一次**已经成功**的登录判成失败。登录段（填账号密码/改密/同意/信任）只在华为 CAS 域上
+     * 才有意义，所以用地址闸门把「已经在业务页」的这次重跑收敛到 S9→S10。
+     * 和 exists 可以同时出现（AND）；只有 url 时行为等同原来的 exists 单条件。 */
+    if (when.url_matches !== undefined || when.url_not_matches !== undefined) {
+      const href = String(location.href || '');
+      const label = when.name || '当前地址';
+      const details = [];
+      let hit = true;
+      const tryRe = function (raw) {
+        try { return { re: new RegExp(rp(String(raw))) }; } catch (e) { return { err: 'url 正则无效: ' + raw + '（' + e.message + '）' }; }
+      };
+      if (when.url_matches !== undefined) {
+        const r = tryRe(when.url_matches);
+        if (r.err) return { error: r.err };
+        const ok = r.re.test(href);
+        if (!ok) hit = false;
+        details.push('匹配 /' + when.url_matches + '/ → ' + (ok ? '成立' : '不成立'));
+      }
+      if (when.url_not_matches !== undefined) {
+        const r = tryRe(when.url_not_matches);
+        if (r.err) return { error: r.err };
+        const bad = r.re.test(href);
+        if (bad) hit = false;
+        details.push('不匹配 /' + when.url_not_matches + '/ → ' + (bad ? '不成立' : '成立'));
+      }
+      if (when.exists) {
+        const xp = rp(when.exists);
+        let el = null;
+        try { el = ENGINE.uiFindBusinessByXPath(xp); } catch (e) { return { error: 'exists 选择器无效: ' + xp + '（' + e.message + '）' }; }
+        const vis = !!el && ENGINE.uiIsVisible(el);
+        if (!vis) hit = false;
+        details.push((when.name || '元素') + (!el ? ' 不存在' : (vis ? ' 存在' : ' 存在但不可见')));
+      }
+      return { hit: hit, detail: label + '「' + href.slice(0, 90) + '」；' + details.join('；') };
+    }
+
     if (when.exists) {
       const xp = rp(when.exists);
       let el = null;
@@ -1279,9 +1319,19 @@
       for (let k = 1; k <= tries; k++) {
         // 每次重试都重新定位：联动重渲染会把旧节点换成新的，持有旧引用会点空
         const tFind = Date.now();
+        /* optional 的动作**不该陪着等满 ready 超时**（0.9.26）。
+         * 真机 2026-11-09：3A 的「去登录」声明 optional、ready 3000ms，而登录页上它根本不存在——
+         * 一轮跑里被等了 3 次，11.1s 全花在「等一个确定不在的元素」。optional 的语义本来就是
+         * 「在就点、不在就走」，等这么久和它的定义自相矛盾。
+         * 压到 800ms 而不是 0：弹层/按钮偶尔比上一动作慢半拍渲染（S7/S8 的协议弹层就是），
+         * 0 会把「慢半拍」当成「没有」。真要更久就在 spec 里写 optional_ready_ms。
+         * 日志里的「最多 Nms」跟着一起变——它写的是真实等待上限，不能报旧数字。 */
+        const waitMs = a.optional === true
+          ? (a.optional_ready_ms !== undefined ? Math.max(0, Number(a.optional_ready_ms) || 0) : Math.min(readyMs, 800))
+          : readyMs;
         const first = ENGINE.uiFindByXPath(target);
-        if (!first && readyMs > 0) log('等待页面渲染（' + label + '，最多 ' + readyMs + 'ms）');
-        const el = first || await ENGINE.uiWaitByXPath(target, readyMs, sleep);
+        if (!first && waitMs > 0) log('等待页面渲染（' + label + '，最多 ' + waitMs + 'ms）');
+        const el = first || await ENGINE.uiWaitByXPath(target, waitMs, sleep);
         if (!el) {
           /* optional：同一个入口可能有两种页面形态（如邀请链接可能落在注册页，也可能直接
            * 落在登录页）。只有 spec 显式声明 optional 才允许跳过，并且必须留日志——
@@ -1291,7 +1341,7 @@
             return;
           }
           throw new Error('E_UI_TARGET 页面元素未找到: ' + a.target + (a.name ? '（' + a.name + '）' : '')
-            + '——已等待 ' + (Date.now() - tFind) + 'ms 仍未出现：页面可能改版，或表单渲染比 ' + readyMs + 'ms 更慢');
+            + '——已等待 ' + (Date.now() - tFind) + 'ms 仍未出现：页面可能改版，或表单渲染比 ' + waitMs + 'ms 更慢');
         }
 
         if (act === 'hover') {
@@ -1693,7 +1743,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.25',
+    RUNNER_VERSION: '0.9.26',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2524,7 +2574,22 @@
      * 跨页续跑的场景（如「点去登录 → 登录页继续填」）因此拿不到密码——这里按记录重新向
      * 服务端取一次，而不是把凭据写进存储。取不到就如实记录，由后续步骤报「值为空」。 */
     try {
-      const need = (spec.params || []).filter(function (p) { return p.secret === true && !params[p.name]; });
+      /* 只为「落地后、下一次整页跳转之前」真正被引用的凭据取数（0.9.26）。
+       * 真机 2026-11-09 19:33：S1 点「退出当前账号」整页跳到官网首页后，这里立刻重取了一次
+       * 凭据（3.2s），而紧接着的 S2 只是 navigate、URL 是常量，根本没人用；到 loginAuth 落地
+       * 又取了一次（2.9s）。同一份密码为一次填表娶了两遍，第一遍纯浪费。
+       * 判据不猜：只看「剩余步骤里、到下一个 navigate 为止」的 JSON 有没有 `{{参数名}}`。
+       * 跨过下一次跳转就不再算——那个页面会自己再判一次。 */
+      const stepsAfter = spec.steps.slice(stepIdx + 1);
+      const nextNav = stepsAfter.findIndex(function (s) { return s.mode === 'navigate'; });
+      const seg = stepsAfter.slice(0, nextNav < 0 ? stepsAfter.length : nextNav);
+      /* 回写字段也算引用：现在的 spec 没有把密码写回表（已核过全部 8 份），但只要以后有人这么写，
+       * 这里没算进去就会变成「回写了一串空密码」这种查都查不出来的错。加上它零成本——
+       * 过滤器本来就要求文本里出现 {{参数名}}，没引用就不会触发取数。 */
+      const segTxt = JSON.stringify(seg) + JSON.stringify(spec.writeback || {});
+      const need = (spec.params || []).filter(function (p) {
+        return p.secret === true && !params[p.name] && segTxt.indexOf('{{' + p.name + '}}') >= 0;
+      });
       if (need.length) {
         const rid = (st.task && st.task.record_id) || params.record_id || '';
         const sid = (st.task && st.task.script_id) || spec.spec_id;
@@ -3440,6 +3505,17 @@
   SVC.code = function () { return String(GM_getValue(SVC.C_KEY, '') || ''); };
   SVC.me = function () { try { return JSON.parse(GM_getValue(SVC.M_KEY, 'null')); } catch (e) { return null; } };
 
+  /* 最近一次「后端真的通」的时间（0.9.26）。/task、/spec、/health 任一成功都算。
+   * 存在 GM 存储里是为了**跨页**有效：整页跳转会把内存状态清光，而跳转恰恰是 /task 最密集的时刻；
+   * 只放内存的话，「刚取完数 → 跳转 → 落地页」这条路仍会白做一次 /health 预检。 */
+  SVC.OK_KEY = 'masr_last_ok_v1';
+  SVC.markOk = function () { try { GM_setValue(SVC.OK_KEY, Date.now()); } catch (e) {} };
+  SVC.chanFreshMs = function () {
+    let v = 0;
+    try { v = Number(GM_getValue(SVC.OK_KEY, 0) || 0); } catch (e) {}
+    return v ? (Date.now() - v) : Infinity;
+  };
+
   SVC.call = function (method, path, query, body, opts) {
     const base = SVC.base();
     let url = base + path;
@@ -3494,6 +3570,7 @@
             let j = {};
             try { j = JSON.parse(r.responseText || '{}'); } catch (e) { return reject(new Error('E_SVC_PARSE http=' + r.status)); }
             if (r.status >= 400 || j.ok === false) return reject(new Error(j.error || ('E_SVC ' + r.status)));
+            SVC.markOk();
             resolve(j);
           },
           onerror: function () {
@@ -3556,6 +3633,7 @@
             try { j = JSON.parse(r.responseText || '{}'); } catch (e) {}
             if (r.status !== 200) return reject(new Error('地址有响应但不是本服务（HTTP ' + r.status + '）'));
             if (j.service && j.service !== 'mas-service') return reject(new Error('这个地址不是 MAS 后端'));
+            SVC.markOk();
             resolve({ mode: 'svc', version: j.version || '?' });
           },
           onerror: function () { reject(new Error('连不上 ' + SVC.base())); },
@@ -4210,17 +4288,27 @@
       const needWrite = wbModeOf(s.spec) === 'auto';
       if (needWrite) {
         // 预检后端：票据是一次性的，如果回写通道断了就别开跑（跑完写不回去等于白跑一趟）
-        const tPing = Date.now();
-        try { await SVC.ping(); }
-        catch (e) {
-          connOut = '<span style="color:#c02a0a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
-          UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），本次不执行：先把服务起来（temp-up / Workers），再点「重试连接」' });
-          UI.renderConn();
-          return;
+        /* 但「刚在这条通道上成功过」就不必再探一次（0.9.26）。
+         * 真机 2026-11-09 19:32–19:34 的一次重登录跑：四次预检花了 5.4+9.4+30.3+24.6 = 69.7s，
+         * 占整轮 127s 的 55%，而每次预检前 3~10 秒刚有一个 /task 成功返回 —— 同一个域、同一条通道、
+         * 同一个脚本管理器通道，那次成功就是最新鲜的「通道是通的」证据，/health 只是再证明一遍。
+         * 判定窗口 90s（跨页也认：写进 GM 存储，整页跳转后仍然有效）。
+         * 不写日志：这是「省掉一次重复探测」，不是业务事件；写了反而让每单多一行噪音、
+         * 把 golden 基线全部打花。（真连不上时仍然会 fatal，行为和以前一致。） */
+        const chanFresh = SVC.chanFreshMs() < 90000;
+        if (!chanFresh) {
+          const tPing = Date.now();
+          try { await SVC.ping(); }
+          catch (e) {
+            connOut = '<span style="color:#c02a0a">后端连不上：' + connEsc(e.message) + '</span> —— 本次不执行（避免票据白用一次）';
+            UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），本次不执行：先把服务起来（temp-up / Workers），再点「重试连接」' });
+            UI.renderConn();
+            return;
+          }
+          const pingMs = Date.now() - tPing;
+          // 只报慢的，快的不打——省得每单多一行噪音（也保住 golden 基线）
+          if (pingMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '预检后端 ' + (pingMs / 1000).toFixed(1) + 's（/health 往返，慢在链路上）' });
         }
-        const pingMs = Date.now() - tPing;
-        // 只报慢的，快的不打——省得每单多一行噪音（也保住 golden 基线）
-        if (pingMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '预检后端 ' + (pingMs / 1000).toFixed(1) + 's（/health 往返，慢在链路上）' });
         UI._warmTimer = SVC.warmStart(90000, scene); // 跑流程的十几秒里顺手把该场景的表捂热，回写时就快了
       }
       UI.appendLog({ t: Date.now(), level: 'ok', msg: '开始执行 ' + (s.spec_id || scene) + ' v' + s.version + '（任务参数已带入）' });
