@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.13
+// @version      0.9.14
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -208,6 +208,13 @@
  *     多打十几枪 /health?warm=1，白占连接）。
  *
  *   - v0.9.12：「检查更新」不能只看第一个源（2026-11-06 真机：点了更新还是旧版）。
+ *   - v0.9.14：新增 upload 原语（3B 开户信息页的执照/身份证正反/行业资质上传用）。
+ *      脚本不能改 input.value，但 new File + new DataTransfer 赋 input.files 再派发 change 是通的
+ *      —— 2026-11-06 真机实测：Element Plus 的 el-upload 接收后立刻发出
+ *      POST /usermgtportal/v1/upload_private（证据 evidence/p3b-upload-feasibility-20261106.md）。
+ *      ⚠ 派发 change 之后组件会把 input 清空，**判据必须看上传列表/缩略图，不能看 input.files**
+ *      （派发后立刻读是 0，那是「事件被接收」的正面信号）。只给 xpath 不给 expect_xpath 时
+ *      只记一条 warn：那只证明「事件发得出去」，不证明「传上去了」。
  *   - v0.9.13：①单次取数（read-once）：trigger.params_from_pend + 交接上下文优先于表 + TTL 10→60 分钟续期
  *              ②S5 回写改异步（先入本机队列、后台补写），不再堵 40~50s（2026-11-06 真机 48.9s）。
  *     现象：面板点「检查更新」，显示「已是最新 v0.9.10」，可 jsDelivr 上早有 0.9.11。
@@ -291,6 +298,29 @@
     if (typeof document === 'undefined') throw new Error('E_ENV ui 步骤需要 DOM 环境');
     const r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
     return r.singleNodeValue;
+  };
+  /* 把字节塞进 input[type=file]（0.9.14，3B 开户信息页的上传位用）。
+   * 脚本不能改 input.value，但 new File + new DataTransfer 赋给 input.files 再派发 change 是通的
+   * —— 2026-11-06 真机实测 Element Plus 的 el-upload 会接收并立刻发出
+   * POST /usermgtportal/v1/upload_private（evidence/p3b-upload-feasibility-20261106.md）。
+   * ⚠ 派发 change 之后组件通常会把 input 清空，**调用方不要在 dispatch 之后拿 files.length 判成败**，
+   * 那是「事件被接收」的正面信号。 */
+  ENGINE.uiPutFile = function (inp, bytes, filename, mime) {
+    if (!inp) throw new Error('E_UI 没有可写入的文件输入框');
+    if (String(inp.tagName || '').toUpperCase() !== 'INPUT' || String(inp.type || '').toLowerCase() !== 'file') {
+      throw new Error('E_SPEC 目标必须是 input[type=file]，实际命中 ' + inp.tagName + '[type=' + inp.type + ']');
+    }
+    if (typeof DataTransfer === 'undefined' || typeof File === 'undefined') {
+      throw new Error('E_ENV 当前环境不支持 DataTransfer/File，无法构造文件列表');
+    }
+    const file = new File([bytes], filename || 'upload.bin', { type: mime || 'application/octet-stream' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    inp.files = dt.files;
+    const assigned = inp.files ? inp.files.length : 0;
+    if (!assigned) throw new Error('E_UI 赋值后 input.files 仍为空——浏览器没有接受这次赋值（不是上传失败）');
+    inp.dispatchEvent(new Event('change', { bubbles: true }));
+    return { assigned: assigned, size: bytes.length, filename: file.name, mime: file.type };
   };
   /* 等元素出现：命中即刻返回（正常路径零额外耗时），未命中每 100ms 重试至超时。
    * 为什么必须等（2026-11-06 事故）：业务页是 SPA，URL 触发时 document-idle 只代表
@@ -700,6 +730,54 @@
         const key = String(a.var || ('v' + Object.keys(readings).length));
         readings[key] = got;
         log('读取 ' + label + ' = ' + (a.secret === true ? ENGINE.maskValue(got) : (got.length > 48 ? got.slice(0, 48) + '…' : got)));
+        return;
+      }
+
+      /* upload：往 input[type=file] 里塞文件（3B 开户信息页的企业执照/身份证正反/行业资质都靠它）。
+       * 为什么必须有这个原语：脚本不能改 input.value，但可以构造 File + DataTransfer 赋给 input.files
+       * 再派发 change —— 2026-11-06 真机实测 Element Plus 的 el-upload 会正常接收并发出
+       * POST /usermgtportal/v1/upload_private（见 evidence/p3b-upload-feasibility-20261106.md）。
+       *
+       * 判据不能看 input.files：派发 change 之后组件会把 input 清空，立刻读是 0，那是「事件被接收」
+       * 的正面信号而不是失败。所以要求用 expect_xpath/expect_text 等「上传列表出现文件名/缩略图」，
+       * 不写判据就只证明「事件发出去了」，不证明「传上去了」。 */
+      if (act === 'upload') {
+        const uxp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
+        if (!uxp) throw new Error('E_SPEC upload 缺 xpath（必须指向 input[type=file]）');
+        const b64 = String(ENGINE.resolvePlaceholders(String(a.base64 || ''), scope) || '').replace(/\s+/g, '');
+        if (!b64) throw new Error('E_SPEC upload 的 base64 为空（' + (a.base64 || '未声明') + '）——多半是业务表这一列没有附件');
+        const fname = ENGINE.resolvePlaceholders(String(a.filename || 'upload.bin'), scope);
+        const mm = ENGINE.resolvePlaceholders(String(a.mime || 'application/octet-stream'), scope);
+
+        const inp = ENGINE.uiFindByXPath(uxp);
+        if (!inp) throw new Error('E_UI_TARGET upload 目标未找到：' + (a.name || uxp));
+
+        let bin;
+        try { bin = atob(b64); } catch (e) { throw new Error('E_SPEC upload 的 base64 无法解码：' + e.message); }
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+        const put = ENGINE.uiPutFile(inp, bytes, fname, mm);
+        log('已塞入文件 ' + put.filename + '（' + put.size + ' 字节，' + put.mime + '）→ ' + (a.name || label)
+          + '；随后 input.files 会被组件清空，属正常');
+
+        /* 判据：等上传列表/缩略图/文件名出现。不写 expect_xpath 时只记一条 warn —— 只证明
+         * 「变更事件发得出去」，不证明「传成功了」，别让人误以为已经验过。 */
+        const wxp = a.expect_xpath ? ENGINE.resolvePlaceholders(String(a.expect_xpath), scope) : '';
+        const wtext = a.expect_text == null ? '' : ENGINE.resolvePlaceholders(String(a.expect_text), scope);
+        if (!wxp) {
+          log('⚠ upload 未声明 expect_xpath，只确认了文件已交给组件，未确认上传结果');
+          return;
+        }
+        const wms = Math.max(0, Number(a.expect_ms) || Number(a.until_ms) || 20000);
+        const t0 = Date.now();
+        let r = ENGINE.uiExpectText(wxp, wtext);
+        while (!r.ok && Date.now() - t0 < wms) { await sleep(200); r = ENGINE.uiExpectText(wxp, wtext); }
+        if (!r.ok) {
+          throw new Error('E_UI_EXPECT ' + (a.name || '') + '：上传后没看到「' + wtext + '」（实际「'
+            + (r.found ? r.actual : '<元素未找到>') + '」）——文件可能被前端校验拒了，或会话已失效');
+        }
+        log('上传结果已确认：' + (a.name || label) + (wtext ? ' = ' + wtext : '（元素已出现）'));
         return;
       }
 
@@ -1123,7 +1201,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.13',
+    RUNNER_VERSION: '0.9.14',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
