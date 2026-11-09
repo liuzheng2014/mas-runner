@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.24
+// @version      0.9.25
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1693,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.24',
+    RUNNER_VERSION: '0.9.25',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3447,7 +3447,23 @@
     const ks = Object.keys(q);
     if (ks.length) url += '?' + ks.map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(q[k]); }).join('&');
     const budget = (opts && opts.timeout) || 20000;
-    return new Promise(function (resolve, reject) {
+    /* 传输层重试（0.9.25）。
+     * 2026-11-09 19:00 实测：从本机到自定义域**单次尝试约 50% 根本连不上**——
+     * 12 次 /health 里 6 次失败（5 次 time_connect=0，SYN 石沉大海；1 次连上了但 TLS 握手卡住）；
+     * 成功的 6 次全在 0.35s 内。同一时刻 jsdelivr（同在 Cloudflare）10/10 秒回，
+     * 所以不是「CF 全挂」，是这个自定义域此刻的链路在丢包。
+     * 真机现象就是这个：URL 触发起手就打 /task，一枪 20s 超时 → 「按记录取数失败」整次终止，
+     * 而人重试一次往往就过了。
+     * 规则：**只重试幂等的 GET**。POST（/result 回写）一次都不重放——重放写请求可能造双份结果，
+     * 宁可让人在面板上点「重试回写」。E_SVC_WATCHDOG 也不在这里重试（它内部已经补发过一枪）。 */
+    const verb = String(method || 'GET').toUpperCase();
+    const retries = (opts && opts.retries !== undefined)
+      ? Math.max(0, Number(opts.retries) || 0)
+      : (verb === 'GET' ? 2 : 0);
+    const RETRY_GAP = [400, 1000];
+    const attempt = function (n, resolve, reject) {
+      /* 重试时的预算收窄到 12s：连不上就是连不上，没必要每枪都等满 20s 才换下一枪 */
+      const b = n === 1 ? budget : Math.min(budget, 12000);
       /* 看门狗（0.9.20）：GM_xmlhttpRequest 的三个回调在个别页面会**集体失联**——
        * 2026-11-09 ads.huawei.com SPA 实测 /task 静默挂死 4 次：onload/onerror/ontimeout 一个都不来，
        * 连 20s 的 ontimeout 都不触发（脚本管理器通道层挂死；页面 fetch 又被 CSP 拦死，
@@ -3455,7 +3471,7 @@
        * 超预算+5s 还没有任何回调 → 自动重发一次；再超 → 显式报错终止，绝不静默挂着。
        * GM 回调事后才到也没关系：settled 挡住迟到的 resolve/reject，且每次回调先清掉看门狗。 */
       let settled = false, retried = false, wd = null;
-      const margin = Math.min(5000, budget);   // 余量不小于预算的怪比例：小预算（测试/探针）不用陪等 5s
+      const margin = Math.min(5000, b);   // 余量不小于预算的怪比例：小预算（测试/探针）不用陪等 5s
       const send = function () {
         clearTimeout(wd);
         wd = setTimeout(function () {
@@ -3465,14 +3481,14 @@
           reject(new Error('E_SVC_WATCHDOG ' + method + ' ' + path +
             '：脚本管理器网络通道无响应（重发一次仍无回调）。这个站点的扩展环境把请求吞了：'
             + '刷新页面重试，或换一个页面/域名发起；同一服务在别的域名的页面上往往是好的。'));
-        }, budget + margin);
+        }, b + margin);
         GM_xmlhttpRequest({
           method: method,
           url: url,
           headers: { 'Content-Type': 'application/json; charset=utf-8', 'x-mas-code': SVC.code() },
           data: body ? JSON.stringify(body) : null,
           // 回写要等飞书返回（服务端自己还有 15s×2 的超时预算），所以按调用类型给不同上限
-          timeout: budget,
+          timeout: b,
           onload: function (r) {
             if (settled) return; settled = true; clearTimeout(wd);
             let j = {};
@@ -3480,12 +3496,35 @@
             if (r.status >= 400 || j.ok === false) return reject(new Error(j.error || ('E_SVC ' + r.status)));
             resolve(j);
           },
-          onerror: function () { if (settled) return; settled = true; clearTimeout(wd); reject(new Error('E_SVC_NET ' + url)); },
-          ontimeout: function () { if (settled) return; settled = true; clearTimeout(wd); reject(new Error('E_SVC_TIMEOUT ' + url)); },
+          onerror: function () {
+            if (settled) return; settled = true; clearTimeout(wd);
+            reject(new Error('E_SVC_NET ' + method + ' ' + path + '：连不上 ' + base));
+          },
+          ontimeout: function () {
+            if (settled) return; settled = true; clearTimeout(wd);
+            reject(new Error('E_SVC_TIMEOUT ' + method + ' ' + path + '：' + Math.round(b / 1000) +
+              's 内没有任何响应（到后端的 TCP/TLS 没通，或后端极慢；不是被服务端拒绝）'));
+          },
         });
       };
       send();
-    });
+    };
+    const loop = function (n) {
+      return new Promise(function (resolve, reject) { attempt(n, resolve, reject); }).catch(function (e) {
+        const m = String((e && e.message) || '');
+        /* 只有「传输层没通」才换一枪：服务端明确回了错（4xx/5xx/ok:false）说明请求到了，
+         * 重发不会变好，只会让人多等。 */
+        const transient = /^E_SVC_NET |^E_SVC_TIMEOUT /.test(m);
+        if (!transient || n > retries) {
+          if (n > 1) e.message = m + '；已尝试 ' + n + ' 次';
+          throw e;
+        }
+        const wait = RETRY_GAP[Math.min(n - 1, RETRY_GAP.length - 1)];
+        if (typeof SVC.onRetry === 'function') { try { SVC.onRetry(n, retries); } catch (_) {} }
+        return new Promise(function (r) { setTimeout(r, wait); }).then(function () { return loop(n + 1); });
+      });
+    };
+    return loop(1);
   };
 
   /* v0.4.13 起只有一种模式：填了服务地址走服务端，直连已整体移除（app_secret 只在服务端） */
@@ -4946,6 +4985,16 @@
     UI.renderLogEntry(entry);
   };
 
+  /* 传输层重试要说出来（0.9.25）：不静默重试——人看到「第 1/2 次重试」比「等了 20 秒突然失败」
+   * 好得多，否则只会以为脚本卡死了。文案里刻意不出现内部错误码
+   * （spec-upgrade-smoke 有一条断言就是「E_SVC_* 这种内部码不许甩给用户」）。 */
+  SVC.onRetry = function (n, max) {
+    UI.appendLog({
+      t: Date.now(), level: 'warn',
+      msg: '到后端的这次连接没通，正在重试（第 ' + n + '/' + max + ' 次）…',
+    });
+  };
+
   UI.replayPersistedLogs = function () {
     const el = document.getElementById('masr-log');
     if (!el) return;
@@ -5618,8 +5667,27 @@
       return;
     }
     if (!t && err) {
+      /* 失败卡片要给「再来一次」的入口（0.9.25）。以前只有一行红字，人唯一的办法是刷新整页——
+       * 而刷新意味着重新走一遍登录态/页面加载，代价远大于问题本身。
+       * 只在「传输层失败」时才给重试按钮：多场景命中、地址里没 record_id 这类，
+       * 原地重试一百次也是同一个结果，按钮只会教人瞎点。 */
+      const canRetry = !!UI._triggerErrRetry && typeof UI.retrigger === 'function';
       box.innerHTML = '<div style="' + bar + 'background:#fff2f0;border:1px solid #ffccc7;color:#c02a2a;font-size:11px">' +
-        trigEsc(err) + '</div>';
+        trigEsc(err) +
+        (canRetry
+          ? '<div class="row" style="margin-top:4px">' +
+              '<button id="masr-trigger-retry" style="font-size:11px;padding:1px 6px">重试取数</button>' +
+              '<span style="font-size:11px;color:#8f959e">不用刷新页面；这条记录的参数还没取到，重试不会重复执行</span>' +
+            '</div>'
+          : '') +
+        '</div>';
+      const rb = document.getElementById('masr-trigger-retry');
+      if (rb) rb.addEventListener('click', function () {
+        UI._triggerErr = '';
+        UI._triggerErrRetry = false;
+        UI.renderTrigger();
+        UI.retrigger();
+      });
       return;
     }
     const view = SVC.sceneView(t.script_id);
@@ -5737,6 +5805,7 @@
     if (UI.spec && UI.restoreSpecText) UI.restoreSpecText();
     UI._triggerTask = task;
     UI._triggerErr = '';
+    UI._triggerErrRetry = false;
     UI.renderTrigger();
     const ps = task.params || {};
     const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
@@ -5788,6 +5857,7 @@
            *   ②命中但取不到 recordId（recordId 在 service 里且 spec 没声明 record_id_deep）。 */
           const amb = SVC._triggerAmbiguous;
           if (amb && amb.length > 1) {
+            UI._triggerErrRetry = false;
             UI._triggerErr = '当前地址同时匹配多个场景（' + amb.join('、') + '）：声明里缺少区分标记（action_query），引擎不做猜测，已跳过';
             UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr });
             UI.renderTrigger();
@@ -5812,6 +5882,7 @@
          * 命中也要说出来——「明明匹配上了却什么都没发生」是最难排查的那种故障。 */
         const lo = SVC.logoutGuard(hit);
         if (lo) {
+          UI._triggerErrRetry = false;
           UI._triggerErr = lo.msg;
           UI.appendLog({ t: Date.now(), level: 'warn', msg: lo.msg });
           UI.renderTrigger();
@@ -5820,6 +5891,7 @@
         const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
         if (!hit.record_id && !hasUrlParams) {
           UI._triggerTask = null;
+          UI._triggerErrRetry = false;
           UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
           /* 这条曾经只写进面板的错误条，而错误条挂在任务区、会被 renderTasks 重绘抹掉，
            * 结果就是「点完按钮跳到登录页 → 没反应、没日志」。跨域登录页上 recordId 被编码进
@@ -5902,6 +5974,9 @@
       } catch (e) {
         UI._triggerTask = null;
         UI._triggerErr = '按记录取数失败：' + e.message;
+        /* 只有传输层失败才值得原地再试一次（0.9.25）：实测这个自定义域单次尝试约 50% 连不上，
+         * 而 /task 已经自动重试过 2 次；还原地再给一次机会，比让人刷新整页成本低得多。 */
+        UI._triggerErrRetry = /E_SVC_NET|E_SVC_TIMEOUT|E_SVC_WATCHDOG|E_SVC_PARSE|E_SVC 5\d\d/.test(String(e && e.message || ''));
         UI.renderTrigger();
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '按记录取数失败：' + e.message });
         // 中转页没有主面板，必须让人看见失败原因，否则会以为按钮坏了
@@ -5920,6 +5995,8 @@
       lastHref = location.href;
       fire('url-change');
     }, 1200);
+    /* 面板「重试取数」按的就是它（0.9.25）：同一个入口、同一套判定，不另写一条捷径 */
+    UI.retrigger = function () { return fire('manual'); };
     fire('boot');
     return fire;
   }
@@ -6159,6 +6236,13 @@
       /* 手动同步 spec（0.9.22）：要验证「强制绕开缓存 / 失败不清旧缓存 / 只换当前这份」，
        * 只能构造「本机缓存旧、线上新」的假响应，真机等不到。生产路径不会调用。 */
       forceSyncSpec: function () { return UI.forceSyncSpec(); },
+      /* 传输层重试（0.9.25）：失败卡片上的「重试取数」按钮要能验证「传输层失败才有、
+       * 声明不足（多场景/无 recordId）这类没有」，这份 UI 状态从外部造不出来，只能显式给写入口。 */
+      setTriggerErr: function (err, retryable) {
+        UI._triggerTask = null; UI._triggerErr = err || ''; UI._triggerErrRetry = !!retryable;
+        UI.renderTrigger();
+      },
+      hasRetrigger: function () { return typeof UI.retrigger === 'function'; },
     };
   } catch (e) {
     window.__MASR_TEST_WB__ = {
@@ -6176,6 +6260,13 @@
       /* 手动同步 spec（0.9.22）：要验证「强制绕开缓存 / 失败不清旧缓存 / 只换当前这份」，
        * 只能构造「本机缓存旧、线上新」的假响应，真机等不到。生产路径不会调用。 */
       forceSyncSpec: function () { return UI.forceSyncSpec(); },
+      /* 传输层重试（0.9.25）：失败卡片上的「重试取数」按钮要能验证「传输层失败才有、
+       * 声明不足（多场景/无 recordId）这类没有」，这份 UI 状态从外部造不出来，只能显式给写入口。 */
+      setTriggerErr: function (err, retryable) {
+        UI._triggerTask = null; UI._triggerErr = err || ''; UI._triggerErrRetry = !!retryable;
+        UI.renderTrigger();
+      },
+      hasRetrigger: function () { return typeof UI.retrigger === 'function'; },
     };
   }
   // 触发匹配/模板/跨页传递是纯逻辑，单独暴露给回归探针（只读引用，不改变运行行为）
