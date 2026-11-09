@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.20
+// @version      0.9.21
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1693,7 +1693,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.20',
+    RUNNER_VERSION: '0.9.21',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3383,20 +3383,31 @@
   /* 探活：打 /health，顺便核对版本。没填地址时由调用方引导填写，不会走到这里 */
   /* 超时 8s→4s（v0.9.11）：这是一个纯健康检查，链路正常时是亚秒级；给到 8s 只会让「标签页被冻住」
    * 这类情况多挂 4 秒静默。真机 2026-11-06 的 27s 空白段里，脚本唯一在等的东西就是它。 */
-  SVC.ping = function () {
-    const base = SVC.base();
-    return new Promise(function (resolve, reject) {
-      GM_xmlhttpRequest({
-        method: 'GET', url: base + '/health', timeout: 4000,
-        onload: function (r) {
-          let j = {};
-          try { j = JSON.parse(r.responseText || '{}'); } catch (e) {}
-          if (r.status !== 200) return reject(new Error('地址有响应但不是本服务（HTTP ' + r.status + '）'));
-          if (j.service && j.service !== 'mas-service') return reject(new Error('这个地址不是 MAS 后端'));
-          resolve({ mode: 'svc', version: j.version || '?' });
-        },
-        onerror: function () { reject(new Error('连不上 ' + base)); },
-        ontimeout: function () { reject(new Error('超时（4 秒）' + base)); },
+  /* 两段式（0.9.21）：4s 快探失败后再给 12s 重试一次。真机 2026-11-09：同一次运行里
+   * /task 4.2s 成功（后端明明可达），/health 却 4s 超时 fatal，把登录点击之后的续跑整次误杀
+   * （当天链路普遍 5~6.5s，4s 预算必炸）。两段都失败才向上报错——真死的服务在重试里会快速
+   * 再失败（连接拒绝类 onerror 是瞬时的），总代价有界；budgets 可注入（smoke 用小预算）。 */
+  SVC.ping = function (opts) {
+    const budgets = (opts && opts.budgets) || [4000, 12000];
+    const once = function (budget) {
+      return new Promise(function (resolve, reject) {
+        GM_xmlhttpRequest({
+          method: 'GET', url: SVC.base() + '/health', timeout: budget,
+          onload: function (r) {
+            let j = {};
+            try { j = JSON.parse(r.responseText || '{}'); } catch (e) {}
+            if (r.status !== 200) return reject(new Error('地址有响应但不是本服务（HTTP ' + r.status + '）'));
+            if (j.service && j.service !== 'mas-service') return reject(new Error('这个地址不是 MAS 后端'));
+            resolve({ mode: 'svc', version: j.version || '?' });
+          },
+          onerror: function () { reject(new Error('连不上 ' + SVC.base())); },
+          ontimeout: function () { reject(new Error('超时（' + Math.round(budget / 1000) + ' 秒）' + SVC.base())); },
+        });
+      });
+    };
+    return once(budgets[0]).catch(function (e1) {
+      return once(budgets[1]).catch(function (e2) {
+        throw new Error(e1.message + '；重试（' + Math.round(budgets[1] / 1000) + 's）仍失败：' + e2.message);
       });
     });
   };
