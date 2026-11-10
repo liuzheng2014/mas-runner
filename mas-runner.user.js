@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.28
+// @version      0.9.29
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -385,7 +385,16 @@
    * 且 @connect * 已在头部声明。
    * 不用 .js 中转形态：那要求服务端把整个文件 base64 一遍，免费 Workers 的 10ms CPU 撑不住。
    *
-   * 0.9.28（2026-11-10 真机）：三个改动，全部由 3C 那次失败逼出来的——
+   * 0.9.29（2026-11-10 真机）：**待写队列按「场景+记录」分键**。
+   *   现场 reczz28VqEhiC0kO：P2 建完成员、S5 把「开户状态+邮箱账号」放进待写队列，页面随即退出跳转；
+   *   登录页启动补写时轮到这条还没开始写，3A（登录）跑完也入队同一条记录（「客仓ID+密码修改结果」），
+   *   队列原来只按 record_id 去重 → 新入队的把 P2 那份**顶掉**。表里最终只有客仓ID，
+   *   邮箱账号永远空着，日志却写着「✅ 自动补写成功」。
+   *   同一场景重复跑「以最新为准」是对的（旧结果作废），跨场景不能互相顶：一条记录会被三个场景
+   *   先后写不同的列。现在键 = `场景|记录`，出队也只删自己那一份；顺带把「队列里有超过 30 分钟
+   *   没补写的」从静默改成明确提示（原来自动补写会静默跳过它们，只在面板上留一句「还没写进飞书」）。
+   *
+ * 0.9.28（2026-11-10 真机）：三个改动，全部由 3C 那次失败逼出来的——
    *   ① 单文件超时 60s → 120s。实测这条链路 20~40KB/s（876KB 的执照下了 24s），
    *      1.28MB 的软著 PDF 在 60s 内根本下不完，报出来的却是「检查是否 ≤5MB」这种误导文案；
    *   ② 超时/网络错误重试 1 次（410/404 不重试：一次性签名地址失效，重试只是再失败一次）；
@@ -1857,7 +1866,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.28',
+    RUNNER_VERSION: '0.9.29',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4760,18 +4769,35 @@
   const PENDW_KEY = 'masr_pending_writes_v1';
   function pwList() { try { return JSON.parse(GM_getValue(PENDW_KEY, '[]')) || []; } catch (e) { return []; } }
   function pwSave(arr) { try { GM_setValue(PENDW_KEY, JSON.stringify(arr.slice(-100))); } catch (e) {} } // 上限 100：批量一次 50 条，留 20 会丢掉最早的结果
+  /* 队列项的主键 = 「场景 + 记录」，不是只用记录。
+   * 一条记录会被**多个场景**先后回写不同的列：P2 写「开户状态 + 邮箱账号」，3A 写「客仓ID +
+   * 密码修改结果」，3C 写「开户状态 + 客仓ID」。只用 record_id 去重时，后一个场景入队会把前一个
+   * 场景还没轮到写的那份**直接顶掉**——2026-11-10 真机 reczz28VqEhiC0kO 就是这样：表里最后只有
+   * 3A 的客仓ID，「邮箱账号」永远空着，而日志写着「✅ 自动补写成功」（它确实成功了，只是写的是
+   * 被别人换掉的那份）。同一场景重复跑才有「以最新为准」的语义（旧结果作废），所以键里必须带场景。 */
+  function pwKey(p, script) {
+    const rid = (p && p.record_id) || '';
+    const sc = (script === undefined ? (p && p._script) : script) || '';
+    return sc + '|' + rid;
+  }
   function pwAdd(payload) {
     const a = pwList();
-    /* 一条记录只留一条待写：失败重跑会越堆越多，而「重试回写」是按顺序逐条 PUT 的，
-     * 同一条记录的多份 payload 会互相覆盖，最后落表的可能反而是早就作废的那份。 */
-    const i = a.findIndex(function (p) { return p && p.record_id === payload.record_id; });
+    const k = pwKey(payload);
+    const i = a.findIndex(function (p) { return p && pwKey(p) === k; });
     const item = Object.assign({}, payload, { queued_at: Date.now() });
     if (i >= 0) a[i] = item; else a.push(item);
     pwSave(a);
   }
-  /* 出队：后台回写成功后才调用。失败一律留在队列里——队列就是「还没进表」的唯一真值。 */
-  function pwDel(record_id) {
-    pwSave(pwList().filter(function (p) { return !p || p.record_id !== record_id; }));
+  /* 出队：后台回写成功后才调用。失败一律留在队列里——队列就是「还没进表」的唯一真值。
+   * 只删「自己这一份」：同一条记录上别的场景还排着队的结果不能被连带清掉。
+   * 不给 script 时才是「清掉这条记录的全部待写」（老调用兼容）。 */
+  function pwDel(record_id, script) {
+    const k = (script === undefined) ? null : pwKey({ record_id: record_id }, script);
+    pwSave(pwList().filter(function (p) {
+      if (!p) return false;
+      if (p.record_id !== record_id) return true;
+      return k ? pwKey(p) !== k : false;
+    }));
   }
 
   /* 「这条记录的成功结果已经进表了」的跨页凭证。
@@ -4798,6 +4824,13 @@
   }
 
   /* 回写：超时/断连自动再试一次（这类失败九成是连接抖了一下，重试就过；见 service fsFetch 注释） */
+  /* 队列里带着几个「只在本机有意义」的键（queued_at / _expect_fields / _script），
+   * 发给服务端前统一剥掉：服务端不关心，也免得以后有人以为它们进了表。 */
+  function localPayload(p) {
+    const b = Object.assign({}, p);
+    delete b.queued_at; delete b._expect_fields; delete b._script;
+    return b;
+  }
   async function writeWithRetry(payload, tries) {
     tries = tries || 2;
     let lastErr = null;
@@ -4895,6 +4928,7 @@
       // 写什么列、写什么值，由服务端按该 spec 的 scene.writeback 渲染（Runner 零场景知识）。
       const payload = {
         record_id: task.record_id,
+        _script: task.script_id || '',   // 只在本地待写队列里用：队列按「场景+记录」分键（0.9.29）
         // 透传：这条记录从 /tasks 下来就带着凭据（含 script_id），回写只做一次 PUT，服务端不再回读记录
         write_token: task.write_token || '',
         status: ok ? 'ok' : 'fail',
@@ -4915,14 +4949,14 @@
        * 请求若被页面跳转打断，下一个页面启动时 autoFlushPending 会自己补写。 */
       if (opt && opt.background) {
         payload._expect_fields = wbDeclared(st, ok) || undefined;
-        pwAdd(payload);          // 先落盘：这一步成功了，后面无论怎么断都不会丢
+        pwAdd(payload);   // 键含场景：别把别的场景还没写的那份顶掉          // 先落盘：这一步成功了，后面无论怎么断都不会丢
         UI.appendLog({ t: Date.now(), level: 'info',
           msg: '结果已存入本机队列，后台开始回写（不阻塞流程，页面继续往下走）' });
         const bgJob = (async function () {
           const t0 = Date.now();
           try {
-            const wr = await writeWithRetry(payload);
-            pwDel(task.record_id);        // 真写成功才出队
+            const wr = await writeWithRetry(localPayload(payload));
+            pwDel(task.record_id, task.script_id);   // 真写成功才出队（只删自己这一份）
             markWbOk(task.record_id);
             const wrote = !wr || !Array.isArray(wr.written) || wr.written.length > 0;
             UI.appendLog({
@@ -5049,18 +5083,28 @@
     const all = pwList().filter(function (p) {
       return p && p.record_id && (Date.now() - (p.queued_at || 0)) < 30 * 60 * 1000;
     });
-    if (!all.length) return;
+    if (!all.length) {
+      /* 老结果不硬撞是对的（后端没起来时一条条超时只会更慢），但**不能静默**：
+       * 2026-11-10 真机 reczz28VqEhi9mVy 在队列里躺了 5 小时，面板每页都写「还没写进飞书」，
+       * 自动补写却一次都不碰它——人以为是系统在补，其实要手点「重试回写」。 */
+      const stale = pwList().filter(function (p) { return p && p.record_id; });
+      if (stale.length) {
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '待写队列里有 ' + stale.length + ' 条超过 30 分钟没补写（' +
+            stale.map(function (p) { return p.record_id; }).join('、') +
+            '）：自动补写不会动它们，请点任务面板上方的「重试回写」' });
+      }
+      return;
+    }
     _autoFlush = true;
     UI.appendLog({ t: Date.now(), level: 'info',
       msg: '发现 ' + all.length + ' 条结果还没进表（上一次被页面跳转打断了），后台自动补写…' });
     for (const p of all) {
-      const body = Object.assign({}, p);
-      const expect = body._expect_fields || null;
-      delete body.queued_at;
-      delete body._expect_fields;          // 只在本地产物里，不往服务端发
+      const body = localPayload(p);
+      const expect = p._expect_fields || null;
       try {
         const wr = await writeWithRetry(body, 1);
-        pwDel(body.record_id);
+        pwDel(body.record_id, p._script);
         markWbOk(body.record_id);
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 自动补写成功：' + body.record_id });
         warnMissingFields(expect, (wr && wr.written) || [], '自动补写');
@@ -6506,7 +6550,7 @@
       checkUpdate: UI.checkUpdate,
       newUrl: function () { return UI._newUrl || ''; },
       /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
-      autoFlushPending: autoFlushPending, pwDel: pwDel, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
+      autoFlushPending: autoFlushPending, pwDel: pwDel, pwKey: pwKey, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
       /* spec 缓存版本校验（0.9.19）：要验证「缓存 0.2.0 / 线上 0.4.0 → 本次就换新版」，
        * 只能从 /task 回包里带版本号那条路走，UI 上没法稳定构造（线上不会配合同时发两个版本）。
        * 生产路径不会调用。 */
@@ -6530,7 +6574,7 @@
       checkUpdate: UI.checkUpdate,
       newUrl: function () { return UI._newUrl || ''; },
       /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
-      autoFlushPending: autoFlushPending, pwDel: pwDel, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
+      autoFlushPending: autoFlushPending, pwDel: pwDel, pwKey: pwKey, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
       /* spec 缓存版本校验（0.9.19）：要验证「缓存 0.2.0 / 线上 0.4.0 → 本次就换新版」，
        * 只能从 /task 回包里带版本号那条路走，UI 上没法稳定构造（线上不会配合同时发两个版本）。
        * 生产路径不会调用。 */
