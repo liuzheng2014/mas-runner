@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.27
+// @version      0.9.28
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -383,8 +383,19 @@
    * 2026-11-06 实测 ads.huawei.com 把自家 Worker 的请求整条拒掉（同一个 URL 在 example.com
    * 返回 200，证明是页面 CSP 而不是服务端）。GM_xhr 走扩展上下文，不受页面 CSP 约束，
    * 且 @connect * 已在头部声明。
-   * 不用 .js 中转形态：那要求服务端把整个文件 base64 一遍，免费 Workers 的 10ms CPU 撑不住。 */
-  ENGINE.uiFetchBytes = function (url) {
+   * 不用 .js 中转形态：那要求服务端把整个文件 base64 一遍，免费 Workers 的 10ms CPU 撑不住。
+   *
+   * 0.9.28（2026-11-10 真机）：三个改动，全部由 3C 那次失败逼出来的——
+   *   ① 单文件超时 60s → 120s。实测这条链路 20~40KB/s（876KB 的执照下了 24s），
+   *      1.28MB 的软著 PDF 在 60s 内根本下不完，报出来的却是「检查是否 ≤5MB」这种误导文案；
+   *   ② 超时/网络错误重试 1 次（410/404 不重试：一次性签名地址失效，重试只是再失败一次）；
+   *   ③ 按 URL 缓存 Promise：开跑时并行预取（见 uiPrefetchUploads），上传时直接取内存，
+   *      同一个地址永远只下一次。缓存里存 Promise 而不是 ArrayBuffer，是为了让「预取还没
+   *      下完、上传已经到了」这两条路径共享同一次下载，而不是各发一条。 */
+  ENGINE.FILE_TIMEOUT_MS = 120000;
+  ENGINE.uiFileCache = {};
+  ENGINE.uiFileLog = function () {};      // 调用方注入（execUi / 预取），默认静默
+  ENGINE.uiFetchOnce = function (url) {
     return new Promise(function (resolve, reject) {
       if (typeof GM_xmlhttpRequest !== 'function') {
         reject(new Error('E_ENV 当前环境没有 GM_xmlhttpRequest，无法从 URL 取文件字节（不能退回页面 fetch：会被页面 CSP 拦）'));
@@ -396,7 +407,7 @@
         method: 'GET',
         url: url,
         responseType: 'arraybuffer',
-        timeout: 60000,
+        timeout: ENGINE.FILE_TIMEOUT_MS,
         onload: function (r) {
           if (done) return;
           if (r.status === 410) {
@@ -420,10 +431,76 @@
           resolve(ab);
         },
         onerror: function () { fail('E_UI_FILE_SRC 网络错误：' + url); },
-        ontimeout: function () { fail('E_UI_FILE_SRC 取文件超时（60s）：' + url); },
+        ontimeout: function () {
+          fail('E_UI_FILE_SRC 取文件超时（' + Math.round(ENGINE.FILE_TIMEOUT_MS / 1000) + 's）：' + url);
+        },
       });
     });
   };
+  /* 带缓存 + 重试的取字节。失败必须把缓存条目删掉——否则上传阶段的「再试一次」
+   * 会拿到同一个已 rejected 的 Promise，等于没有第二次机会。 */
+  ENGINE.uiFetchBytes = function (url) {
+    const key = String(url);
+    if (ENGINE.uiFileCache[key]) return ENGINE.uiFileCache[key];
+    const p = (async function () {
+      let last = '';
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try { return await ENGINE.uiFetchOnce(key); }
+        catch (e) {
+          last = e.message || String(e);
+          /* 地址类错误重试无意义：410 是一次性签名过期、404 是对象被清掉，
+           * 重试只会白等一轮再把同样的错抛出去（还会让人以为是网络问题）。 */
+          if (/（410）|（404）|HTTP 4\d\d/.test(last)) break;
+          if (attempt < 2) ENGINE.uiFileLog('下载失败（' + last.replace(/^E_UI_FILE_SRC\s*/, '').slice(0, 120) + '），重试 1 次');
+        }
+      }
+      delete ENGINE.uiFileCache[key];
+      throw new Error(last);
+    })();
+    ENGINE.uiFileCache[key] = p;
+    return p;
+  };
+  /* 附件预取（0.9.28）：把 spec 里所有 upload.src 在开跑时一起下，与填表步骤重叠。
+   * 为什么值得：3C 一次要传 5 个文件（执照 876KB、身份证 2 张、软著 PDF 1.28MB + 授权书），
+   * 串行「用到才下」时每个上传动作都在干等网络，S2 的 25.5s 里 24s 是下载。
+   * 预取不阻塞流程、失败不终止（上传时还有一次重试），下不动的文件不该让整单停在这里。 */
+  ENGINE.collectUploadSrcs = function (spec, scope) {
+    const out = [];
+    (spec.steps || []).forEach(function (s) {
+      ((s.ui && s.ui.actions) || []).forEach(function (a) {
+        if (!a || String(a.do) !== 'upload' || !a.src) return;
+        let v = '';
+        try { v = String(ENGINE.resolvePlaceholders(String(a.src), scope) || '').trim(); } catch (e) { v = ''; }
+        if (/^https?:\/\//i.test(v) && out.indexOf(v) < 0) out.push(v);
+      });
+    });
+    return out;
+  };
+  ENGINE.uiPrefetchUploads = function (spec, scope, log) {
+    const urls = ENGINE.collectUploadSrcs(spec, scope);
+    if (!urls.length) return 0;   // 没附件就一个字节都不动：老场景日志逐字节不变
+    const say = log || function () {};
+    /* 预取阶段就把「下载失败→重试」接到同一条日志流上：这一步没有步骤号，
+     * 但它是真机上最先出问题的地方（链路丢包），静默重试等于让人看不到发生过什么。 */
+    if (log) ENGINE.uiFileLog = say;
+    const t0 = Date.now();
+    say('附件预取：' + urls.length + ' 个文件并行下载（与填表同时进行，用到时直接取内存）');
+    let ok = 0, bad = 0, bytes = 0, lastErr = '';
+    Promise.all(urls.map(function (u) {
+      return ENGINE.uiFetchBytes(u).then(function (ab) {
+        ok++; bytes += (ab && ab.byteLength) || 0;
+      }, function (e) {
+        bad++; lastErr = (e && e.message) || String(e);
+      });
+    })).then(function () {
+      const mb = (bytes / 1024 / 1024).toFixed(1);
+      say('附件预取' + (bad ? '部分失败' : '完成') + '：' + ok + '/' + urls.length + ' 就绪，' + mb + 'MB，用时 '
+        + ((Date.now() - t0) / 1000).toFixed(1) + 's'
+        + (bad ? '；失败的上传时会再试一次（' + String(lastErr).slice(0, 140) + '）' : ''));
+    });
+    return urls.length;
+  };
+
   /* 等元素出现：命中即刻返回（正常路径零额外耗时），未命中每 100ms 重试至超时。
    * 为什么必须等（2026-11-06 事故）：业务页是 SPA，URL 触发时 document-idle 只代表
    * 文档就绪，表单还要等若干 XHR 回来才渲染。此前 spec 取数要走 14 秒网络，恰好把这段
@@ -1032,6 +1109,38 @@
         log('条件成立（' + w.detail + '），执行 ' + (a.name || act));
       }
       if (act === 'wait') { await sleep(Number(a.ms) || gap); return; }
+      /* wait_for（0.9.28）：等元素出现就立刻往下走，等不到才等满 timeout_ms。
+       * 为什么它不是 wait 的糖：spec 里原来到处是「固定睡 9 秒等 SPA 落稳」「固定睡 2.5 秒
+       * 等联动渲染」——页面快时白等，页面慢时又不够。3C 首跑实测 S1 的 11.5s 里 11.5s 是纯睡眠。
+       * 判据支持两种：
+       *   xpath           元素存在（可带 count() 谓词，用来等「第 4 个上传位被联动渲染出来」）
+       *   value_nonempty  元素存在**且** value 非空（等 OCR 回填这种「先出现再被写入」的框）
+       * optional：等不到只记一行日志，不失败（「本来就没有」与「选择器写错」的区别靠日志看）。 */
+      if (act === 'wait_for') {
+        const wxp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
+        if (!wxp) throw new Error('E_SPEC wait_for 缺 xpath');
+        const tmax = Math.max(0, Number(a.timeout_ms) || 8000);
+        const wantVal = a.value_nonempty === true;
+        const t0w = Date.now();
+        let hit = null;
+        while (Date.now() - t0w < tmax) {
+          let el = null;
+          try { el = ENGINE.uiFindByXPath(wxp); } catch (e) { throw new Error('E_UI_TARGET wait_for 选择器无效: ' + wxp); }
+          if (el && (!wantVal || String(el.value == null ? '' : el.value).trim().length)) { hit = el; break; }
+          await sleep(120);
+        }
+        const cost = Date.now() - t0w;
+        if (hit) {
+          log('等到 ' + (a.name || '目标元素') + (wantVal ? '（已有值）' : '') + '，用时 ' + cost + 'ms');
+          return;
+        }
+        if (a.optional === true) {
+          log('等不到 ' + (a.name || '目标元素') + '（' + tmax + 'ms）——spec 声明 optional，继续');
+          return;
+        }
+        throw new Error('E_UI_TARGET wait_for 超时（' + tmax + 'ms）：' + (a.name || wxp)
+          + ' 仍未出现' + (wantVal ? '或仍为空' : '') + '——页面没渲染到该状态，或选择器已改版');
+      }
       /* 关页是纯本地动作：不等网络、不依赖任何元素。调用后页面可能立刻销毁，
        * 所以不做「关掉了吗」的回读——那是自欺欺人（页面没了就读不到了）。 */
       if (act === 'close_tab') {
@@ -1247,8 +1356,9 @@
         const fname = ENGINE.resolvePlaceholders(String(a.filename || 'upload.bin'), scope);
         const mm = ENGINE.resolvePlaceholders(String(a.mime || 'application/octet-stream'), scope);
 
-        const inp = ENGINE.uiFindByXPath(uxp);
-        if (!inp) throw new Error('E_UI_TARGET upload 目标未找到：' + (a.name || uxp));
+        const inp = ENGINE.uiFindByXPath(uxp) || await ENGINE.uiWaitByXPath(uxp, Math.max(0, Number(a.ready_ms) || readyMs), sleep);
+        if (!inp) throw new Error('E_UI_TARGET upload 目标未找到：' + (a.name || uxp)
+          + '（已等待 ' + (Math.max(0, Number(a.ready_ms) || readyMs)) + 'ms；资质上传位常常是选完行业/勾选三证合一后由联动渲染出来的，若刚选完行业，多半是联动还没渲染完）');
 
         let bytes;
         if (b64) {
@@ -1548,11 +1658,15 @@
       if (canMerge) last.items.push(item);
       else batches.push({ group: g, items: [item] });
     }
-    for (const b of batches) {
+    for (let bi = 0; bi < batches.length; bi++) {
+      const b = batches[bi];
+      const prog = { i: bi + 1, total: batches.length };
       if (b.items.length > 1) {
         log('并行处理 ' + b.items.length + ' 项（' + b.group + '）');
+        if (opts.onProgress) opts.onProgress(Object.assign({ name: '并行 ' + b.items.length + ' 项' }, prog));
         await Promise.all(b.items.map(runOne));
       } else {
+        if (opts.onProgress) opts.onProgress(Object.assign({ name: (b.items[0] && (b.items[0].name || b.items[0].do)) || '' }, prog));
         await runOne(b.items[0]);
       }
     }
@@ -1743,7 +1857,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.27',
+    RUNNER_VERSION: '0.9.28',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2045,6 +2159,15 @@
     let scope = buildScope(spec, params, extracted, vars);
     let writeCount = 0; // 本次运行的写操作计数（受 runtime.write_caps.max_writes_per_run 约束）
 
+    /* 附件并行预取（0.9.28）：不 await——下载与下面的填表步骤同时进行，传的时候直接从内存拿。
+     * 放在这里（而不是各 upload 动作里）是因为「用到才下」让每个上传动作都在干等网络：
+     * 3C 真机 S2 的 25.5s 里 24s 是下载 876KB 的执照。 */
+    try {
+      ENGINE.uiPrefetchUploads(spec, scope, function (m) { log({ t: Date.now(), level: 'info', msg: m }); });
+    } catch (e) {
+      log({ t: Date.now(), level: 'warn', msg: '附件预取启动失败（不影响流程，上传时会各自下载）：' + (e.message || e) });
+    }
+
     // 预检：全部步骤的占位符当前可解析吗（除引用后步产物的）？——尽力预检，允许执行期再补
     const missing = ENGINE.findUnresolvedPlaceholders(
       spec.steps.map(s => s.request || { url: s.url }), scope);
@@ -2158,8 +2281,11 @@
   async function execUi(spec, step, scope, stepLogs, log, onStep, idx, extracted, params) {
     onStep(step.id, 'running');
     const ui = step.ui || {};
+    const acts = ui.actions || [];
     const t0 = Date.now();
-    log({ t: t0, level: 'info', msg: step.id + ' → 页面填充（' + ((ui.actions) || []).length + ' 个动作，间隔 ' + (Number(ui.gap_ms) || 400) + 'ms）' });
+    log({ t: t0, level: 'info', msg: step.id + ' → 页面填充（' + acts.length + ' 个动作，间隔 ' + (Number(ui.gap_ms) || 400) + 'ms）' });
+    /* 下载失败/重试的日志挂到本步骤上：字体大小与其它动作日志一致，人能看出「卡在哪一个文件」。 */
+    ENGINE.uiFileLog = function (m) { log({ t: Date.now(), level: 'warn', msg: step.id + ' · ' + m }); };
     /* 点击可能整页跳走（例如「去登录」跳到 CAS 登录页）：续跑状态必须在**点之前**写进运行态，
      * 否则页面一卸载就再没人执行后面的步骤。哪个动作会跳，由该动作自己的 nav_after 声明
      * （不是整个 step）——因为同一个 step 里往往还有「元素不存在就跳过」的可选点击。
@@ -2192,6 +2318,11 @@
             Object.keys(stn.params || {}).length + ' 个、产物 ' + Object.keys(stn.extracted || {}).length + ' 项）' });
         },
         onNavAfter: function (ok) { if (!ok) clearNav(); },
+        /* 时间线跟着动作走（0.9.28）：以前一步跑 60 秒，行里只有「⏳ running」，
+         * 人看到页面在填、状态像没动。现在每开一个动作就推一次「3/7 上传软著 1/3」。 */
+        onProgress: function (p) {
+          onStep(step.id, 'progress', p || {});
+        },
       });
       /* read 动作的产物进步骤抽取，key 用「步骤ID.变量名」——与 api 步骤的抽取同一条通道，
        * 因此 outputs / 回写模板都能直接用 {{S3.account_email}} 引用。 */
@@ -5345,19 +5476,67 @@
     if (now - last < (minGapMs || 60 * 60 * 1000)) return;
     await UI.checkUpdate(true);
   };
+  /* 步骤时间线的状态（0.9.28 修）：
+   * ① 以前 map 里只有 running/requesting/navigating/passed/failed，而 ui 步骤收尾时发的是
+   *    'done' / 'fail' —— 于是跑完的一行显示成英文单词 done，看着像没结束（真机截图里
+   *    好几行就是 done）。这里补齐，并且把「跳过」也从裸的 skipped 改成中文。
+   * ② 一步可能要跑几十秒（上传 5 个附件），以前整段时间行里只有「⏳ running」，
+   *    人看到页面在动、状态像没动。现在带动作进度（3/7 上传软著 1/3）与计时，每秒刷新。
+   * 计时器按 stepId 存，任何终态/重新渲染/收尾都要清掉，否则跑完还在跑 interval。 */
+  UI._stepTick = {};
+  UI.clearStepTimers = function () {
+    Object.keys(UI._stepTick).forEach(function (k) {
+      try { clearInterval(UI._stepTick[k]); } catch (e) {}
+      delete UI._stepTick[k];
+    });
+  };
   UI.renderSteps = function (spec) {
+    UI.clearStepTimers();
     const el = document.getElementById('masr-steps');
     el.innerHTML = '<table><tr><th>#</th><th>步骤</th><th>mode</th><th>状态</th></tr>' +
       spec.steps.map((s, i) =>
         '<tr><td>S' + (i + 1) + '</td><td>' + (s.name || s.id) + '</td><td>' + s.mode + '</td><td id="masr-step-' + s.id + '">待执行</td></tr>').join('') +
       '</table>';
   };
-  UI.markStep = function (stepId, phase) {
+  const STEP_LABEL = {
+    running: '⏳ 运行中', progress: '⏳ 运行中', requesting: '→ 请求中', navigating: '→ 导航中',
+    passed: '✓ 通过', done: '✓ 通过', failed: '✗ 失败', fail: '✗ 失败', skipped: '— 跳过',
+  };
+  UI.markStep = function (stepId, phase, info) {
     const el = document.getElementById('masr-step-' + stepId);
     if (!el) return;
-    const map = { running: '⏳ running', requesting: '→ 请求中', navigating: '→ 导航中', passed: '✓ 通过', failed: '✗ 失败' };
-    el.textContent = map[phase] || phase;
-    el.style.color = phase === 'passed' ? '#1a7f43' : phase === 'failed' ? '#c22' : '#555';
+    const stop = function () {
+      if (UI._stepTick[stepId]) { try { clearInterval(UI._stepTick[stepId].t); } catch (e) {} delete UI._stepTick[stepId]; }
+    };
+    const paint = function (st) {
+      const secs = st && st.t0 ? Math.round((Date.now() - st.t0) / 1000) : 0;
+      const p = st && st.info;
+      let s = STEP_LABEL[phase] || phase;
+      if (p && p.total) s += ' · ' + p.i + '/' + p.total + (p.name ? ' ' + p.name : '');
+      else if (p && p.name) s += ' · ' + p.name;
+      if (secs >= 1) s += ' · ' + secs + 's';
+      el.textContent = s.length > 64 ? s.slice(0, 63) + '…' : s;
+    };
+    if (phase === 'running') {
+      stop();
+      const st = { t0: Date.now(), info: null, t: setInterval(function () { paint(st); }, 1000) };
+      UI._stepTick[stepId] = st;
+      el.style.color = '#333';
+      paint(st);
+      return;
+    }
+    if (phase === 'progress') {
+      const st = UI._stepTick[stepId] || (UI._stepTick[stepId] = { t0: Date.now(), info: null, t: null });
+      st.info = info || st.info;
+      el.style.color = '#333';
+      paint(st);
+      return;
+    }
+    stop();
+    el.textContent = STEP_LABEL[phase] || phase;
+    el.style.color = (phase === 'passed' || phase === 'done') ? '#1a7f43'
+      : (phase === 'failed' || phase === 'fail') ? '#c22'
+        : phase === 'skipped' ? '#8f959e' : '#555';
   };
 
   UI.setSpecBadge = function (spec) { UI.renderSpecBadge(spec); };
@@ -5620,6 +5799,7 @@
       } catch (e2) {}
     } finally {
       clearInterval(beat);
+      UI.clearStepTimers();   // 时间线的秒表：收尾必须停，否则跑完还在改 DOM
       const st = RunState.get();
       /* 0.9.20：清态规则——
        * ① running：被打断的残影（原行为）；
