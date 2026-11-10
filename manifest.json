@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.26",
+  "version": "0.9.27",
   "file": "mas-runner.user.js",
-  "sha256": "fcb1da8f23aeb8b429684420d5581fecf9f0b1769b46f143c74e0808c6871207",
-  "bytes": 395916,
-  "published_at": "2026-11-09T19:56:14+08:00",
+  "sha256": "beaa31fafb253dbf68aea53712b42097cfdee849e3d69cb5d1bcd7b3b591d176",
+  "bytes": 397124,
+  "published_at": "2026-11-10T14:18:20+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "v0.9.26"
+  "notes": "0.9.27: on_match=fill 必须自报「在等人点运行」（此前该分支静默，日志看着像凭空停了）"
 }

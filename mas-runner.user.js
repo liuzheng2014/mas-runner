@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.26
+// @version      0.9.27
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1743,7 +1743,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.26',
+    RUNNER_VERSION: '0.9.27',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -6014,6 +6014,13 @@
           if (hit.on_match === 'fill_and_run') {
             UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill_and_run：参数已就位，立即开跑' });
             await UI.runTask(task, document.getElementById('masr-trigger-run'));
+          } else {
+            /* on_match=fill：引擎到此就**什么都不做**，等人点面板的「运行」。
+             * 以前这个分支一行日志都不打，只有面板卡面上那句小字，结果人看日志
+             * （日志是唯一能复盘的地方）时看到的就是「取完数凭空停了」，判成脚本坏了。
+             * 2026-11-10 真机连续踩两次（3C 填开户信息、收尾退出都是 fill）才补上：
+             * 这条不改变任何行为，只是把「我在这儿等人」明说出来。 */
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill：参数已就位，在面板上点「运行」才开始（引擎不会自动跑，这不是故障）' });
           }
           return;
         }
@@ -6058,6 +6065,10 @@
         if (hit.on_match === 'fill_and_run') {
           UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill_and_run：参数已填充，立即开跑' });
           await UI.runTask(task, document.getElementById('masr-trigger-run'));
+        } else {
+          /* 同上（hasUrlParams 分支）：on_match=fill 时引擎不动，必须把「在等人点运行」说出来。
+           * 两个分支都要有，否则「参数直接取自地址」那类场景又会静默。 */
+          UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill：参数已填充，在面板上点「运行」才开始（引擎不会自动跑，这不是故障）' });
         }
       } catch (e) {
         UI._triggerTask = null;
