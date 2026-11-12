@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.31
+// @version      0.9.32
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,8 +12,13 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
-// @match        https://id1.cloud.huawei.com/*
-// @match        https://id.cloud.huawei.com/*
+//
+// 0.9.32：**不能只写 id / id1**。华为 CAS 按区域分片，同一份 client_id 会落到
+// id5 / id6 …（2026-11-12 17:10 真机：点续跑后落到 `id5.cloud.huawei.com/CAS/portal/loginAuth.html`，
+// 脚本根本没注入 → 连悬浮球都没有，人只看到"跳过去什么都不发生"）。
+// 分片号由账号区域决定（同账号 17:10 那次带 regionCode=hk），不是我们能选的，
+// 所以用子域通配一次盖住：idN / oauth-loginN 全在 `*.cloud.huawei.com` 之下。
+// @match        https://*.cloud.huawei.com/*
 // @match        https://*.feishu.cn/*
 // 中转页（业务表按钮打开、URL 带 tableId+recordId 的跳板页）。此域上不挂主面板，
 // 只做「按表 ID 认领场景 → 按记录取数 → 把当前标签页替换成业务页」。
@@ -1902,7 +1907,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.31',
+    RUNNER_VERSION: '0.9.32',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3388,6 +3393,28 @@
     }
     return s;
   };
+  /* 主机名白名单匹配（0.9.32）。以前 everywhere 都是 `list.indexOf(here)` 精确比，
+   * 结果华为 CAS 一分片（id → id5）就全部失效：`cross_domain.hosts` 里没写的那台会被当成
+   * 「不是登录域 → 安全阀不适用」，直接放行，而不是像作者以为的那样拦下来。
+   * 现在支持 `*` 通配（`id*.cloud.huawei.com` 盖住 id / id1 / id5 / id6 …）——
+   * 分片号由账号区域决定，spec 里穷举不住。
+   * 通配只在 spec 明确写了 `*` 时生效，其余仍是精确比——不放松既有契约。 */
+  SVC.hostListHit = function (list, host) {
+    const h = String(host || '').toLowerCase();
+    if (!h || !Array.isArray(list)) return false;
+    for (let i = 0; i < list.length; i++) {
+      const pat = String(list[i] || '').toLowerCase();
+      if (!pat) continue;
+      if (pat === h) return true;
+      if (pat.indexOf('*') < 0) continue;
+      /* 只把 `*` 当通配，其余字符（含 `.`）一律转义——域名里的点必须是字面量。 */
+      const re = new RegExp('^' + pat.split('*').map(function (x) {
+        return x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      }).join('.*') + '$');
+      if (re.test(h)) return true;
+    }
+    return false;
+  };
   /* URL 触发匹配（纯函数）：规则全部来自 spec.scene.trigger，引擎不认识任何具体网站 */
   SVC.matchTriggerIn = function (list, url) {
     const href = String(url || location.href);
@@ -3414,7 +3441,7 @@
       try { here = new URL(href).host; } catch (e) { here = String(location.host || ''); }
       here = String(here).toLowerCase();
       const hosts = Array.isArray(cd.hosts) ? cd.hosts.map(function (x) { return String(x).toLowerCase(); }) : [];
-      if (!hosts.length || hosts.indexOf(here) < 0) return true;  // 不是登录域，不归本闸管
+      if (!hosts.length || !SVC.hostListHit(hosts, here)) return true;  // 不是登录域，不归本闸管
       const allow = Array.isArray(cd.require_service_hosts)
         ? cd.require_service_hosts.map(function (x) { return String(x).toLowerCase(); }) : [];
       if (!allow.length) return true;             // 声明了登录域但没给白名单：不额外拦（由 spec 作者负责）
@@ -3448,7 +3475,7 @@
          * 但一条链上经过的主机都算数——回跳要经过本业务域，才认领。
          * 不能「有一个顶层参数匹配就算」：service 指向别人的站点、redirect_uri 却带着我们的地址时，
          * 那样会把这页认领下来，登录页上就会跑本业务的脚本。 */
-        return chain.some(function (h) { return allow.indexOf(h) >= 0; });
+        return chain.some(function (h) { return SVC.hostListHit(allow, h); });
       }
       /* 一个 service/redirect_uri 都没有：分两种情况，必须由 spec 说清楚。
        *   - 登录页（require_service:true）：CAS 登录页必然带 service，没有就是别人的登录入口
@@ -3732,7 +3759,7 @@
     if (!host || !cur || host === cur) return true;
     const s = SVC.sceneById(o.t.script_id);
     const hosts = (s && s.trigger && s.trigger.cross_domain && s.trigger.cross_domain.hosts) || [];
-    return hosts.map(function (x) { return String(x).toLowerCase(); }).indexOf(cur) >= 0;
+    return SVC.hostListHit(hosts, cur);
   };
   SVC.base = function () {
     const v = String(GM_getValue(SVC.B_KEY, '') || '').replace(/\/+$/, '');
@@ -6303,7 +6330,7 @@
           const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
           const owners = list.filter(function (x) {
             const hs = (x.trigger && x.trigger.cross_domain && x.trigger.cross_domain.hosts) || [];
-            return hs.map(function (h) { return String(h).toLowerCase(); }).indexOf(here) >= 0;
+            return SVC.hostListHit(hs, here);
           }).map(function (x) { return x.name || x.script_id; });
           if (owners.length) {
             UI.appendLog({ t: Date.now(), level: 'warn', msg: '当前在「' + here + '」（' + owners.join('、') +
