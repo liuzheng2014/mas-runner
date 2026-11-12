@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.30
+// @version      0.9.31
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1319,7 +1319,10 @@
         }
         const key = String(a.var || ('v' + Object.keys(readings).length));
         readings[key] = got;
-        log('读取 ' + label + ' = ' + (a.secret === true ? ENGINE.maskValue(got) : (got.length > 48 ? got.slice(0, 48) + '…' : got)));
+        /* 0.9.31：读到的值原样记录（与填写/参数清单同一口径）。读空要看得出来，别被遮盖掩盖。 */
+        const readPlain = !(a.secret === true) || ENGINE.logSecretsOn();
+        log('读取 ' + label + (a.secret === true ? (readPlain ? '（secret 参数，明文）' : '（secret 参数，已打码）') : '') + ' = ' +
+          (got.length ? (readPlain ? got : ENGINE.maskValue(got)) : '（空）'));
         return;
       }
 
@@ -1530,11 +1533,19 @@
              * 固定时长会把「慢」误判成「没跳」，进而回滚续跑状态、把流程掐在退出这一步。 */
             const navMs = Number(navA.wait_ms) > 0 ? Number(navA.wait_ms) : 3000;
             const navDeadline = Date.now() + navMs;
+            /* confirm:"leave"（0.9.31）：只要地址**离开当前页**就算这一跳成立，不等最终落点。
+             * 为什么需要——2026-11-12 16:09 真机：华为「登录」是一串整页跳转
+             * （ads → oauth-login → id1 CAS → ads），中间页的地址永远不含最终落点，
+             * 于是 url_contains 这个判据在整个 wait_ms 里都不成立 → 走 soft 分支回滚续跑状态
+             * → 真正落地 ads 时已经没有状态可续，S5 之后一步都不跑（人只看到「登录成功了然后没了」）。
+             * 声明 leave 后，一检测到地址变化就返回，运行态原样留给落地页；
+             * 落点是否正确仍由 navExpect.url_contains 在落地页二次校验，不会把错误页认成落点。 */
+            const leaveOnly = navA.confirm === 'leave';
             let moved = false, urlOk = false;
             do {
               await sleep(250);
               moved = String(location.href) !== hrefB;
-              urlOk = !navA.url_contains || String(location.href).indexOf(navA.url_contains) >= 0;
+              urlOk = leaveOnly ? true : (!navA.url_contains || String(location.href).indexOf(navA.url_contains) >= 0);
               if (moved && urlOk) break;
             } while (Date.now() < navDeadline);
             if (!(moved && urlOk)) {
@@ -1552,7 +1563,7 @@
                 String(location.href).slice(0, 120) + '——点击可能没落到可点的节点上，或页面结构变了');
             }
             if (opts.onNavAfter) opts.onNavAfter(true);
-            log('已跳转到 ' + String(location.href).slice(0, 90));
+            log('已跳转到 ' + String(location.href).slice(0, 90) + '（本页执行到此结束，落地后按运行态续跑）');
             return;
           }
           el.click();
@@ -1581,10 +1592,14 @@
            * 并常被截图或整段贴进对话与文档——每贴一次就多一份密码副本，且无法审计、无法收回。
            * spec 用 type.secret=true 声明；未声明者照旧显示原值（向后兼容，不影响既有场景）。 */
           const secretVal = a.secret === true;
-          const showVal = (v) => secretVal
+          /* 0.9.31：secret 默认也打明文（与参数清单同一口径，用户要求全量可见）；
+           * golden 基线跑的时候由 masr_log_secret_v1=false 关掉，仓库里不留密码。
+           * 长度只做保护（防超长串撑爆日志），不做内容遮盖。 */
+          const showVal = (v) => (secretVal && !ENGINE.logSecretsOn())
             ? String(ENGINE.maskValue(v))
-            : (String(v).length > 28 ? String(v).slice(0, 28) + '…' : String(v));
-          log('填写 ' + label + ' = ' + showVal(val) + (secretVal ? '（敏感值，已打码）' : '') + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+            : (String(v).length > 200 ? String(v).slice(0, 200) + '…（共 ' + String(v).length + ' 字符）' : String(v));
+          log('填写 ' + label + ' = ' + showVal(val) +
+            (secretVal ? (ENGINE.logSecretsOn() ? '（secret 参数，明文）' : '（敏感值，已打码）') : '') + (k > 1 ? '（第 ' + k + ' 次）' : ''));
           ENGINE.uiSetValue(el, val);
           /* 读回自检：受控组件（Vue v-model）可能在重渲染时把值刷回旧值。
            * 判据只认 el.value 实际值，不认「事件已派发」——事件派发成功不代表值留住了。 */
@@ -1832,6 +1847,16 @@
     if (s.length <= 8) return '***';
     return s.slice(0, 4) + '…***…' + s.slice(-4) + ' (' + s.length + 'ch)';
   };
+  /* 日志里的凭据是否显示明文（0.9.31）。引擎级函数（放在 ENGINE 段内），因为 execUi/execUiActions
+   * 属于引擎段——单测只 eval 这一段时也必须能拿到它（否则日志点直接 ReferenceError）。
+   * 默认显示：排查「值填错/值没传到」时，被星号盖住的恰好是唯一要核对的东西。
+   * golden 基线（要进 git）在 sandbox 里注入 masr_log_secret_v1=false，继续打码。 */
+  ENGINE.logSecretsOn = function () {
+    try {
+      const v = GM_getValue('masr_log_secret_v1', true);
+      return !(v === false || String(v) === 'false');
+    } catch (e) { return true; }
+  };
 
   // ---------- SHA-256（crypto.subtle 包装，dev 模式展示 paste 内容指纹） ----------
   ENGINE.sha256Hex = async function (text) {
@@ -1875,8 +1900,9 @@
     TRANSPORT_KEY: 'masr_transport', // 通道探测结论（fetch / gm）
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
+    LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.30',
+    RUNNER_VERSION: '0.9.31',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -1894,18 +1920,52 @@
     INSTALL_URL: 'https://mas.wankahuanju.top/runner.user.js',
   };
 
+  /* 日志里的凭据是否显示明文（0.9.31）——实现在 ENGINE.logSecretsOn（引擎段，单测能拿到）。
+   * 默认显示；golden 基线注入 masr_log_secret_v1=false 继续打码。
+   * 想在本机关掉明文：GM 存储里把 masr_log_secret_v1 设为 false 即可。 */
+  function logSecretsOn() { return ENGINE.logSecretsOn(); }
+
   // ---------- 运行态存取（GM 存储跨域共享，导航后由新页面恢复） ----------
   const RunState = {
     /* 冻结位：同标签交接开始后，本页剩下的收尾代码（log 闭包、final 广播、失败回写）不许再把
      * 运行态写回去。没有它就会出现「刚 clear 完、下一条 log 又把旧状态原样复活」——
      * 0.9.8 真机就是被这条幽灵状态带到新页面去续跑的（见 v0.9.9 注释）。 */
     _frozen: false,
+    /* 轨迹（0.9.31）：运行态的 phase 一变就落一条日志。
+     * 为什么必须打——运行态是「跨页续跑」的**唯一凭据**，而它被谁改掉，以前完全不可见。
+     * 2026-11-12 15:18 / 16:09 两次真机都是「登录成功、页面已落地，但 S5 之后一条日志都没有」：
+     * 既没有「落地就绪，续跑」，也没有「本页不是它的落点」，只能靠猜是 pend、是 clear、
+     * 还是被 doRun 收尾改成了 done。这里把 phase 的每次迁移都写进日志，事后一眼能看出
+     * 「谁在什么时候把它改掉了」。只在 phase/navStepId 变化时打，不会刷屏。 */
+    _lastKey: '',
+    _tracing: false,
+    _trace(st, how) {
+      const phase = (st && st.phase) ? String(st.phase) : 'none';
+      const key = phase + '|' + ((st && st.navStepId) || '');
+      if (key === this._lastKey || this._tracing) return;
+      this._lastKey = key;
+      this._tracing = true;
+      try {
+        if (typeof UI !== 'undefined' && UI.appendLog) {
+          UI.appendLog({ t: Date.now(), level: 'info', msg: '[运行态] ' + how + ' → phase=' + phase +
+            (st && st.navStepId ? '，步骤 ' + st.navStepId : '') +
+            (st && st.navExpect && st.navExpect.url_contains ? '，等落地 ' + st.navExpect.url_contains : '') +
+            (st && st.params ? '，参数键 ' + (Object.keys(st.params).join(',') || '无') : '') });
+        }
+      } catch (e) { /* 日志失败不能影响状态机 */ }
+      this._tracing = false;
+    },
     get() { try { return JSON.parse(GM_getValue(GV.RUN_KEY, 'null')); } catch (e) { return null; } },
     set(st) {
-      if (this._frozen) return;
+      if (this._frozen) { this._trace(st, 'set（已冻结，丢弃）'); return; }
       GM_setValue(GV.RUN_KEY, JSON.stringify(st));
+      this._trace(st, 'set');
     },
-    clear() { GM_deleteValue(GV.RUN_KEY); },
+    clear() {
+      const b = this.get();
+      GM_deleteValue(GV.RUN_KEY);
+      this._trace({ phase: 'none' }, 'clear（原 phase=' + ((b && b.phase) || '无') + '）');
+    },
     freeze() { this._frozen = true; },
     thaw() { this._frozen = false; },
   };
@@ -2250,7 +2310,10 @@
           continue;
         }
         if (step.mode === 'ui') {
-          await execUi(spec, step, scope, stepLogs, log, onStep, i, extracted, params);
+          const uiRes = await execUi(spec, step, scope, stepLogs, log, onStep, i, extracted, params);
+          /* ui 段里的点击声明了 nav_after 且已确认跳转：本页流程在这里停住，
+           * 交给落地页从下一步续跑（与 mode:navigate 的 navInitiated 同一条出口）。 */
+          if (uiRes && uiRes.navInitiated) return uiRes;
           scope = buildScope(spec, params, extracted, vars);
           continue;
         }
@@ -2309,7 +2372,7 @@
      * 否则页面一卸载就再没人执行后面的步骤。哪个动作会跳，由该动作自己的 nav_after 声明
      * （不是整个 step）——因为同一个 step 里往往还有「元素不存在就跳过」的可选点击。
      * 动作若没真的跳走，这里要把状态回滚并报错：不能留一个永远等不到落地的运行态。 */
-    const navWrote = { on: false };
+    const navWrote = { on: false, hit: false, url: '' };
     function clearNav() {
       const sb = RunState.get() || {};
       sb.phase = 'running'; delete sb.navExpect; delete sb.navStepId; RunState.set(sb);
@@ -2336,7 +2399,11 @@
           log({ t: Date.now(), level: 'info', msg: step.id + ' 预期整页跳转（' + JSON.stringify(expect) + '），已预写续跑状态（参数 ' +
             Object.keys(stn.params || {}).length + ' 个、产物 ' + Object.keys(stn.extracted || {}).length + ' 项）' });
         },
-        onNavAfter: function (ok) { if (!ok) clearNav(); },
+        onNavAfter: function (ok) {
+          if (!ok) { clearNav(); return; }
+          navWrote.hit = true;
+          navWrote.url = String(location.href);
+        },
         /* 时间线跟着动作走（0.9.28）：以前一步跑 60 秒，行里只有「⏳ running」，
          * 人看到页面在填、状态像没动。现在每开一个动作就推一次「3/7 上传软著 1/3」。 */
         onProgress: function (p) {
@@ -2349,6 +2416,17 @@
         const ks = Object.keys(rd);
         ks.forEach(function (k) { if (extracted) extracted[step.id + '.' + k] = rd[k]; });
         log({ t: Date.now(), level: 'info', msg: step.id + ' 读取页面值：' + ks.map(function (k) { return k + '=' + rd[k]; }).join('，') });
+      }
+      /* 点击已确认发起整页跳转（nav_after 命中）：**本页到此为止**。
+       * 不能接着算 outputs、更不能让 runSpec 往下跑下一步——页面若还没卸载（SPA 先发请求再跳），
+       * 下一步会在错误的页面上找元素，最坏的情形是把「登录没成功」当成成功继续。
+       * 运行态已由 onNavBefore 落盘，落地页按 await_nav_check 从下一步续跑。 */
+      if (navWrote.hit) {
+        log({ t: Date.now(), level: 'warn', msg: step.id + ' 已发起整页跳转（当前 ' +
+          String(location.href).slice(0, 90) + '）：本页停止执行，落地后由运行态从下一步续跑' });
+        onStep(step.id, 'navigating');
+        stepLogs.push({ id: step.id, ms: Date.now() - t0, navInitiated: true });
+        return { ok: true, navInitiated: true, stepId: step.id, stepLogs, extracted, dryRun };
       }
     } catch (e) {
       if (navWrote.on) clearNav();
@@ -2750,9 +2828,17 @@
           const fp = (fresh && fresh.params) || {};
           const got = [];
           need.forEach(function (p) { if (fp[p.name]) { params[p.name] = fp[p.name]; got.push(p.name); } });
+          const secN = need.map(function (p) { return p.name; });
+          const showP = function (k) {
+            return k + '=' + ((secN.indexOf(k) >= 0 && !logSecretsOn()) ? ENGINE.maskValue(params[k]) + '（已打码）' : params[k]);
+          };
           log({ t: Date.now(), level: got.length ? 'info' : 'warn',
-            msg: got.length ? '续跑已重新取回凭据参数：' + got.join(',') + '（未落本地存储）'
+            msg: got.length ? '续跑已重新取回凭据参数：' + got.map(showP).join('，') +
+              '（仅存内存、未落本地存储）'
               : '续跑需要凭据参数 ' + need.map(function (p) { return p.name; }).join(',') + '，但 /task 没有下发（表里为空？）' });
+          /* 续跑时把这一段拿到的全部参数也摊开：跨页之后最容易出错的就是「值取回来了但为空」。 */
+          log({ t: Date.now(), level: 'info',
+            msg: '续跑参数快照（' + Object.keys(params).length + ' 项）：' + (Object.keys(params).map(showP).join('，') || '无') });
           if (credMs > 800) log({ t: Date.now(), level: 'info',
             msg: '续跑取凭据耗时 ' + (credMs / 1000).toFixed(1) + 's（/task 往返；凭据不落盘，只能重新取）' });
         }
@@ -5888,6 +5974,12 @@
   //   - 超过 MAX_WAIT 仍未就绪 → 降级为提示手动点「执行」，绝不静默挂死。
   // 续跑函数 resumeAfterNavigate 内部仍会二次校验 url_contains / cookie，本函数只是把等待提前、做细。
   function armNavResumeReady(st0) {
+    /* 同一份运行态只安排一次。现在有两条路会走到这里：mountAll 的落地检查和 URL 触发
+     * 的「本页是落地页」兜底，两条都会在页面 boot 的同一秒内触发；不防重就会并发跑两遍
+     * 同一个步骤（登录/提交这种动作重放一次就是不可逆的副作用）。 */
+    const aid = String(st0.navStepId || '') + '|' + String(st0.navAt || '');
+    if (UI._navResumeArmed === aid) return;
+    UI._navResumeArmed = aid;
     const needCookie = (st0.navExpect && st0.navExpect.cookie_exists) || '';
     const MAX_WAIT = 15000;
     const SETTLE = 300;               // 无 cookie 可等时，给 SPA 的起手缓冲
@@ -6131,9 +6223,11 @@
     UI.renderTrigger();
     const ps = task.params || {};
     const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
-    /* 这一行曾经把 params 原样打进日志——参数级脱敏做了面板/存储/回写，
-     * 唯独漏了这里，等于密码照样进日志（2026-11-05 golden trace 基线里抓到的明文）。
-     * 秘密参数一律走 maskValue，且注明已打码，免得人以为看到了真值。 */
+    /* 0.9.31（按用户要求改）：参数**全部原样**进日志，凭据不再打码。
+     * 为什么改：排查「值填错了 / 值根本没传到」时，被星号盖住的那几个字恰好是唯一需要核对的东西，
+     * 每次都要人复述一遍才能判断，反而更容易判断错。
+     * 代价明写在这里：日志会被「复制日志」成纯文本、也会落 GM 本地存储，
+     * 粘到群里/贴进文档就等于交出密码——所以紧接着补一条显式提示，别让人不知道自己贴了什么。 */
     /* 注意 params 在 s.spec.params 里（s 是 /spec 的回包 {spec,version,spec_id}），
      * 写 s.params 会拿到 undefined → secretNames 空 → 静默退化成明文打印。 */
     const secretNames = (((s && s.spec && s.spec.params) || (s && s.params) || []))
@@ -6146,10 +6240,27 @@
           : '已按页面记录取数 ' + task.record_id)) + '（' + s.spec_id + ' v' + s.version +
         (cached ? '｜本地缓存，取 spec 用时 ' + (Date.now() - t0) + 'ms' : '｜联网取 spec 用时 ' + (Date.now() - t0) + 'ms') + '）' +
         (keys.length ? '；参数 ' + keys.map(function (k) {
-          if (secretNames.indexOf(k) >= 0) return k + '=' + ENGINE.maskValue(ps[k]) + '（已打码）';
-          return k + '=' + ps[k];
+          return k + '=' + (secretNames.indexOf(k) >= 0 && !logSecretsOn()
+            ? ENGINE.maskValue(ps[k]) + '（已打码）' : ps[k]);
         }).join('，') : ''),
     });
+    /* 完整清单：一个键一行、不截断。排查时按行核对最省事（长值、附件 URL 也不省略）。 */
+    keys.forEach(function (k) {
+      const isSecret = secretNames.indexOf(k) >= 0;
+      const plain = !isSecret || logSecretsOn();
+      UI.appendLog({
+        t: Date.now(), level: 'info',
+        msg: '参数[' + k + '] = ' + (plain ? ps[k] : ENGINE.maskValue(ps[k])) +
+          (isSecret ? (plain ? '（secret 参数，明文）' : '（secret 参数，已打码）') : ''),
+      });
+    });
+    if (secretNames.length && logSecretsOn()) {
+      UI.appendLog({
+        t: Date.now(), level: 'warn',
+        msg: '⚠️ 本次日志含明文凭据（' + secretNames.join('、') + '）：已按你的要求不打码，' +
+          '复制/截图/外发前请自行判断（这些值同时存在于本机 GM 存储的日志里）',
+      });
+    }
     // 只有「要往业务表回写」的场景才需要捂热那张表；纯填表场景（URL 自带参数）不查表也不写表，捂热纯属浪费。
     if (!task.from_url) SVC.warmStart(90000, task.script_id);
   };
@@ -6212,6 +6323,24 @@
         }
         const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
         if (!hit.record_id && !hasUrlParams) {
+          /* 先看运行态，再判「取不到数」（0.9.31）。
+           * 本页很可能是「上一步点击后自己跳过来的落地页」：地址里没有 recordId，
+           * 但运行态里既有 record_id 也有下一步。3A 登录成功后 SPA 落的
+           * `#/corp-registry/choose-auth-means` 就是这一形态。
+           * 以前这里直接判「无法取数」并 return，把续跑机会整个吞掉——2026-11-12 16:09
+           * 真机就是这样：S4 明明写了续跑状态，落地页却只报了一句「没有 record_id」。 */
+          const stR = RunState.get();
+          const wantR = String((stR && stR.phase === 'await_nav_check' &&
+            stR.navExpect && stR.navExpect.url_contains) || '');
+          if (wantR && String(location.href).indexOf(wantR) >= 0) {
+            UI.appendLog({
+              t: Date.now(), level: 'info',
+              msg: '本页是「' + (stR.navStepId || '?') + '」的落地页（运行态里有续跑、参数键 ' +
+                (Object.keys(stR.params || {}).join(',') || '无') + '）：不按 URL 取数，直接续跑',
+            });
+            armNavResumeReady(stR);
+            return;
+          }
           UI._triggerTask = null;
           UI._triggerErrRetry = false;
           UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
@@ -6461,6 +6590,29 @@
       }
     } catch (e) { /* 恢复失败不影响手动粘贴 */ }
     const st = RunState.get();
+    /* 本页到底读到了什么运行态——无条件写一行（0.9.31）。
+     * 以前只有「phase===await_nav_check 且匹配」时才说话，其余情况全静默：
+     * 2026-11-12 16:09 真机就是「S4 说已预写续跑状态，落地页却一个字都没说」，
+     * 既不能证明读到了、也不能证明没读到。这行日志把 phase / 新鲜度 / 落地匹配
+     * 三个判据一次摊开，谁都能自己核对，不用听我解释。 */
+    if (st) {
+      const freshS = Date.now() - (Number(st.navAt) || 0) < 10 * 60 * 1000;
+      const wantS = String((st.navExpect && st.navExpect.url_contains) || '');
+      UI.appendLog({
+        t: Date.now(), level: 'info',
+        msg: '[运行态] 本页读到：phase=' + (st.phase || '无') +
+          (st.navStepId ? '，步骤=' + st.navStepId : '') +
+          /* 打毫秒时间戳而不是 toLocaleTimeString：后者每秒都不同，golden 基线没法比。
+           * 13 位数字在 golden 里会被归一成 <ts>；真机上配合后面那句「新鲜/已过期」看就够。 */
+          '，navAt=' + (st.navAt ? String(st.navAt) : '无') +
+          '（' + (freshS ? '10 分钟内，新鲜' : '已过期') + '）' +
+          '，等落地=' + (wantS || '未声明') +
+          '，本页匹配落点=' + (!wantS || location.href.indexOf(wantS) >= 0 ? '是' : '否') +
+          '，参数键=' + (Object.keys(st.params || {}).join(',') || '无'),
+      });
+    } else {
+      UI.appendLog({ t: Date.now(), level: 'info', msg: '[运行态] 本页读到：无（没有待续跑/待回写的状态）' });
+    }
     /* 卡在 running 的运行态：页面被 302/关标签打断时，doRun 的 finally 根本没机会跑，
      * 状态会永远停在 running。之前这种状态完全没人提——下一张页面既不复跑也不提示，
      * 人只能看到「续跑状态=存在: running」和一片空白日志（2026-11-06 实测）。
