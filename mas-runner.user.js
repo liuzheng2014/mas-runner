@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.29
+// @version      0.9.30
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1130,17 +1130,26 @@
         if (!wxp) throw new Error('E_SPEC wait_for 缺 xpath');
         const tmax = Math.max(0, Number(a.timeout_ms) || 8000);
         const wantVal = a.value_nonempty === true;
+        /* visible（0.9.30）：等「真的显示出来」，而不是「节点在 DOM 里」。
+         * 为什么必须有这一条：第三方组件常把容器**常驻**在 DOM 里、平时 display:none，
+         * 需要时才 display:block（网易易盾 yidun_popup 就是这样，实测 0×0、offsetParent=null）。
+         * 只判存在的话，wait_for 会在弹层还没显示时就返回，紧接着的 confirm_gate 又只判一次
+         * 可见性 —— 而弹层是点「登录」后 852ms 才出现，两者一错位就把「需要验证码」判成
+         * 「不需要」，一路走到收尾（2026-11-12 真机：S5 报「存在但不可见」→ S9 硬停）。
+         * 声明式表达不了「等到可见为止」，所以在这里补一个开关。 */
+        const wantVis = a.visible === true;
         const t0w = Date.now();
         let hit = null;
         while (Date.now() - t0w < tmax) {
           let el = null;
           try { el = ENGINE.uiFindByXPath(wxp); } catch (e) { throw new Error('E_UI_TARGET wait_for 选择器无效: ' + wxp); }
-          if (el && (!wantVal || String(el.value == null ? '' : el.value).trim().length)) { hit = el; break; }
+          if (el && (!wantVis || ENGINE.uiIsVisible(el))
+              && (!wantVal || String(el.value == null ? '' : el.value).trim().length)) { hit = el; break; }
           await sleep(120);
         }
         const cost = Date.now() - t0w;
         if (hit) {
-          log('等到 ' + (a.name || '目标元素') + (wantVal ? '（已有值）' : '') + '，用时 ' + cost + 'ms');
+          log('等到 ' + (a.name || '目标元素') + (wantVis ? '（已可见）' : '') + (wantVal ? '（已有值）' : '') + '，用时 ' + cost + 'ms');
           return;
         }
         if (a.optional === true) {
@@ -1148,7 +1157,8 @@
           return;
         }
         throw new Error('E_UI_TARGET wait_for 超时（' + tmax + 'ms）：' + (a.name || wxp)
-          + ' 仍未出现' + (wantVal ? '或仍为空' : '') + '——页面没渲染到该状态，或选择器已改版');
+          + (wantVis ? ' 仍未出现或仍不可见' : ' 仍未出现') + (wantVal ? '或仍为空' : '')
+          + '——页面没渲染到该状态，或选择器已改版');
       }
       /* 关页是纯本地动作：不等网络、不依赖任何元素。调用后页面可能立刻销毁，
        * 所以不做「关掉了吗」的回读——那是自欺欺人（页面没了就读不到了）。 */
@@ -1866,7 +1876,7 @@
     LAST_SPEC_KEY: 'masr_last_spec_v1',     // 上次加载的 spec 原文（刷新/重开自动恢复）
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.29',
+    RUNNER_VERSION: '0.9.30',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
