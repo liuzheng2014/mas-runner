@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.32
+// @version      0.9.33
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1907,7 +1907,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.32',
+    RUNNER_VERSION: '0.9.33',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3558,6 +3558,11 @@
           record_id_deep: (tr.record_id_deep === true),
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
+          /* 页面身份入口（0.9.33）：地址里没有 recordId 时，允许 spec 声明「从页面哪个元素读出业务身份
+           * （例：右上角账户ID），再按哪一列去服务端反查记录」。这是 recordId 之外的**第二条入口**，
+           * 用在「跨域登录一跳回来 query 全丢」那种页面上：2026-11-12 17:51 就是这个形态，
+           * 3A 认领了页面却只能报「没有 record_id」，登录成功照样断链。 */
+          identity: (tr.identity && typeof tr.identity === 'object') ? tr.identity : null,
           params: params,
           /* read-once：声明了就优先用交接上下文里的参数，不查业务表（见 SVC.taskFromPend） */
           params_from_pend: (tr.params_from_pend === true),
@@ -3939,6 +3944,16 @@
     if (!recordId) return Promise.reject(new Error('E_PARAM 页面地址里没有 record_id'));
     if (!scriptId) return Promise.reject(new Error('E_SCENE 未能确定该 URL 属于哪个场景'));
     return SVC.call('GET', '/task', { script_id: scriptId, record_id: recordId }).then(function (j) {
+      return j.item;
+    });
+  };
+  /* 单条取数（页面身份入口，0.9.33）：地址里没有 recordId 时，用页面上读到的业务身份（账户ID/客仓ID）
+   * 让服务端反查记录。列名由 spec 声明，Runner 只负责「从哪个元素读、怎么取值」。 */
+  SVC.recordByLookup = function (scriptId, field, value) {
+    if (!scriptId) return Promise.reject(new Error('E_SCENE 未能确定该 URL 属于哪个场景'));
+    if (!field) return Promise.reject(new Error('E_SPEC 场景未声明 identity.lookup_field'));
+    if (!value) return Promise.reject(new Error('E_PARAM 页面上读不到身份值（' + field + '）'));
+    return SVC.call('GET', '/task', { script_id: scriptId, lookup_field: field, lookup_value: value }).then(function (j) {
       return j.item;
     });
   };
@@ -6303,6 +6318,36 @@
     const hasTrig = list.some(function (s) { return s.trigger && (s.trigger.url_patterns || []).length; });
     if (!hasTrig) return;
 
+    /* 页面身份入口（0.9.33）：地址里没有 recordId 时，从 spec 声明的元素上读出业务身份。
+     * 例：ads.huawei.com 登录回跳后落在 `#/corp-registry/choose-auth-means`，地址里没有 recordId
+     * （跨域一跳 query 全丢），但右上角写着「账户ID 2079…」= 业务表「客仓ID」列。
+     * 读不到**不抛错**——「这个路由不渲染这一行」是正常情况（选择账户态就没有），退路交给调用方。
+     * regex 取第一个捕获组，与 ui 步骤 read 的语义一致（整段写进表会把「账户ID 」四个字一起存进去）。 */
+    async function readPageIdentity(idt) {
+      const xp = String((idt && idt.xpath) || '');
+      if (!xp) return { value: '', why: 'spec 未声明 identity.xpath' };
+      const tmo = Math.max(300, Number(idt && idt.timeout_ms) || 3000);
+      const end = Date.now() + tmo;
+      let el = null;
+      for (;;) {
+        try { el = ENGINE.uiFindBusinessByXPath(xp); }
+        catch (e) { return { value: '', why: '选择器无效：' + e.message }; }
+        if (el || Date.now() >= end) break;
+        await delay(150);
+      }
+      if (!el) return { value: '', why: '等了 ' + tmo + 'ms 页面上也没有这个元素（该路由可能不渲染它）' };
+      let txt = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!txt && el.getAttribute) txt = String(el.getAttribute('title') || '').trim();
+      if (idt.regex) {
+        let m = null;
+        try { m = txt.match(new RegExp(String(idt.regex))); }
+        catch (e) { return { value: '', why: 'identity.regex 无效：' + e.message }; }
+        if (!m) return { value: '', why: '元素文本「' + txt.slice(0, 40) + '」不符合 regex ' + idt.regex };
+        txt = m[1] || m[0];
+      }
+      return { value: txt, why: '' };
+    }
+
     async function fire(reason) {
       if (busy || !SVC.code()) return;
       busy = true;
@@ -6349,8 +6394,11 @@
           return;
         }
         const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
+        /* 本条命中最终用哪个任务：地址里没有 recordId 的两条新入口（②③）会先把任务取好，
+         * 后面「取数 → 装载 → 按 on_match 处理」那段只认这个变量，不再各自复制一份。 */
+        let preTask = null;
         if (!hit.record_id && !hasUrlParams) {
-          /* 先看运行态，再判「取不到数」（0.9.31）。
+          /* ① 先看运行态，再判「取不到数」（0.9.31）。
            * 本页很可能是「上一步点击后自己跳过来的落地页」：地址里没有 recordId，
            * 但运行态里既有 record_id 也有下一步。3A 登录成功后 SPA 落的
            * `#/corp-registry/choose-auth-means` 就是这一形态。
@@ -6368,17 +6416,79 @@
             armNavResumeReady(stR);
             return;
           }
-          UI._triggerTask = null;
-          UI._triggerErrRetry = false;
-          UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
-          /* 这条曾经只写进面板的错误条，而错误条挂在任务区、会被 renderTasks 重绘抹掉，
-           * 结果就是「点完按钮跳到登录页 → 没反应、没日志」。跨域登录页上 recordId 被编码进
-           * service 参数，必须显式告诉人「是取不到记录」，不是「脚本没加载」。 */
-          UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr +
-            '｜当前地址：' + String(location.href).slice(0, 160) +
-            '（跨域登录页的 recordId 在 service 参数里，需 spec 声明 record_id_deep）' });
-          UI.renderTrigger();
-          return;
+          /* ② 页面身份入口（0.9.33）：页面上有业务身份（账户ID/客仓ID）就按它反查记录。
+           * 这是 user 2026-11-12 明确要的入口方式：不认 URL 里的 recordId，认「我现在登的是哪个客仓」。
+           * 只在 spec 声明的 url_matches 范围内生效——同一个场景在别的页面上（例：CAS 登录页）
+           * 不该去读这个元素，那里也读不到。 */
+          const idt = hit.identity;
+          let idtHere = false;
+          if (idt) {
+            if (!idt.url_matches) idtHere = true;
+            else { try { idtHere = new RegExp(String(idt.url_matches)).test(String(location.href)); } catch (e) { idtHere = false; } }
+          }
+          if (idtHere) {
+            const rd = await readPageIdentity(idt);
+            if (rd.value) {
+              const field = String(idt.lookup_field || '').trim();
+              if (!field) {
+                UI._triggerErr = '场景「' + (hit.name || hit.script_id) + '」声明了 identity 但没写 lookup_field（拿哪一列当键），已跳过';
+                UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr });
+                UI.renderTrigger();
+                return;
+              }
+              UI.appendLog({ t: Date.now(), level: 'info',
+                msg: '页面身份入口：本页没有 recordId，但读到「' + (idt.label || field) + '」= ' + rd.value +
+                  '，按业务表「' + field + '」列反查记录…' });
+              const tL = Date.now();
+              try {
+                preTask = SVC.pendMerge(await SVC.recordByLookup(hit.script_id, field, rd.value));
+              } catch (e) {
+                UI.appendLog({ t: Date.now(), level: 'warn',
+                  msg: '按「' + field + '=' + rd.value + '」反查失败：' + e.message + '（继续试运行态里的 record_id）' });
+              }
+              if (preTask) {
+                hit.record_id = preTask.record_id || '';
+                UI.appendLog({ t: Date.now(), level: 'info',
+                  msg: '反查命中记录 ' + hit.record_id + '（' + ((Date.now() - tL) / 1000).toFixed(1) + 's）' });
+              }
+            } else {
+              UI.appendLog({ t: Date.now(), level: 'warn', msg: '页面身份读不到：' + rd.why });
+            }
+          }
+          /* ③ 运行态里带着这条记录（0.9.33）：本页刚由上一步点击跳过来，但落地校验窗口已经过期、
+           * phase 被回滚成 running，于是 ① 不成立。运行态里的 record_id 仍是这次流程自己的
+           * （同一个标签页、10 分钟内），拿它取数是最省事且不会取错的那条路。
+           * 2026-11-12 17:51 真机：S4 点登录 → 易盾弹层等人拖了 6s → 4s 的落地窗口已过期 → 回滚 →
+           * 页面在 S5 等待中被 OAuth 自己带走 → 落地页上 ① 不成立、又没有 recordId，整条链断在这里。 */
+          if (!preTask) {
+            const stF = RunState.get();
+            const ridF = String((stF && stF.params && stF.params.record_id) || '');
+            const freshF = stF && (Date.now() - (Number(stF.navAt) || 0) < 10 * 60 * 1000);
+            if (ridF && freshF) {
+              const mins = Math.round((Date.now() - (Number(stF.navAt) || 0)) / 60000);
+              UI.appendLog({ t: Date.now(), level: 'info',
+                msg: '本页没有 recordId，但运行态里带着记录 ' + ridF + '（' + mins + ' 分钟内的同一次流程），按它取数…' });
+              preTask = SVC.pendMerge(await SVC.record(ridF, hit.script_id));
+              hit.record_id = ridF;
+            }
+          }
+          if (!preTask) {
+            UI._triggerTask = null;
+            UI._triggerErrRetry = false;
+            UI._triggerErr = '当前页面匹配场景「' + (hit.name || hit.script_id) + '」，但地址里没有 record_id，无法取数';
+            /* 这条曾经只写进面板的错误条，而错误条挂在任务区、会被 renderTasks 重绘抹掉，
+             * 结果就是「点完按钮跳到登录页 → 没反应、没日志」。跨域登录页上 recordId 被编码进
+             * service 参数，必须显式告诉人「是取不到记录」，不是「脚本没加载」。
+             * 后半句要按「到底试过哪几条路」说：身份入口没适用（不在 url_matches 内）时
+             * 说「没读到值」是假话，人照着去查 DOM 会白花时间。 */
+            const whyAll = idtHere
+              ? '（页面身份没读到值、运行态里也没有这次的记录）'
+              : '（本场景没声明页面身份入口，或当前地址不在它的适用范围内；运行态里也没有这次的记录）';
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr +
+              '｜当前地址：' + String(location.href).slice(0, 160) + whyAll });
+            UI.renderTrigger();
+            return;
+          }
         }
         const key = hit.script_id + '|' + (hit.record_id || ENGINE.strHash(JSON.stringify(hit.params)));
         if (seen[key]) return;                 // 同一页面生命周期内一条记录只取一次
@@ -6417,8 +6527,13 @@
         /* read-once 优先：交接上下文齐了就直接开跑，省掉「服务端回读业务表」这一跳。
          * 回退是隐式的——上下文缺参数/过期/不是给本场景的，就照旧查表一次，
          * 并且打一行说明为什么回退，避免「说好只读一次却读两次」变成查不出来的谜。 */
-        let task = SVC.taskFromPend(hit);
+        let task = preTask;
         if (task) {
+          /* 任务已经在 ②/③ 里取好了（页面身份反查 / 运行态 record_id），这里只补 on_match */
+          UI.appendLog({ t: Date.now(), level: 'info',
+            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，记录 ' + hit.record_id + ' 已取数，按声明继续（' + reason + '）' });
+          task.on_match = hit.on_match;
+        } else if ((task = SVC.taskFromPend(hit))) {
           UI.appendLog({ t: Date.now(), level: 'info',
             msg: '参数取自上游交接上下文（按 read-once 约定，本页不查业务表）：' + Object.keys(task.params).join(',') });
           task.on_match = hit.on_match;
