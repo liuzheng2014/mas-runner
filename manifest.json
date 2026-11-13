@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.41",
+  "version": "0.9.42",
   "file": "mas-runner.user.js",
-  "sha256": "20622ec38c965010f5b2787aa3f3efdb6aedf05b6b508dfc53e250b3f31fecf1",
-  "bytes": 455852,
-  "published_at": "2026-11-13T18:28:18+08:00",
+  "sha256": "ea2f84e075969ad2f210fb575b8727d7f223cb8c856137911c4823c75569f590",
+  "bytes": 458789,
+  "published_at": "2026-11-13T18:43:49+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "runner v0.9.41: 同步 spec 改为全部场景（并行 4 路），不再只刷当前这一份"
+  "notes": "runner v0.9.42: /scenes 带 spec_version，开跑前自动对齐（触发型场景不再跑到旧版）"
 }

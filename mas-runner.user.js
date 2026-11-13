@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.41
+// @version      0.9.42
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.42：开跑前对齐 spec 版本。/scenes（服务端 0.6.12 起）下发每个场景的 spec_version，
+// 触发型场景（登录/收尾）没有 /task 回包，以前只能靠人工「同步 spec」才会升缓存 ——
+// 真机因此跑过两次旧流程。现在版本不符就当场重取（20s 上限），取不到才告警并用旧缓存。
 //
 // 0.9.41：「同步 spec」改为同步**全部**场景（并行 4 路）。0.9.23 起它只同步「当前这一份」，
 // 于是站在 3C 页面上永远刷不到收尾场景的新 spec —— 真机 2026-11-13 18:04 收尾仍跑缓存 v0.2.0，
@@ -2034,7 +2038,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.41',
+    RUNNER_VERSION: '0.9.42',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3911,6 +3915,29 @@
       from_pend: true,
     };
   };
+  /* 0.9.42：/scenes 从服务端 0.6.12 起带 spec_version。触发型场景（登录/收尾等）没有 /task
+   * 回包，此前版本号只能靠人工「同步 spec」才会校验 —— 真机因此跑过两次旧流程
+   * （2026-11-13 收尾 S1 还是 15s 的旧逻辑，直接导致最终回写被跳转打断）。
+   * 开跑前比一次：线上版本与本地缓存不一致就立刻重取（20s 上限）；取不到如实告警、继续用缓存。 */
+  SVC.syncStaleSpec = async function (hit) {
+    const online = String((hit && hit.spec_version) || '');
+    if (!hit || !hit.script_id || !online) return false;
+    const cur = SVC.specCache.get(hit.script_id);
+    if (cur && String(cur.version) === online) return false;
+    try {
+      const s = await SVC.spec(hit.script_id, { timeout: 20000 });
+      SVC.specCache.put(hit.script_id, s);
+      UI.appendLog({ t: Date.now(), level: 'ok',
+        msg: '场景 spec 版本不符：线上 v' + (s.version || online) +
+          (cur ? '，本机 v' + cur.version : '（本机无缓存）') + ' → 已自动重取，本次就用新版' });
+      return true;
+    } catch (e) {
+      UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '自动重取 spec 失败（' + e.message + '）：本次仍用本机缓存' +
+          (cur ? ' v' + cur.version : '（无缓存，场景可能加载不了）') + '；可点「同步 spec」重试' });
+      return false;
+    }
+  };
   /* 按 script_id 找场景声明（跨域判定要用它声明的 hosts） */
   SVC.sceneById = function (scriptId) {
     const list = (SVC._sceneCache && SVC._sceneCache.list) || [];
@@ -4730,6 +4757,21 @@
       let s = memc ? { spec: memc.spec, version: memc.version }
         : (diskc ? { spec_id: diskc.spec_id || scene, version: diskc.version, status: diskc.status || '', spec: diskc.spec } : null);
       if (!s) { s = await SVC.spec(scene); SVC.specCache.put(scene, s); }
+      /* 0.9.42：/tasks 回包带 spec_version（服务端 0.6.10 起）。缓存落后就本次改用线上版，
+       * 不等「下次生效」——2026-11-09 真机因为缓存旧版硬停在验证码那一步。 */
+      const onlineV = String(task.spec_version || '');
+      if (s && onlineV && String(s.version) !== onlineV) {
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '本地缓存的 spec 是 v' + s.version + '，线上已是 v' + onlineV + '：本次改用线上版（重取一次）' });
+        try {
+          const fresh = await SVC.spec(scene);
+          SVC.specCache.put(scene, fresh);
+          s = fresh;
+        } catch (e) {
+          UI.appendLog({ t: Date.now(), level: 'warn',
+            msg: '重取线上版失败（' + e.message + '）：本次仍按缓存 v' + s.version + ' 执行' });
+        }
+      }
       UI._specCache = { script_id: scene, spec: s.spec, version: s.version };
       UI.currentTask.spec_version = s.version;
       UI.applySpec(JSON.stringify(s.spec), { persist: true });
@@ -6644,6 +6686,9 @@
           UI.renderTrigger();
           return;
         }
+        /* 0.9.42：开跑前对齐 spec 版本。/scenes 现在下发每个场景的 spec_version，
+         * 缓存落后就当场重取 —— 触发型场景没有 /task，靠这一条才不会跑到旧流程。 */
+        await SVC.syncStaleSpec(hit);
         const hasUrlParams = !!(hit.params && Object.keys(hit.params).length);
         /* 本条命中最终用哪个任务：地址里没有 recordId 的两条新入口（②③）会先把任务取好，
          * 后面「取数 → 装载 → 按 on_match 处理」那段只认这个变量，不再各自复制一份。 */
