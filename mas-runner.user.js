@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.42
+// @version      0.9.43
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.43：①附件预取改回**全部并行**（按用户要求：页面一加载就同时下所有资质，不再先执照后其余）；
+// ②步骤时间线状态跨标签页/跨刷新保留（写入 GM 存储，renderSteps 回放 + 2s 轮询），
+// 解决「跑在另一个标签页时这里一直是待执行」。
 //
 // 0.9.42：开跑前对齐 spec 版本。/scenes（服务端 0.6.12 起）下发每个场景的 spec_version，
 // 触发型场景（登录/收尾）没有 /task 回包，以前只能靠人工「同步 spec」才会升缓存 ——
@@ -534,12 +538,10 @@
      * 但它是真机上最先出问题的地方（链路丢包），静默重试等于让人看不到发生过什么。 */
     if (log) ENGINE.uiFileLog = say;
     const t0 = Date.now();
-    /* 0.9.39：第一个附件单独先下，其余等它「下完或满 15s」再并行。
-     * 真机 2026-11-13 18:04：5 张并行共享 ~100KB/s 链路，执照（1MB，第一张、且 OCR 与
-     * 后续字段全卡在它后面）被挤到 22s；独占时实测只要 ~9s。把关键路径从抢带宽里摘出来，
-     * 其余附件在 OCR/填字段的空档里下。15s 上限保证「第一张卡死」时其余仍能开工。 */
-    if (urls.length > 1) say('附件预取：先下第 1 个（最先用到），其余 ' + (urls.length - 1) + ' 个随后并行');
-    else say('附件预取：1 个文件（与填表同时进行，用到时直接取内存）');
+    /* 0.9.43（按用户要求）：页面一加载就**全部并行**下载，不再「先执照、后其余」。
+     * 0.9.39 的两段式是为了给执照让带宽；用户要的是「所有资质一起下」，等的时间按
+     * 最慢那个算，不再有第二段排队。 */
+    say('附件预取：' + urls.length + ' 个文件并行下载（页面一加载就开始，与填表同时进行）');
     let ok = 0, bad = 0, bytes = 0, lastErr = '';
     const one = function (u) {
       return ENGINE.uiFetchBytes(u).then(function (ab) {
@@ -549,8 +551,7 @@
       });
     };
     (async function () {
-      await Promise.race([one(urls[0]), new Promise(function (r) { setTimeout(r, 15000); })]);
-      await Promise.all(urls.slice(1).map(one));
+      await Promise.all(urls.map(one));
       const mb = (bytes / 1024 / 1024).toFixed(1);
       say('附件预取' + (bad ? '部分失败' : '完成') + '：' + ok + '/' + urls.length + ' 就绪，' + mb + 'MB，用时 '
         + ((Date.now() - t0) / 1000).toFixed(1) + 's'
@@ -2038,7 +2039,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.42',
+    RUNNER_VERSION: '0.9.43',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -5936,6 +5937,39 @@
       delete UI._stepTick[k];
     });
   };
+  /* 0.9.43：步骤状态持久化（跨标签页 / 跨页面）。
+   * 真机反馈：填表页的步骤时间线一直「待执行」——真正在跑的是另一个标签页（或页面刷新过），
+   * 而 markStep 只改当前 DOM。这里把每个终态写进 GM 存储（脚本级、跨标签页共享），
+   * renderSteps 时回放；另有 2s 轮询，另一页在跑时这边也能看到进度。 */
+  const STEP_STATE_KEY = 'masr_step_states_v1';
+  function readStepStates() {
+    try { return JSON.parse(GM_getValue(STEP_STATE_KEY, 'null')) || null; } catch (e) { return null; }
+  }
+  function saveStepState(stepId, phase) {
+    try {
+      const spec = UI.spec || {};
+      const s = readStepStates();
+      if (!s || !spec.spec_id || String(s.spec_id) !== String(spec.spec_id)) return;
+      s.states = s.states || {};
+      s.states[stepId] = phase;
+      s.at = Date.now();
+      GM_setValue(STEP_STATE_KEY, JSON.stringify(s));
+    } catch (e) {}
+  }
+  UI.resetStepStates = function (specId, version) {
+    try {
+      GM_setValue(STEP_STATE_KEY, JSON.stringify({
+        spec_id: String(specId || ''), version: String(version || ''), states: {}, at: Date.now(),
+      }));
+      UI._stepPaintedAt = 0;
+    } catch (e) {}
+  };
+  UI.paintSavedSteps = function (spec) {
+    const s = readStepStates();
+    if (!s || !spec || String(s.spec_id) !== String(spec.spec_id)) return false;
+    Object.keys(s.states || {}).forEach(function (id) { UI.markStep(id, s.states[id]); });
+    return true;
+  };
   UI.renderSteps = function (spec) {
     UI.clearStepTimers();
     const el = document.getElementById('masr-steps');
@@ -5943,6 +5977,8 @@
       spec.steps.map((s, i) =>
         '<tr><td>S' + (i + 1) + '</td><td>' + (s.name || s.id) + '</td><td>' + s.mode + '</td><td id="masr-step-' + s.id + '">待执行</td></tr>').join('') +
       '</table>';
+    /* 回放这个场景最近一次运行留下的状态（另一标签页跑的、或本页刷新前的）。 */
+    UI.paintSavedSteps(spec);
   };
   const STEP_LABEL = {
     running: '⏳ 运行中', progress: '⏳ 运行中', requesting: '→ 请求中', navigating: '→ 导航中',
@@ -5983,6 +6019,8 @@
     el.style.color = (phase === 'passed' || phase === 'done') ? '#1a7f43'
       : (phase === 'failed' || phase === 'fail') ? '#c22'
         : phase === 'skipped' ? '#8f959e' : '#555';
+    /* 0.9.43：终态写进跨标签页共享的状态，别的标签页 / 刷新后的面板能回放 */
+    saveStepState(stepId, phase);
   };
 
   UI.setSpecBadge = function (spec) { UI.renderSpecBadge(spec); };
@@ -6086,6 +6124,8 @@
     UI.spec = spec;
     UI.setSpecBadge(spec);
     if (!opts.keepLog) document.getElementById('masr-log').innerHTML = '';
+    /* 0.9.43：开新一轮就把该场景的步骤状态清空，避免把上一轮的结果当成本轮的 */
+    if (UI.resetStepStates) UI.resetStepStates(spec.spec_id, spec.version);
     UI.renderSteps(spec);
     if (resuming) {
       UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 续跑模式：从运行态恢复（' + st0.navStepId + ' 之后）===' });
@@ -7043,6 +7083,18 @@
     if (SVC.code()) {
       try { armUrlTrigger(); } catch (e) { /* 触发失败不影响手动流程 */ }
     }
+    /* 0.9.43：另一标签页正在跑同一份 spec 时，这里也把它的步骤进度回放出来（2s 一次）。
+     * 本页自己在跑时不覆盖（markStep 已经在实时改 DOM）。 */
+    setInterval(function () {
+      try {
+        if (!UI.spec || UI._running) return;
+        const s = readStepStates();
+        if (s && s.at > (UI._stepPaintedAt || 0)) {
+          UI._stepPaintedAt = s.at;
+          UI.paintSavedSteps(UI.spec);
+        }
+      } catch (e) {}
+    }, 2000);
     // 版本落点：解释器升级后第一次加载，明确告诉人「现在跑的是哪个版本」
     try {
       const cur = UI.installedVersion();
