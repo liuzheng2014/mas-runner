@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.38
+// @version      0.9.39
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.39：附件预取改「两段式」——第 1 张（最先上传、且 OCR 与后续字段都卡在它后面）单独先下，
+// 其余等它下完（最多 15s）再并行。真机 2026-11-13 18:04：5 张并行抢一条 ~100KB/s 的链路，
+// 1MB 执照被挤到 22s（独占实测 ~9s），整单因此多花约 12s。
 //
 // 0.9.38：①补 0.9.37 的漏：record_optional 没写进命中对象（fire() 判了但 hit 里没有），
 // 声明了等于没声明；②nav_after.until_visible —— 点了「登录」后如果页面**不跳转**而是弹出
@@ -518,20 +522,28 @@
      * 但它是真机上最先出问题的地方（链路丢包），静默重试等于让人看不到发生过什么。 */
     if (log) ENGINE.uiFileLog = say;
     const t0 = Date.now();
-    say('附件预取：' + urls.length + ' 个文件并行下载（与填表同时进行，用到时直接取内存）');
+    /* 0.9.39：第一个附件单独先下，其余等它「下完或满 15s」再并行。
+     * 真机 2026-11-13 18:04：5 张并行共享 ~100KB/s 链路，执照（1MB，第一张、且 OCR 与
+     * 后续字段全卡在它后面）被挤到 22s；独占时实测只要 ~9s。把关键路径从抢带宽里摘出来，
+     * 其余附件在 OCR/填字段的空档里下。15s 上限保证「第一张卡死」时其余仍能开工。 */
+    if (urls.length > 1) say('附件预取：先下第 1 个（最先用到），其余 ' + (urls.length - 1) + ' 个随后并行');
+    else say('附件预取：1 个文件（与填表同时进行，用到时直接取内存）');
     let ok = 0, bad = 0, bytes = 0, lastErr = '';
-    Promise.all(urls.map(function (u) {
+    const one = function (u) {
       return ENGINE.uiFetchBytes(u).then(function (ab) {
         ok++; bytes += (ab && ab.byteLength) || 0;
       }, function (e) {
         bad++; lastErr = (e && e.message) || String(e);
       });
-    })).then(function () {
+    };
+    (async function () {
+      await Promise.race([one(urls[0]), new Promise(function (r) { setTimeout(r, 15000); })]);
+      await Promise.all(urls.slice(1).map(one));
       const mb = (bytes / 1024 / 1024).toFixed(1);
       say('附件预取' + (bad ? '部分失败' : '完成') + '：' + ok + '/' + urls.length + ' 就绪，' + mb + 'MB，用时 '
         + ((Date.now() - t0) / 1000).toFixed(1) + 's'
         + (bad ? '；失败的上传时会再试一次（' + String(lastErr).slice(0, 140) + '）' : ''));
-    });
+    })();
     return urls.length;
   };
 
@@ -2014,7 +2026,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.38',
+    RUNNER_VERSION: '0.9.39',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
