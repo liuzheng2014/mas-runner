@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.34
+// @version      0.9.35
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.35：①trigger.ticket_only —— 参数已由上游交接带齐时，只向 /task 要一张回写票据
+// （不读业务表），read-once 从此也能用于「需要回写」的场景。
+// ②新原语 writeback —— 流程中途把指定列写进业务表（局部写、不改状态、不结束流程），
+// 用于填表场景一进表单页就把「客仓ID」记下来。
+// ③confirm_gate 支持第二个按钮「取消」——点了终止本次、保留页面、不提交。
 //
 // 0.9.32：**不能只写 id / id1**。华为 CAS 按区域分片，同一份 client_id 会落到
 // id5 / id6 …（2026-11-12 17:10 真机：点续跑后落到 `id5.cloud.huawei.com/CAS/portal/loginAuth.html`，
@@ -734,12 +740,22 @@
           '<div style="font-size:16px;font-weight:600;margin-bottom:8px">' + esc(o.title || '需要你确认') + '</div>' +
           '<div style="white-space:pre-wrap;color:#3d4757">' + esc(o.message || '') + '</div>' +
           '<div style="margin-top:16px;text-align:right">' +
+          (o.cancel ? ('<button id="masr-gate-cancel" style="padding:6px 18px;margin-right:10px;border:1px solid #d0d3d9;border-radius:6px;background:#fff;color:#3d4757;font-size:14px;cursor:pointer">' +
+            esc(o.cancel) + '</button>') : '') +
           '<button id="masr-gate-ok" style="padding:6px 18px;border:0;border-radius:6px;background:#1664ff;color:#fff;font-size:14px;cursor:pointer">' +
           esc(o.button || '我知道了') + '</button></div></div>';
         document.body.appendChild(wrap);
         wrap.querySelector('#masr-gate-ok').addEventListener('click', function () {
           try { wrap.parentNode && wrap.parentNode.removeChild(wrap); } catch (e) {}
           resolve({ confirmed: true, at: Date.now() });
+        });
+        /* 取消（0.9.35）：给「提交前确认」这类闸门一个明确的「不干了」出口——
+         * 以前只能关提示或刷新页面，人分不清「取消提示」和「取消提交」。
+         * 取消 = 终止本次流程、页面原样保留、不做任何写操作。 */
+        const cancelBtn = wrap.querySelector('#masr-gate-cancel');
+        if (cancelBtn) cancelBtn.addEventListener('click', function () {
+          try { wrap.parentNode && wrap.parentNode.removeChild(wrap); } catch (e) {}
+          resolve({ confirmed: false, canceled: true, at: Date.now() });
         });
       } catch (e) {
         // DOM 异常时不能静默放行（那就是「假装人确认过」），直接把错误抛给调用方
@@ -1222,7 +1238,15 @@
         }
         if (!gw.hit) { log('闸门条件未命中（' + gw.detail + '），继续'); return; }
         log('⏸ 等待人工确认：' + gTitle + '（' + gw.detail + '）');
-        const gr = await ENGINE.confirmGate({ title: gTitle, message: gMsg, button: a.button ? String(a.button) : '' });
+        const gr = await ENGINE.confirmGate({ title: gTitle, message: gMsg, button: a.button ? String(a.button) : '', cancel: a.cancel ? String(a.cancel) : '' });
+        if (gr.canceled) {
+          /* 人明确点了「取消」：终止本次、页面保留、什么都不写。
+           * 这不是故障，所以带 human 标记；错误码可由 spec 覆盖（缺省 E_HUMAN_CANCEL）。 */
+          const ce = new Error(gTitle + '｜已取消：本次流程终止，页面原样保留，未做任何提交/写操作');
+          ce.code = String(a.cancel_error || 'E_HUMAN_CANCEL');
+          ce.human = true;
+          throw ce;
+        }
         if (!gr.confirmed) {
           throw engineFail('E_GATE 无法显示确认框（' + (gr.error || '未知原因') + '）——已终止，不在无人知晓的情况下继续往下跑');
         }
@@ -1278,6 +1302,34 @@
         gErr.code = String(a.error || 'E_HUMAN_CONFIRM');
         gErr.human = true;
         throw gErr;
+      }
+
+      /* writeback（0.9.35）：流程中途把指定列写进业务表——局部写、不改状态、不结束流程。
+       * 典型用途：填表场景刚进入表单页，先把读到的「客仓ID」记进表（异步，不阻塞填写）。
+       * fields = {列名: 模板值}；列名必须在该 spec 的 scene.writeback 里声明过（服务端白名单）。 */
+      if (act === 'writeback') {
+        const decl = (a.fields && typeof a.fields === 'object') ? a.fields : {};
+        const out = {};
+        Object.keys(decl).forEach(function (k) {
+          let v;
+          try { v = ENGINE.resolvePlaceholders(String(decl[k]), scope); }
+          catch (e) {
+            /* 取不到值（例：账户ID 那行这次没渲染）→ 跳过这一列，不把整步拖红。
+             * 这是「顺手记录」型动作：记不上不该让填表停下，但必须留一行日志。 */
+            log('writeback 跳过 ' + k + '：' + ((e && e.message) || e));
+            return;
+          }
+          if (v !== undefined && v !== null && String(v) !== '') out[k] = String(v);
+        });
+        if (!Object.keys(out).length) { log('writeback 跳过：解析后没有非空字段'); return; }
+        if (typeof opts.onWriteback !== 'function') throw new Error('E_SPEC writeback 未接线（引擎没有回写通道）');
+        log('局部回写 ' + Object.keys(out).join(',') + '（后台写，不阻塞后续动作）');
+        opts.onWriteback(out).then(function (wr) {
+          log('✓ 局部回写完成：' + ((wr && wr.written) || []).join(','));
+        }).catch(function (e) {
+          log('⚠ 局部回写失败：' + ((e && e.message) || e) + '（不影响后续填写）');
+        });
+        return;
       }
 
       const target = ENGINE.resolvePlaceholders(String(a.target || ''), scope);
@@ -1338,6 +1390,10 @@
         }
         const key = String(a.var || ('v' + Object.keys(readings).length));
         readings[key] = got;
+        /* 0.9.35：读到的值立刻进本步作用域，同一步里后面的动作可以直接引用 {{变量名}}
+         * （典型：S1 读右上角账户ID → 紧接着 writeback 写「客仓ID」）。
+         * 以前只能等本步结束由 execUi 并入 {{步骤.变量名}}，同一步里引用会解析成空。 */
+        scope[key] = got;
         /* 0.9.31：读到的值原样记录（与填写/参数清单同一口径）。读空要看得出来，别被遮盖掩盖。 */
         const readPlain = !(a.secret === true) || ENGINE.logSecretsOn();
         log('读取 ' + label + (a.secret === true ? (readPlain ? '（secret 参数，明文）' : '（secret 参数，已打码）') : '') + ' = ' +
@@ -1921,7 +1977,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.34',
+    RUNNER_VERSION: '0.9.35',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2105,6 +2161,13 @@
   function buildScope(spec, params, extracted, extra) {
     const scope = Object.assign({}, extra || {});
     for (const p of spec.params || []) scope[p.name] = params[p.name];
+    /* 0.9.35：服务端下发但本 spec 没声明的参数也进作用域。
+     * 用途：登录场景 /task 一次取齐填表场景的全部字段（含附件派生键），
+     * 交接时按 handoff.params 白名单原样带过去；只认 spec.params 的话这些值会被丢掉。
+     * 只补空缺，不覆盖已声明的同名参数（声明仍是权威）。 */
+    Object.keys(params || {}).forEach(function (k) {
+      if (scope[k] === undefined) scope[k] = params[k];
+    });
     for (const k of Object.keys(extracted)) scope[k] = extracted[k];
     scope.task_id = scope.task_id || 'dev-' + Date.now();
     scope.now = new Date().toISOString().slice(0, 19).replace('T', ' ');
@@ -2428,6 +2491,8 @@
         onProgress: function (p) {
           onStep(step.id, 'progress', p || {});
         },
+        /* writeback 动作的出口（0.9.35）：局部写业务表，不改状态、不结束流程 */
+        onWriteback: function (fields) { return writebackFields(fields); },
       });
       /* read 动作的产物进步骤抽取，key 用「步骤ID.变量名」——与 api 步骤的抽取同一条通道，
        * 因此 outputs / 回写模板都能直接用 {{S3.account_email}} 引用。 */
@@ -3580,6 +3645,8 @@
           params: params,
           /* read-once：声明了就优先用交接上下文里的参数，不查业务表（见 SVC.taskFromPend） */
           params_from_pend: (tr.params_from_pend === true),
+          /* ticket_only（0.9.35）：交接上下文只带参数，回写票据另向 /task 要（服务端不读表） */
+          ticket_only: (tr.ticket_only === true),
           cross_domain: (tr.cross_domain && Array.isArray(tr.cross_domain.hosts)) ? tr.cross_domain.hosts.slice() : [],
           /* 退出登录后多久内不再自动登录。缺省由 logoutGuard 给跨域场景 3 分钟，
            * spec 显式写 0 可关掉（例如确实需要「退出即重登」的站点）。 */
@@ -3744,6 +3811,11 @@
     const pd = SVC.pendGet();
     if (!pd || !pd.t) { SVC.taskFromPend.lastReason = 'no_pend_or_expired'; return null; }
     if (String(pd.t.script_id || '') !== String(hit.script_id || '')) { SVC.taskFromPend.lastReason = 'script_mismatch'; return null; }
+    /* 地址里明确带了 recordId 且与交接上下文不是同一条 → 以地址为准，走完整取数。
+     * 防「残留的交接上下文把人工指定的记录顶掉」（0.9.35，auth-info 两种入口并存）。 */
+    if (hit.record_id && pd.t.record_id && String(hit.record_id) !== String(pd.t.record_id)) {
+      SVC.taskFromPend.lastReason = 'record_mismatch'; return null;
+    }
     if (!SVC.pendAccept(pd, location.host)) { SVC.taskFromPend.lastReason = 'host_not_allowed'; return null; }
     if (pd.t.params_complete !== true) { SVC.taskFromPend.lastReason = 'upstream_not_complete'; return null; }
     const ps = (pd.t && pd.t.params) || {};
@@ -3954,10 +4026,13 @@
     });
   };
   /* 单条取数（URL 触发路径）：record_id 来自页面地址，服务端按 scene 声明的状态条件校验后才给参数与票据 */
-  SVC.record = function (recordId, scriptId) {
+  SVC.record = function (recordId, scriptId, opts) {
     if (!recordId) return Promise.reject(new Error('E_PARAM 页面地址里没有 record_id'));
     if (!scriptId) return Promise.reject(new Error('E_SCENE 未能确定该 URL 属于哪个场景'));
-    return SVC.call('GET', '/task', { script_id: scriptId, record_id: recordId }).then(function (j) {
+    const q = { script_id: scriptId, record_id: recordId };
+    /* ticket_only（0.9.35）：只签回写票据，服务端不读业务表。参数来自交接上下文时用它。 */
+    if (opts && opts.ticket_only) q.ticket_only = '1';
+    return SVC.call('GET', '/task', q).then(function (j) {
       return j.item;
     });
   };
@@ -5011,6 +5086,27 @@
       }
     }
     throw lastErr;
+  }
+
+  /* 局部回写（0.9.35）：流程中途把几列写进业务表——不改状态、不结束流程、不等收尾。
+   * 用途：填表场景一进表单页就把刚读到的「客仓ID」记进表，后面任何一步失败这个值都还在。
+   * 服务端走 /result 的 partial 通道，只接受 spec.scene.writeback 声明过的列。
+   * 失败不阻断流程（写的是「顺手记录」，不是本步的业务结果），由调用方记一条 warn。 */
+  async function writebackFields(fields) {
+    const st = RunState.get() || {};
+    const task = (st && st.task) || UI.currentTask || {};
+    if (!task.record_id) throw new Error('E_SPEC writeback 需要任务上下文（record_id 缺失）');
+    const payload = {
+      record_id: task.record_id,
+      script_id: task.script_id || '',
+      write_token: task.write_token || '',
+      status: 'ok',
+      partial: true,
+      fields: fields || {},
+      runner_version: GV.RUNNER_VERSION,
+      spec_version: st.specVersion || '',
+    };
+    return writeWithRetry(payload, 1);
   }
 
   /* 回写字段核对：HTTP 200 只说明「这次请求成了」，不说明「每个字段都进表了」。
@@ -6427,23 +6523,41 @@
          * 后面「取数 → 装载 → 按 on_match 处理」那段只认这个变量，不再各自复制一份。 */
         let preTask = null;
         if (!hit.record_id && !hasUrlParams) {
+          /* ⓪ 交接上下文优先（0.9.35，read-once）：参数齐了就不要再读业务表。
+           * 以前 pend 只作为「②页面身份」之后的兜底，结果登录交棒过来的页面明明带着全套参数，
+           * 仍然先按账户ID 反查一次表（真机 4~8s）。 */
+          preTask = SVC.taskFromPend(hit);
+          if (preTask) {
+            UI.appendLog({ t: Date.now(), level: 'info',
+              msg: '参数取自上游交接上下文（按 read-once 约定，本页不查业务表）：' + Object.keys(preTask.params).join(',') });
+          }
           /* ① 先看运行态，再判「取不到数」（0.9.31）。
            * 本页很可能是「上一步点击后自己跳过来的落地页」：地址里没有 recordId，
            * 但运行态里既有 record_id 也有下一步。3A 登录成功后 SPA 落的
            * `#/corp-registry/choose-auth-means` 就是这一形态。
            * 以前这里直接判「无法取数」并 return，把续跑机会整个吞掉——2026-11-12 16:09
-           * 真机就是这样：S4 明明写了续跑状态，落地页却只报了一句「没有 record_id」。 */
+           * 真机就是这样：S4 明明写了续跑状态，落地页却只报了一句「没有 record_id」。
+           * 0.9.35：必须**同一场景**才续跑。本页现在是 3C 的入口，运行态里却留着 3A 的
+           * await_nav_check（登录点完「信任」后整页跳走，3A 收不了尾）——不加这个判断，
+           * 3C 的落地页会被 3A 的旧状态接管，续跑一段已经结束的登录流程。 */
           const stR = RunState.get();
           const wantR = String((stR && stR.phase === 'await_nav_check' &&
             stR.navExpect && stR.navExpect.url_contains) || '');
-          if (wantR && String(location.href).indexOf(wantR) >= 0) {
-            UI.appendLog({
-              t: Date.now(), level: 'info',
-              msg: '本页是「' + (stR.navStepId || '?') + '」的落地页（运行态里有续跑、参数键 ' +
-                (Object.keys(stR.params || {}).join(',') || '无') + '）：不按 URL 取数，直接续跑',
-            });
-            armNavResumeReady(stR);
-            return;
+          const sameSceneR = !!stR && String(stR.specId || '') === String(hit.script_id || '');
+          if (!preTask && wantR && String(location.href).indexOf(wantR) >= 0) {
+            if (!sameSceneR) {
+              UI.appendLog({ t: Date.now(), level: 'info',
+                msg: '本页地址符合另一个场景「' + stR.specId + '」的落地校验（' + (stR.navStepId || '?') +
+                  '），但当前认领的是本场景 → 不接管，按本场景继续（那条流程已结束）' });
+            } else {
+              UI.appendLog({
+                t: Date.now(), level: 'info',
+                msg: '本页是「' + (stR.navStepId || '?') + '」的落地页（运行态里有续跑、参数键 ' +
+                  (Object.keys(stR.params || {}).join(',') || '无') + '）：不按 URL 取数，直接续跑',
+              });
+              armNavResumeReady(stR);
+              return;
+            }
           }
           /* ② 页面身份入口（0.9.33）：页面上有业务身份（账户ID/客仓ID）就按它反查记录。
            * 这是 user 2026-11-12 明确要的入口方式：不认 URL 里的 recordId，认「我现在登的是哪个客仓」。
@@ -6455,7 +6569,7 @@
             if (!idt.url_matches) idtHere = true;
             else { try { idtHere = new RegExp(String(idt.url_matches)).test(String(location.href)); } catch (e) { idtHere = false; } }
           }
-          if (idtHere) {
+          if (!preTask && idtHere) {
             const rd = await readPageIdentity(idt);
             if (rd.value) {
               const field = String(idt.lookup_field || '').trim();
@@ -6558,9 +6672,10 @@
          * 并且打一行说明为什么回退，避免「说好只读一次却读两次」变成查不出来的谜。 */
         let task = preTask;
         if (task) {
-          /* 任务已经在 ②/③ 里取好了（页面身份反查 / 运行态 record_id），这里只补 on_match */
+          /* 任务已经在 ⓪/②/③ 里取好了（交接上下文 / 页面身份反查 / 运行态 record_id），这里只补 on_match */
+          if (!hit.record_id && task.record_id) hit.record_id = task.record_id;
           UI.appendLog({ t: Date.now(), level: 'info',
-            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，记录 ' + hit.record_id + ' 已取数，按声明继续（' + reason + '）' });
+            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，记录 ' + (hit.record_id || '（待定）') + ' 已取数，按声明继续（' + reason + '）' });
           task.on_match = hit.on_match;
         } else if ((task = SVC.taskFromPend(hit))) {
           UI.appendLog({ t: Date.now(), level: 'info',
@@ -6579,6 +6694,25 @@
           const recMs = Date.now() - tRec;
           if (recMs > 800) UI.appendLog({ t: Date.now(), level: 'info', msg: '取数 ' + (recMs / 1000).toFixed(1) + 's（/task 往返：服务端回读业务表）' });
           task.on_match = hit.on_match;
+        }
+        task.on_match = hit.on_match;
+        /* ticket_only（0.9.35）：参数来自交接上下文时，写表还缺一张回写票据。
+         * 只向 /task 要票据（服务端不读业务表）；失败就回退成完整取数——
+         * 宁可多花 4~8s，也不能无票据开跑（写表会 403，等于白填一遍）。 */
+        if (hit.ticket_only === true && task.from_pend) {
+          const tTk = Date.now();
+          try {
+            const tk = await SVC.record(task.record_id, hit.script_id, { ticket_only: true });
+            task.write_token = tk.write_token || '';
+            task.spec_version = tk.spec_version || task.spec_version;
+            UI.appendLog({ t: Date.now(), level: 'info',
+              msg: '回写票据已取（只签票、不读业务表，' + (Date.now() - tTk) + 'ms）' });
+          } catch (e) {
+            UI.appendLog({ t: Date.now(), level: 'warn',
+              msg: '取回写票据失败：' + e.message + ' → 回退完整取数一次' });
+            task = SVC.pendMerge(await SVC.record(task.record_id, hit.script_id));
+            task.on_match = hit.on_match;
+          }
         }
         task.on_match = hit.on_match;
         // 中转页：当前页只是跳板，取到数就把这个标签页「原地替换」成业务页。
