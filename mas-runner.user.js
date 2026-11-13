@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.33
+// @version      0.9.34
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -1145,11 +1145,25 @@
         const wantVis = a.visible === true;
         const t0w = Date.now();
         let hit = null;
+        /* 0.9.34：wantVis 时不再只判「第一个匹配节点」。
+         * 原因：S5 的并集里同时有「常驻 DOM 但 display:none 的易盾容器」和「已经可见的改密弹层」，
+         * 前者在文档顺序里可能靠前，FIRST_ORDERED_NODE 会一直拿它做可见性判断 → 明明改密框
+         * 已经出来了还要等满 6s。改成遍历该 XPath 的所有匹配，任一满足可见性/取值即命中。 */
+        const findVisibleAny = function () {
+          const r = document.evaluate(wxp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+          for (let i = 0; i < r.snapshotLength; i++) {
+            const n = r.snapshotItem(i);
+            if (!n || n.nodeType !== 1) continue;
+            if (wantVis && !ENGINE.uiIsVisible(n)) continue;
+            if (wantVal && !String(n.value == null ? '' : n.value).trim().length) continue;
+            return n;
+          }
+          return null;
+        };
         while (Date.now() - t0w < tmax) {
           let el = null;
-          try { el = ENGINE.uiFindByXPath(wxp); } catch (e) { throw new Error('E_UI_TARGET wait_for 选择器无效: ' + wxp); }
-          if (el && (!wantVis || ENGINE.uiIsVisible(el))
-              && (!wantVal || String(el.value == null ? '' : el.value).trim().length)) { hit = el; break; }
+          try { el = findVisibleAny(); } catch (e) { throw new Error('E_UI_TARGET wait_for 选择器无效: ' + wxp); }
+          if (el) { hit = el; break; }
           await sleep(120);
         }
         const cost = Date.now() - t0w;
@@ -1907,7 +1921,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.33',
+    RUNNER_VERSION: '0.9.34',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -6265,6 +6279,10 @@
     UI.renderTrigger();
     const ps = task.params || {};
     const keys = Object.keys(ps).filter(function (k) { return k !== 'record_id'; });
+    /* 0.9.34：scene.log_params=false 时不再逐键打印参数明细。
+     * 背景：填表场景一次 90 个参数（含手机/邮箱/地址/附件 URL），一行一个既慢又把 PII 摊在日志里；
+     * 只对声明了这个开关的场景生效，默认仍保留完整清单，排查其他场景不受影响。 */
+    const logParams = !(s && s.spec && s.spec.scene && s.spec.scene.log_params === false);
     /* 0.9.31（按用户要求改）：参数**全部原样**进日志，凭据不再打码。
      * 为什么改：排查「值填错了 / 值根本没传到」时，被星号盖住的那几个字恰好是唯一需要核对的东西，
      * 每次都要人复述一遍才能判断，反而更容易判断错。
@@ -6281,27 +6299,32 @@
         : (task.from_pend ? '参数取自上游交接上下文（本页未查业务表） ' + task.record_id
           : '已按页面记录取数 ' + task.record_id)) + '（' + s.spec_id + ' v' + s.version +
         (cached ? '｜本地缓存，取 spec 用时 ' + (Date.now() - t0) + 'ms' : '｜联网取 spec 用时 ' + (Date.now() - t0) + 'ms') + '）' +
-        (keys.length ? '；参数 ' + keys.map(function (k) {
-          return k + '=' + (secretNames.indexOf(k) >= 0 && !logSecretsOn()
-            ? ENGINE.maskValue(ps[k]) + '（已打码）' : ps[k]);
-        }).join('，') : ''),
+        (keys.length ? '；参数 ' + (logParams
+          ? keys.map(function (k) {
+            return k + '=' + (secretNames.indexOf(k) >= 0 && !logSecretsOn()
+              ? ENGINE.maskValue(ps[k]) + '（已打码）' : ps[k]);
+          }).join('，')
+          : keys.length + ' 个（spec 声明 scene.log_params=false，明细已省略）') : ''),
     });
-    /* 完整清单：一个键一行、不截断。排查时按行核对最省事（长值、附件 URL 也不省略）。 */
-    keys.forEach(function (k) {
-      const isSecret = secretNames.indexOf(k) >= 0;
-      const plain = !isSecret || logSecretsOn();
-      UI.appendLog({
-        t: Date.now(), level: 'info',
-        msg: '参数[' + k + '] = ' + (plain ? ps[k] : ENGINE.maskValue(ps[k])) +
-          (isSecret ? (plain ? '（secret 参数，明文）' : '（secret 参数，已打码）') : ''),
+    /* 完整清单：一个键一行、不截断。排查时按行核对最省事（长值、附件 URL 也不省略）。
+     * 0.9.34：scene.log_params=false 时整段省略，只保留上一行的「参数 N 个」。 */
+    if (logParams) {
+      keys.forEach(function (k) {
+        const isSecret = secretNames.indexOf(k) >= 0;
+        const plain = !isSecret || logSecretsOn();
+        UI.appendLog({
+          t: Date.now(), level: 'info',
+          msg: '参数[' + k + '] = ' + (plain ? ps[k] : ENGINE.maskValue(ps[k])) +
+            (isSecret ? (plain ? '（secret 参数，明文）' : '（secret 参数，已打码）') : ''),
+        });
       });
-    });
-    if (secretNames.length && logSecretsOn()) {
-      UI.appendLog({
-        t: Date.now(), level: 'warn',
-        msg: '⚠️ 本次日志含明文凭据（' + secretNames.join('、') + '）：已按你的要求不打码，' +
-          '复制/截图/外发前请自行判断（这些值同时存在于本机 GM 存储的日志里）',
-      });
+      if (secretNames.length && logSecretsOn()) {
+        UI.appendLog({
+          t: Date.now(), level: 'warn',
+          msg: '⚠️ 本次日志含明文凭据（' + secretNames.join('、') + '）：已按你的要求不打码，' +
+            '复制/截图/外发前请自行判断（这些值同时存在于本机 GM 存储的日志里）',
+        });
+      }
     }
     // 只有「要往业务表回写」的场景才需要捂热那张表；纯填表场景（URL 自带参数）不查表也不写表，捂热纯属浪费。
     if (!task.from_url) SVC.warmStart(90000, task.script_id);
@@ -6312,6 +6335,11 @@
     const seen = {};
     let lastHref = location.href;
     let busy = false;
+    /* 0.9.34：URL 在「正在跑任务」期间变化时不能把事件丢掉。
+     * 真机 2026-11-13 15:27 事故：3C 提交后 SPA 切到 #/approve-result，URL 轮询在 runTask 还没
+     * 退出时就调了 fire()，busy=true 直接 return；等 3C 跑完后地址不再变化，收尾场景永远不触发
+     * → 提交成功但不会自动退出/关页。这里改成「忙时记一笔 pending，跑完再补一次」。 */
+    let firePending = false;
 
     // 有没有场景声明 URL 触发，由 /scenes 决定；一个都没有就不起监听（零开销，不是靠开关猜）
     const list = await SVC.scenes().catch(function () { return []; });
@@ -6349,7 +6377,8 @@
     }
 
     async function fire(reason) {
-      if (busy || !SVC.code()) return;
+      if (!SVC.code()) return;
+      if (busy) { firePending = true; return; }
       busy = true;
       try {
         await SVC.scenes();
@@ -6589,6 +6618,11 @@
         }
       } finally {
         busy = false;
+        if (firePending) {
+          firePending = false;
+          /* 300ms 让 runTask 的收尾日志/回写先落地；收尾场景自己的 S1 门禁还会等回写完成 */
+          setTimeout(function () { fire('pending'); }, 300);
+        }
       }
     }
 
