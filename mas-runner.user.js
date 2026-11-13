@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.40
+// @version      0.9.41
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.41：「同步 spec」改为同步**全部**场景（并行 4 路）。0.9.23 起它只同步「当前这一份」，
+// 于是站在 3C 页面上永远刷不到收尾场景的新 spec —— 真机 2026-11-13 18:04 收尾仍跑缓存 v0.2.0，
+// 直接造成最终状态回写被跳转打断。并行后 7 个场景通常 10~20s，比「拿旧流程白跑一趟」便宜得多。
 //
 // 0.9.40：开新场景 / 真导航前，先在途回写落表（drainWrites，最多 90s）。
 // 真机 2026-11-13 18:04：P3 final 回写 18:04:56 发出，收尾场景同秒启动、旧版 S1 等 15s 就导航
@@ -2030,7 +2034,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.40',
+    RUNNER_VERSION: '0.9.41',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3122,7 +3126,7 @@
           <span class="lbl">业务脚本</span>
           <span id="masr-spec-badge"><span class="lbl">未加载</span></span>
           <span class="grow"></span>
-          <button class="masr-mini" id="masr-spec-upgrade" title="联网强制同步：场景触发规则（绕开 10 分钟缓存）+ 当前业务脚本的最新 spec（绕开本地缓存）。流程执行中不允许点。">同步 spec</button>
+          <button class="masr-mini" id="masr-spec-upgrade" title="联网强制同步：场景触发规则（绕开 10 分钟缓存）+ 全部业务脚本的最新 spec（并行 4 路，绕开本地缓存）。流程执行中不允许点。">同步 spec</button>
         </div>
       </div>
       <div class="row" id="masr-selfcheck"></div>
@@ -3305,21 +3309,25 @@
       }
       const ids = [];
       const push = function (x) { if (x && ids.indexOf(x) < 0) ids.push(x); };
-      if (sid) push(sid);
-      else scenes.forEach(function (s) { if (s && s.script_id) push(String(s.script_id)); });
-      if (sid) {
-        UI.appendLog({ t: Date.now(), level: 'info', msg: '同步目标：' + sid + '（' + sidFrom + '），其余场景不动' });
-      } else {
-        UI.appendLog({ t: Date.now(), level: 'warn',
-          msg: '认不出「当前这份 spec」属于哪个场景（面板没加载、当前页也没命中）：改为同步全部 ' + ids.length + ' 个场景，会慢一些' });
+      /* 0.9.41（用户报「想更新的更新不到，老是白跑」）：默认同步**全部**场景。
+       * 0.9.23 起只同步「当前这一份」，本意是省时间（当时串行 7 个要 98s），但代价是：
+       * 站在 3C 页面上永远刷不到收尾场景的新 spec —— 真机 2026-11-13 18:04 收尾跑的还是
+       * 缓存 v0.2.0（S1 只等 15s），直接导致最终状态回写被跳转打断。
+       * 现在并行 4 路，7 个场景通常 10~20s；慢的代价远小于「拿旧流程白跑一趟」。 */
+      scenes.forEach(function (s) { if (s && s.script_id) push(String(s.script_id)); });
+      if (!ids.length && sid) push(sid);
+      if (ids.length > 1) {
+        UI.appendLog({ t: Date.now(), level: 'info',
+          msg: '同步目标：全部 ' + ids.length + ' 个场景（并行 4 路）' + (sid ? '；当前任务 ' + sid : '') });
+      } else if (sid) {
+        UI.appendLog({ t: Date.now(), level: 'info', msg: '同步目标：' + sid + '（' + sidFrom + '）' });
       }
       if (!ids.length) {
         UI.appendLog({ t: Date.now(), level: 'warn', msg: '没有可同步的业务脚本：面板没加载 spec、当前页没命中场景、场景列表也拿不到。先打开一次业务页面或点「加载 spec」再试' });
         return;
       }
       let ups = 0, same = 0, bad = 0;
-      for (let i = 0; i < ids.length; i++) {
-        const id = ids[i];
+      const syncOne = async function (id) {
         const before = SVC.specCache.get(id);
         try {
           /* 手动同步是人在等的一次性动作：给 45s（默认 20s 在这条链路上经常不够——2026-11-09
@@ -3341,7 +3349,9 @@
            * 不调 applySpec 的后果就是 0.9.22 那个 bug：缓存升到 0.4.4，徽标还写着 0.4.3。 */
           const panelSpecId = (UI.spec && UI.spec.spec_id) ? String(UI.spec.spec_id) : '';
           const respSpecId = (s.spec && s.spec.spec_id) ? String(s.spec.spec_id) : '';
-          const isPanelOne = panelSpecId ? panelSpecId === respSpecId : (ids.length === 1);
+          const isPanelOne = panelSpecId
+            ? panelSpecId === respSpecId
+            : !!((UI.currentTask && UI.currentTask.script_id === id) || ids.length === 1);
           if (isPanelOne) {
             UI._specCache = { script_id: id, spec: s.spec, version: s.version };
             UI.applySpec(JSON.stringify(s.spec), { persist: true });
@@ -3353,7 +3363,17 @@
           UI.appendLog({ t: Date.now(), level: 'warn',
             msg: 'spec 同步失败：' + id + '（' + UI.syncErrText(e) + '）' + (before ? '——本机缓存 v' + before.version + ' 保留，仍可执行' : '——本机没有该场景缓存') });
         }
+      };
+      /* 并行 4 路：7 个场景串行要 ~100s（0.9.23 就是因此砍成只同步一个），并行后通常 10~20s。
+       * 每个请求仍各自 45s 预算；单个失败不影响其它场景。 */
+      const queue = ids.slice();
+      const lanes = [];
+      for (let w = 0; w < Math.min(4, queue.length); w++) {
+        lanes.push((async function () {
+          while (queue.length) await syncOne(queue.shift());
+        })());
       }
+      await Promise.all(lanes);
       UI.appendLog({ t: Date.now(), level: bad && !ups ? 'fatal' : 'info',
         msg: '同步完成（' + ((Date.now() - T0) / 1000).toFixed(1) + 's）：升级 ' + ups + '、已是最新 ' + same + '、失败 ' + bad +
           (bad && !ups ? '——后端连不上时先把服务起来，再点一次「同步 spec」' : '') });
