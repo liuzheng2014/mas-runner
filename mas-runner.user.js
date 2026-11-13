@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.43
+// @version      0.9.44
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,15 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.44：**页面身份守卫**。交接上下文/地址带来的记录未必是页面上登录着的那一个
+// （真机 2026-11-13 19:14：3C 按陈旧 pend 的「甜点大师」启动，页面却是「家园建造保卫战」，
+// 结果把家园的账户ID 回写进了甜点大师那条记录，还把上一条的 96 个参数填到了家园账号上）。
+// 现在 spec 声明了 trigger.identity 的场景，在开跑前用它核对一次：记录里同名列为空（首次登录）
+// 直接沿用；两者一致零额外查询；**不一致才按页面身份反查**（最多 4 次、共约 5.4s 退避，
+// 容忍飞书刚写入还没同步）——查到别的记录就整条换过去（参数与票据重取），仍查不到就停手，
+// 不填表、不回写，并作废那条陈旧交接。
+// 同时给 writeback 加了 only_if_stored_empty_or_equal：记录里同名列已有不同的值就不覆盖。
 //
 // 0.9.43：①附件预取改回**全部并行**（按用户要求：页面一加载就同时下所有资质，不再先执照后其余）；
 // ②步骤时间线状态跨标签页/跨刷新保留（写入 GM 存储，renderSteps 回放 + 2s 轮询），
@@ -1345,9 +1354,12 @@
 
       /* writeback（0.9.35）：流程中途把指定列写进业务表——局部写、不改状态、不结束流程。
        * 典型用途：填表场景刚进入表单页，先把读到的「客仓ID」记进表（异步，不阻塞填写）。
-       * fields = {列名: 模板值}；列名必须在该 spec 的 scene.writeback 里声明过（服务端白名单）。 */
+       * fields = {列名: 模板值}；列名必须在该 spec 的 scene.writeback 里声明过（服务端白名单）。
+       * only_if_stored_empty_or_equal（0.9.44）：写之前先看作用域里**同名列**（表里读到的旧值），
+       * 旧值非空且与新值不同 → 跳过并告警。拦的是「记录串号时把 B 的账户ID 盖到 A 的记录上」。 */
       if (act === 'writeback') {
         const decl = (a.fields && typeof a.fields === 'object') ? a.fields : {};
+        const guardStored = a.only_if_stored_empty_or_equal === true;
         const out = {};
         Object.keys(decl).forEach(function (k) {
           let v;
@@ -1358,7 +1370,19 @@
             log('writeback 跳过 ' + k + '：' + ((e && e.message) || e));
             return;
           }
-          if (v !== undefined && v !== null && String(v) !== '') out[k] = String(v);
+          if (v !== undefined && v !== null && String(v) !== '') {
+            if (guardStored) {
+              const raw = scope[k];
+              const cur = (raw === undefined || raw === null) ? '' : String(raw).trim();
+              const nv = String(v).trim();
+              if (cur && cur !== nv) {
+                log('⚠ writeback 跳过 ' + k + '：表里这条记录已是 ' + cur + '，本次读到 ' + nv +
+                  '（不一致，疑似记录串号，不覆盖）');
+                return;
+              }
+            }
+            out[k] = String(v);
+          }
         });
         if (!Object.keys(out).length) { log('writeback 跳过：解析后没有非空字段'); return; }
         if (typeof opts.onWriteback !== 'function') throw new Error('E_SPEC writeback 未接线（引擎没有回写通道）');
@@ -2039,7 +2063,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.43',
+    RUNNER_VERSION: '0.9.44',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -6680,6 +6704,97 @@
       return { value: txt, why: '' };
     }
 
+    /* identity.url_matches 之外的页面不去读这个元素（例：CAS 登录页上读不到，白等 timeout）。
+     * 没写 url_matches = 任何命中页都适用（校验器会给 warn）。 */
+    function identityHere(idt) {
+      if (!idt) return false;
+      if (!idt.url_matches) return true;
+      try { return new RegExp(String(idt.url_matches)).test(String(location.href)); }
+      catch (e) { return false; }
+    }
+
+    /* 页面身份守卫（0.9.44）——把「这条记录」和「页面上登录着的这个账号」对一次账。
+     * 只对 spec 声明了 trigger.identity 的场景生效；绝不额外查表，除非两边的值真的不一致。
+     *   ① 记录里同名列为空 → 首次登录，沿用该记录（一次查询都不加，值由 S1 回写）；
+     *   ② 两边一致        → 直接走；
+     *   ③ 两边不一致      → 按页面身份反查（带退避重试，容忍飞书刚写入还没同步）：
+     *        查到别的记录 → 整条换过去（参数、票据重取，绝不沿用上一条的参数）；
+     *        仍查不到     → 停手：不填表、不回写，并作废那条陈旧交接。
+     */
+    const IDT_TRIES = 4;
+    const IDT_GAP_MS = [1200, 1800, 2400];   // 合计约 5.4s
+    function identityStop(msg) {
+      const e = new Error('页面身份守卫：' + msg + '——已停止：本次不填表、不回写。请回业务表核对后重新触发。');
+      e.code = 'E_IDENTITY';
+      e.identityGuard = true;
+      return e;
+    }
+    async function identityGuard(hit, task) {
+      const idt = hit.identity;
+      if (!idt || !task || task.record_optional || task.from_url) return task;
+      const field = String(idt.lookup_field || '').trim();
+      if (!field || !identityHere(idt)) return task;
+      const label = String(idt.label || field);
+      const rd = await readPageIdentity(idt);
+      if (!rd.value) {
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '页面身份守卫：读不到「' + label + '」（' + rd.why + '）→ 无法核对，按原记录 ' + task.record_id + ' 继续' });
+        return task;
+      }
+      const have = String((task.params && task.params[field]) || '').trim();
+      if (have === rd.value) {
+        UI.appendLog({ t: Date.now(), level: 'info',
+          msg: '页面身份核对一致：' + label + ' = ' + rd.value + '（记录 ' + task.record_id + '）' });
+        return task;
+      }
+      if (!have) {
+        UI.appendLog({ t: Date.now(), level: 'info',
+          msg: '页面身份守卫：记录 ' + task.record_id + ' 尚未写「' + field + '」（首次登录），沿用该记录；页面读到 ' + rd.value });
+        return task;
+      }
+      UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '⚠ 页面身份与记录不一致：页面「' + label + '」= ' + rd.value + '，记录 ' + task.record_id +
+          ' 的「' + field + '」= ' + have + ' → 按页面身份反查（最多 ' + IDT_TRIES + ' 次，等飞书写入同步）' });
+      let found = null, lastErr = '';
+      for (let i = 0; i < IDT_TRIES && !found; i++) {
+        if (i > 0) await delay(IDT_GAP_MS[Math.min(i - 1, IDT_GAP_MS.length - 1)]);
+        try {
+          found = await SVC.recordByLookup(hit.script_id, field, rd.value);
+        } catch (e) {
+          lastErr = String((e && e.message) || e);
+          UI.appendLog({ t: Date.now(), level: i ? 'warn' : 'info',
+            msg: '反查第 ' + (i + 1) + '/' + IDT_TRIES + ' 次未果：' + lastErr +
+              (i + 1 < IDT_TRIES ? '，稍等再试' : '') });
+        }
+      }
+      if (found) {
+        const rid = String(found.record_id || '');
+        if (!rid || rid === String(task.record_id || '')) {
+          UI.appendLog({ t: Date.now(), level: 'warn',
+            msg: '反查回到同一条记录 ' + task.record_id + '，但表里该列仍是旧值（' + have + '）——按该记录继续，由 S1 回写纠正' });
+          return task;
+        }
+        let t2 = null;
+        try { t2 = await SVC.record(rid, hit.script_id); }
+        catch (e) { throw identityStop('页面身份反查到记录 ' + rid + '，但按它取数失败（' + e.message + '）'); }
+        hit.record_id = rid;
+        hit.record_id_from_pend = false;
+        /* 这条记录的「本页只取一次」标记要补上：fire() 的 seen 键在守卫之前就按**旧**记录算过了，
+         * 不补的话，S1 点完「下一步」引起的 hash 变化会以新记录为键再触发一次、把整条流程重跑。 */
+        seen[hit.script_id + '|' + rid] = true;
+        t2.on_match = hit.on_match;
+        /* 交接上下文也要换掉：否则同一标签页里下一次 URL 变化又会拿着旧记录启动。 */
+        try { SVC.pendSet(t2, location.host); } catch (e) {}
+        UI.appendLog({ t: Date.now(), level: 'warn',
+          msg: '已按页面身份切换到记录 ' + rid + '（原记录 ' + (task.record_id || '?') + '）：参数与回写票据已重新取，按新记录继续' });
+        return t2;
+      }
+      try { SVC.pendClear(); } catch (e) {}
+      throw identityStop('页面「' + label + '」= ' + rd.value + '，交接记录 ' + task.record_id +
+        ' 的「' + field + '」= ' + have + '，按页面身份反查 ' + IDT_TRIES + ' 次仍未找到对应记录' +
+        (lastErr ? '（最后一次：' + lastErr + '）' : '') + '（可能刚写入还没同步；那条陈旧交接已作废）');
+    }
+
     async function fire(reason) {
       if (!SVC.code()) return;
       if (busy) { firePending = true; return; }
@@ -6786,11 +6901,7 @@
            * 只在 spec 声明的 url_matches 范围内生效——同一个场景在别的页面上（例：CAS 登录页）
            * 不该去读这个元素，那里也读不到。 */
           const idt = hit.identity;
-          let idtHere = false;
-          if (idt) {
-            if (!idt.url_matches) idtHere = true;
-            else { try { idtHere = new RegExp(String(idt.url_matches)).test(String(location.href)); } catch (e) { idtHere = false; } }
-          }
+          const idtHere = identityHere(idt);
           if (!preTask && idtHere) {
             const rd = await readPageIdentity(idt);
             if (rd.value) {
@@ -6923,6 +7034,10 @@
           task.on_match = hit.on_match;
         }
         task.on_match = hit.on_match;
+        /* 0.9.44：开跑前核对「这条记录 ↔ 页面上登录着的这个账号」（见 identityGuard）。
+         * 这一枪必须放在「参数已齐、尚未填表/回写」的位置：它是最后一道能拦住
+         * 「把 A 的资料填到 B 的账号上、再把 B 的账户ID 写进 A 的记录」的闸。 */
+        task = await identityGuard(hit, task);
         /* ticket_only（0.9.35）：参数来自交接上下文时，写表还缺一张回写票据。
          * 只向 /task 要票据（服务端不读业务表）；失败就回退成完整取数——
          * 宁可多花 4~8s，也不能无票据开跑（写表会 403，等于白填一遍）。 */
@@ -6967,15 +7082,18 @@
         }
       } catch (e) {
         UI._triggerTask = null;
-        UI._triggerErr = '按记录取数失败：' + e.message;
+        /* 身份守卫拦下来的不是「取数失败」，文案不能套那个前缀（会把人引去查网络/表状态）。 */
+        const msg = e && e.identityGuard ? String(e.message || e) : ('按记录取数失败：' + e.message);
+        UI._triggerErr = msg;
         /* 只有传输层失败才值得原地再试一次（0.9.25）：实测这个自定义域单次尝试约 50% 连不上，
          * 而 /task 已经自动重试过 2 次；还原地再给一次机会，比让人刷新整页成本低得多。 */
-        UI._triggerErrRetry = /E_SVC_NET|E_SVC_TIMEOUT|E_SVC_WATCHDOG|E_SVC_PARSE|E_SVC 5\d\d/.test(String(e && e.message || ''));
+        UI._triggerErrRetry = !(e && e.identityGuard) &&
+          /E_SVC_NET|E_SVC_TIMEOUT|E_SVC_WATCHDOG|E_SVC_PARSE|E_SVC 5\d\d/.test(String(e && e.message || ''));
         UI.renderTrigger();
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '按记录取数失败：' + e.message });
+        UI.appendLog({ t: Date.now(), level: 'warn', msg: msg });
         // 中转页没有主面板，必须让人看见失败原因，否则会以为按钮坏了
         if (!document.getElementById('masr-trigger-box')) {
-          UI.notice('取数失败：' + e.message + '（不会继续，请回业务表核对该行状态）', 'error');
+          UI.notice((e && e.identityGuard ? '' : '取数失败：') + msg + '（不会继续，请回业务表核对该行状态）', 'error');
         }
       } finally {
         busy = false;
