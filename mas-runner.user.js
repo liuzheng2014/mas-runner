@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.44
+// @version      0.9.45
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,13 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.45：步骤时间线真的跟着「在跑的那个标签页」走。0.9.43 只把**终态**写进共享存储，
+// 且观察页必须自己渲染过同一份 spec 才有行可画——真机现场是「这页看着 3C、实际在另一页跑」，
+// 于是整列停在「待执行」。现在共享状态里连步骤清单一起存（id/名称/mode）、开跑与完成都落盘，
+// 任何标签页都能把整张表画出来并回放；1.5s 轮询在「本页没在画」时才回放（不会盖掉本页的秒表），
+// 别的场景还在跑时会在表头上方标「另一标签页正在运行：xxx」。加载 spec 时也会先画一次，
+// 刷新后或只是打开面板的页面不再是空白表。
 //
 // 0.9.44：**页面身份守卫**。交接上下文/地址带来的记录未必是页面上登录着的那一个
 // （真机 2026-11-13 19:14：3C 按陈旧 pend 的「甜点大师」启动，页面却是「家园建造保卫战」，
@@ -2063,7 +2070,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.44',
+    RUNNER_VERSION: '0.9.45',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -5610,6 +5617,10 @@
       if (opts.persist !== false) GM_setValue(GV.LAST_SPEC_KEY, text);
       UI.renderSpecBadge(spec);
       UI.renderParams(spec);
+      /* 0.9.45：加载 spec 就把步骤表画出来（并回放已保存的状态）。
+       * 以前只有 doRun 会画，于是「只是打开页面/加载了 spec」的标签页里时间线是空的，
+       * 人以为面板坏了；刷新后的页面同理。本页正在跑时不动它（本地绘制权威）。 */
+      if (!UI._running) UI.renderSteps(spec);
       document.getElementById('masr-run').textContent = spec.status === 'active' ? '重跑当前 spec' : '执行（draft → dry_run）';
       // 自动恢复（fromStore）静默处理：只更新 badge/参数表，不往跨页日志里灌噪音
       // 同一份 spec 重复 apply 也不重复播报：URL 触发 → runTask 会把同一份 spec 载两遍，
@@ -5964,45 +5975,86 @@
   /* 0.9.43：步骤状态持久化（跨标签页 / 跨页面）。
    * 真机反馈：填表页的步骤时间线一直「待执行」——真正在跑的是另一个标签页（或页面刷新过），
    * 而 markStep 只改当前 DOM。这里把每个终态写进 GM 存储（脚本级、跨标签页共享），
-   * renderSteps 时回放；另有 2s 轮询，另一页在跑时这边也能看到进度。 */
+   * renderSteps 时回放；另有轮询，另一页在跑时这边也能看到进度。
+   * 0.9.45：**带上步骤清单本身**（id/名称/mode）。0.9.43 只存了 states，观察页必须先自己
+   * 渲染过同一份 spec 才有行可画；实际现场是「这页看着 3C、真正在跑的却是另一页」，
+   * 于是永远停在「待执行」（或干脆没有行）。现在拿到状态就能把整张表画出来，
+   * 并在表头上方标明「另一标签页正在运行：xxx」。 */
   const STEP_STATE_KEY = 'masr_step_states_v1';
+  const STEP_LIVE_MS = 90 * 1000;   // 这么久没更新的运行视为已结束（不再抢别的页面的时间线）
   function readStepStates() {
     try { return JSON.parse(GM_getValue(STEP_STATE_KEY, 'null')) || null; } catch (e) { return null; }
   }
+  function stepListOf(spec) {
+    return (spec.steps || []).map(function (x) {
+      return { id: x.id, name: x.name || x.id, mode: x.mode || '' };
+    });
+  }
+  function stateForSpec(spec) {
+    return {
+      spec_id: String((spec && spec.spec_id) || ''), version: String((spec && spec.version) || ''),
+      name: String((spec && spec.scene && spec.scene.name) || (spec && spec.title) || ''),
+      steps: stepListOf(spec || {}), states: {}, at: Date.now(),
+    };
+  }
   function saveStepState(stepId, phase) {
+    if (UI._replayingSteps) return;   // 回放不算「本页在跑」，也不能反过来把状态再写一遍
     try {
       const spec = UI.spec || {};
-      const s = readStepStates();
-      if (!s || !spec.spec_id || String(s.spec_id) !== String(spec.spec_id)) return;
-      s.states = s.states || {};
+      if (!spec.spec_id) return;
+      let s = readStepStates();
+      if (!s || !s.states || String(s.spec_id) !== String(spec.spec_id)) s = stateForSpec(spec);
       s.states[stepId] = phase;
       s.at = Date.now();
       GM_setValue(STEP_STATE_KEY, JSON.stringify(s));
     } catch (e) {}
   }
-  UI.resetStepStates = function (specId, version) {
+  UI.resetStepStates = function (spec) {
     try {
-      GM_setValue(STEP_STATE_KEY, JSON.stringify({
-        spec_id: String(specId || ''), version: String(version || ''), states: {}, at: Date.now(),
-      }));
+      GM_setValue(STEP_STATE_KEY, JSON.stringify(stateForSpec(spec || UI.spec || {})));
       UI._stepPaintedAt = 0;
     } catch (e) {}
   };
-  UI.paintSavedSteps = function (spec) {
-    const s = readStepStates();
-    if (!s || !spec || String(s.spec_id) !== String(spec.spec_id)) return false;
-    Object.keys(s.states || {}).forEach(function (id) { UI.markStep(id, s.states[id]); });
+  /* 把「另一份 spec」的步骤表画出来：观察页没有加载它，只能靠状态里带的清单。 */
+  UI.renderStepRows = function (list, note, specId) {
+    const el = document.getElementById('masr-steps');
+    if (!el) return false;
+    UI.clearStepTimers();
+    UI._stepsSpecId = String(specId || '');
+    el.innerHTML = (note ? '<div style="margin:2px 0 4px;color:#8a6412">' + note + '</div>' : '') +
+      '<table><tr><th>#</th><th>步骤</th><th>mode</th><th>状态</th></tr>' +
+      (list || []).map(function (s, i) {
+        return '<tr><td>S' + (i + 1) + '</td><td>' + (s.name || s.id) + '</td><td>' +
+          (s.mode || '') + '</td><td id="masr-step-' + s.id + '">待执行</td></tr>';
+      }).join('') + '</table>';
+    return true;
+  };
+  /* s 不传就用存储里那份。当前页的 spec 与状态属于同一场景 → 只画状态；
+   * 不是（或本页根本没加载 spec）→ 用状态里带的步骤清单重建整张表并标明出处。 */
+  UI.paintSavedSteps = function (s) {
+    s = s || readStepStates();
+    if (!s || !s.states) return false;
+    const mine = UI.spec && String(UI.spec.spec_id) === String(s.spec_id);
+    if (!mine) {
+      if (!Array.isArray(s.steps) || !s.steps.length) return false;
+      /* 表已经是这份状态的了就别每 1.5s 重建一次（会闪、也会把正在滚动的面板拽回去） */
+      if (UI._stepsSpecId !== String(s.spec_id)) {
+        UI.renderStepRows(s.steps, '另一标签页正在运行：' + (s.name || s.spec_id) + '（不是本页场景）', s.spec_id);
+      }
+    } else if (UI._stepsSpecId !== String(UI.spec.spec_id)) {
+      /* 面板上刚才还是别的场景的表 → 换回本页自己的步骤行 */
+      UI.renderStepRows(stepListOf(UI.spec), '', UI.spec.spec_id);
+    }
+    UI._replayingSteps = true;
+    try {
+      Object.keys(s.states).forEach(function (id) { UI.markStep(id, s.states[id]); });
+    } finally { UI._replayingSteps = false; }
     return true;
   };
   UI.renderSteps = function (spec) {
-    UI.clearStepTimers();
-    const el = document.getElementById('masr-steps');
-    el.innerHTML = '<table><tr><th>#</th><th>步骤</th><th>mode</th><th>状态</th></tr>' +
-      spec.steps.map((s, i) =>
-        '<tr><td>S' + (i + 1) + '</td><td>' + (s.name || s.id) + '</td><td>' + s.mode + '</td><td id="masr-step-' + s.id + '">待执行</td></tr>').join('') +
-      '</table>';
+    UI.renderStepRows(stepListOf(spec), '', spec.spec_id);
     /* 回放这个场景最近一次运行留下的状态（另一标签页跑的、或本页刷新前的）。 */
-    UI.paintSavedSteps(spec);
+    UI.paintSavedSteps(readStepStates());
   };
   const STEP_LABEL = {
     running: '⏳ 运行中', progress: '⏳ 运行中', requesting: '→ 请求中', navigating: '→ 导航中',
@@ -6011,6 +6063,16 @@
   UI.markStep = function (stepId, phase, info) {
     const el = document.getElementById('masr-step-' + stepId);
     if (!el) return;
+    /* 回放别的标签页的状态时不动本页的计时器，也不把状态再写回去。
+     * 「运行中」在观察页只显示成静态文字（秒表只在真正跑它的那一页有意义）。 */
+    if (UI._replayingSteps && (phase === 'running' || phase === 'progress')) {
+      el.textContent = (STEP_LABEL[phase] || phase) + (info && info.name ? ' · ' + info.name : '');
+      el.style.color = '#333';
+      return;
+    }
+    /* 只有「本页真的在跑」才记这一笔：回放也会走下面那段，若把它算成本页在跑，
+     * 轮询会以为「本地绘制权威」而一直跳过，观察页就永远停在第一次回放的样子。 */
+    if (!UI._replayingSteps) UI._lastLocalStepAt = Date.now();
     const stop = function () {
       if (UI._stepTick[stepId]) { try { clearInterval(UI._stepTick[stepId].t); } catch (e) {} delete UI._stepTick[stepId]; }
     };
@@ -6029,6 +6091,8 @@
       UI._stepTick[stepId] = st;
       el.style.color = '#333';
       paint(st);
+      /* 0.9.45：开跑也落盘——别的标签页要能看出「现在跑到哪一步」，而不是整列待执行。 */
+      saveStepState(stepId, 'running');
       return;
     }
     if (phase === 'progress') {
@@ -6149,7 +6213,7 @@
     UI.setSpecBadge(spec);
     if (!opts.keepLog) document.getElementById('masr-log').innerHTML = '';
     /* 0.9.43：开新一轮就把该场景的步骤状态清空，避免把上一轮的结果当成本轮的 */
-    if (UI.resetStepStates) UI.resetStepStates(spec.spec_id, spec.version);
+    if (UI.resetStepStates) UI.resetStepStates(spec);
     UI.renderSteps(spec);
     if (resuming) {
       UI.appendLog({ t: Date.now(), level: 'info', msg: '=== 续跑模式：从运行态恢复（' + st0.navStepId + ' 之后）===' });
@@ -7201,18 +7265,27 @@
     if (SVC.code()) {
       try { armUrlTrigger(); } catch (e) { /* 触发失败不影响手动流程 */ }
     }
-    /* 0.9.43：另一标签页正在跑同一份 spec 时，这里也把它的步骤进度回放出来（2s 一次）。
-     * 本页自己在跑时不覆盖（markStep 已经在实时改 DOM）。 */
+    /* 0.9.45：步骤时间线跟「真正在跑的那个标签页」对齐（1.5s 一次）。
+     * 判定三件事：
+     *   ① 状态更新过才有必要画（at 比上次画的新）；
+     *   ② 本页最近 5s 内自己画过（正在跑）→ 以本地为准，别让回放把秒表/进度盖掉；
+     *   ③ 不是本页的场景时，只在这个运行还活着（90s 内有更新）时接管面板，
+     *      否则会把别的页面很久以前的结果塞到本页场景下面。
+     * 0.9.43 的旧实现只看「同 spec + !UI._running」，既画不出别人场景的表（没有行），
+     * 又会被卡住的 _running 永久挡掉——真机上就表现成「每一步都是待执行」。 */
     setInterval(function () {
       try {
-        if (!UI.spec || UI._running) return;
         const s = readStepStates();
-        if (s && s.at > (UI._stepPaintedAt || 0)) {
-          UI._stepPaintedAt = s.at;
-          UI.paintSavedSteps(UI.spec);
-        }
+        if (!s || !s.states || !Object.keys(s.states).length) return;
+        const mine = !!UI.spec && String(UI.spec.spec_id) === String(s.spec_id);
+        const live = (Date.now() - Number(s.at || 0)) < STEP_LIVE_MS;
+        if (!mine && !live) return;
+        if (Date.now() - Number(UI._lastLocalStepAt || 0) < 5000) return;
+        if (Number(s.at || 0) <= Number(UI._stepPaintedAt || 0)) return;
+        UI._stepPaintedAt = Number(s.at || 0);
+        UI.paintSavedSteps(s);
       } catch (e) {}
-    }, 2000);
+    }, 1500);
     // 版本落点：解释器升级后第一次加载，明确告诉人「现在跑的是哪个版本」
     try {
       const cur = UI.installedVersion();
