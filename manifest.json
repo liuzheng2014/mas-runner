@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.39",
+  "version": "0.9.40",
   "file": "mas-runner.user.js",
-  "sha256": "c457cc233eebe9d76400f62a21855e13daa27582dcec66d74377d38278173cbb",
-  "bytes": 451199,
-  "published_at": "2026-11-13T18:12:55+08:00",
+  "sha256": "42e21e3f99c47666f08565611438a0803522a87ffe6fb97cbdfa452140b21a74",
+  "bytes": 454397,
+  "published_at": "2026-11-13T18:22:54+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "runner v0.9.39: 附件预取两段式（执照独占先下，S2 22s->~10s）"
+  "notes": "runner v0.9.40: 跳转/开新场景前等在途回写落表（修复最终状态丢失）"
 }

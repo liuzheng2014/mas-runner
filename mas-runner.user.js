@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.39
+// @version      0.9.40
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.40：开新场景 / 真导航前，先在途回写落表（drainWrites，最多 90s）。
+// 真机 2026-11-13 18:04：P3 final 回写 18:04:56 发出，收尾场景同秒启动、旧版 S1 等 15s 就导航
+// 登出，请求在飞被整页卸载打断 —— 表里状态没更新、也没进待写队列，且一行报错都没有。
 //
 // 0.9.39：附件预取改「两段式」——第 1 张（最先上传、且 OCR 与后续字段都卡在它后面）单独先下，
 // 其余等它下完（最多 15s）再并行。真机 2026-11-13 18:04：5 张并行抢一条 ~100KB/s 的链路，
@@ -2026,7 +2030,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.39',
+    RUNNER_VERSION: '0.9.40',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2856,6 +2860,9 @@
       return { initiated: false, handoff: true, openedTab: true, stepId: step.id };
     }
 
+    /* 0.9.40：真导航前先等在途回写（最多 90s）。交接（handoff）分支刻意不等——
+     * 它的回写本来就是「先入队、后台写」，阻塞它等于废掉异步化。 */
+    await UI.drainWrites(90000);
     const newTab = step.open === 'new-tab';
     log({ t: Date.now(), level: 'info', msg: step.id + ' → ' + (newTab ? '新标签页打开 ' : '导航 ') + maskUrl(url) + '（运行态已保存）' });
     onStep(step.id, 'navigating');
@@ -4676,6 +4683,9 @@
   UI.runTask = async function (task, btn) {
     if (UI._running) return;
     UI._running = true;
+    /* 0.9.40：上一条流程的 final 回写可能还在路上（典型：提交完成 → 收尾场景同秒启动）。
+     * 不等它就开始新流程，最坏结果是 0.5s 后整页跳转把请求打断 → 表里状态没更新、也没有报错。 */
+    await UI.drainWrites(90000);
     const paceStop = startPaceWatch();
     const old = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
@@ -5281,6 +5291,10 @@
         })();
         if (!UI._writeJobs) UI._writeJobs = {};
         UI._writeJobs[task.record_id] = bgJob;
+        /* 0.9.40：登记「真的在途」的写，供 drainWrites 在跳转前等 */
+        if (!UI._pendingWrites) UI._pendingWrites = new Set();
+        UI._pendingWrites.add(bgJob);
+        bgJob.finally(function () { try { UI._pendingWrites.delete(bgJob); } catch (e) {} });
         /* 对外语义仍是「这条已经处理了、收尾别再发一次」；是否真写成功由 background/queued 表达 */
         return Promise.resolve({ written: true, queued: true, background: true, job: bgJob, msg: '' });
       }
@@ -5333,8 +5347,34 @@
     if (!UI._writeJobs) UI._writeJobs = {};
     if (Object.keys(UI._writeJobs).length > 200) UI._writeJobs = {}; // 兜底，正常每条消费后即删
     UI._writeJobs[task.record_id] = job;
+    /* 0.9.40：登记在途写；settle 后立刻摘掉，drainWrites 才不会把「已完成的写」当在途 */
+    if (!UI._pendingWrites) UI._pendingWrites = new Set();
+    UI._pendingWrites.add(job);
+    job.finally(function () { try { UI._pendingWrites.delete(job); } catch (e) {} });
     return job;
   }
+  /* 0.9.40：跳转/开新场景前，把「在途回写」等完（最多 ms 毫秒）。
+   * 真机 2026-11-13 18:04：P3 的 final 回写 18:04:56 发出；收尾场景同秒启动，旧版 S1 等 15s
+   * 等不到就导航登出 —— 请求还在飞就被整页卸载打断，既没写进表、也没进待写队列（失败分支
+   * 根本没机会跑）。表现就是「流程完成、表里状态没变」。
+   * 这里把「等回写落表」从 spec 的自觉变成引擎保证：任何一次跳转/新场景启动都先等一次。 */
+  UI.drainWrites = async function (ms) {
+    const jobs = Array.from(UI._pendingWrites || []);
+    if (!jobs.length) return true;
+    const limit = Math.max(1000, Number(ms) || 90000);
+    UI.appendLog({ t: Date.now(), level: 'info',
+      msg: '等本页回写落表再继续（' + jobs.length + ' 条在途，最多 ' + Math.round(limit / 1000) + 's）' });
+    const ok = await Promise.race([
+      Promise.allSettled(jobs).then(function () { return true; }),
+      new Promise(function (r) { setTimeout(function () { r(false); }, limit); }),
+    ]);
+    if (!ok) {
+      UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '回写仍未完成（超过 ' + Math.round(limit / 1000) + 's）：若被本次跳转打断，失败会进本机待写队列，' +
+          '下个页面启动时自动补写；请在「任务」行确认最终状态' });
+    }
+    return ok;
+  };
   function updResultWarn(n) {
     const el = document.getElementById('masr-result');
     if (!el || !n) return;
@@ -7105,6 +7145,8 @@
       newUrl: function () { return UI._newUrl || ''; },
       /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
       autoFlushPending: autoFlushPending, pwDel: pwDel, pwKey: pwKey, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
+      /* 跳转前等在途回写（0.9.40）：只能从这里构造「请求在飞 + 立刻跳转」的现场 */
+      drainWrites: UI.drainWrites,
       /* spec 缓存版本校验（0.9.19）：要验证「缓存 0.2.0 / 线上 0.4.0 → 本次就换新版」，
        * 只能从 /task 回包里带版本号那条路走，UI 上没法稳定构造（线上不会配合同时发两个版本）。
        * 生产路径不会调用。 */
@@ -7129,6 +7171,8 @@
       newUrl: function () { return UI._newUrl || ''; },
       /* 异步回写要能验证「入队→后台写→出队→跨页成功凭证」这条链，暴露给 async-writeback-smoke */
       autoFlushPending: autoFlushPending, pwDel: pwDel, pwKey: pwKey, markWbOk: markWbOk, wbOkRecent: wbOkRecent,
+      /* 跳转前等在途回写（0.9.40）：只能从这里构造「请求在飞 + 立刻跳转」的现场 */
+      drainWrites: UI.drainWrites,
       /* spec 缓存版本校验（0.9.19）：要验证「缓存 0.2.0 / 线上 0.4.0 → 本次就换新版」，
        * 只能从 /task 回包里带版本号那条路走，UI 上没法稳定构造（线上不会配合同时发两个版本）。
        * 生产路径不会调用。 */
