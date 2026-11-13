@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.35",
+  "version": "0.9.36",
   "file": "mas-runner.user.js",
-  "sha256": "729e8a59060ea38a835037ecb9289d7b8c2e78298be0a171469a185bc717d337",
-  "bytes": 444647,
-  "published_at": "2026-11-13T16:54:25+08:00",
+  "sha256": "d6adf1ac2ac6b9948bcb0c594a5d56010bf912bd8da1373361bb90576b68dd4e",
+  "bytes": 446156,
+  "published_at": "2026-11-13T17:26:09+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "0.9.35：ticket_only 取票 / writeback 局部回写 / confirm_gate 取消按钮"
+  "notes": "runner v0.9.36: handoff 透传未被 spec 声明的参数（修复 P2->P3 只带 record_id/account_email）"
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.35
+// @version      0.9.36
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.36：触发执行时，服务端按 task_source 取回、但本 spec 没声明的参数也装配进作用域。
+// 背景（2026-11-13 17:08 真机）：P2 登录只声明 5 个参数，handoff 白名单写了 65 个键，
+// 但交接包只从作用域取值 → 随行参数只剩 record_id,account_email；params_complete 又是
+// spec 静态声明的 true → P3 走 read-once 不查表，拿 1 个参数硬跑 22 步（地区/行业/附件全空）。
+// 交接白名单里的字段本来就不属于上游场景，不该要求上游 spec.params 逐个声明。
 //
 // 0.9.35：①trigger.ticket_only —— 参数已由上游交接带齐时，只向 /task 要一张回写票据
 // （不读业务表），read-once 从此也能用于「需要回写」的场景。
@@ -1977,7 +1983,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.35',
+    RUNNER_VERSION: '0.9.36',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -5904,6 +5910,19 @@
           return;
         }
       }
+      /* 0.9.36：/task 带回、但本 spec 没声明的字段也进 params。
+       * 为什么：handoff 白名单里的字段往往不属于上游场景（P2 登录只声明 5 个参数，却要把
+       * 65 个键整包交给 P3），buildScope 只从 params 取值 → 交接包变成空包；而
+       * params_complete 是 spec 静态声明的 true → 下游 read-once 跳过取数、拿空参数硬跑。
+       * 真机 2026-11-13 17:08：P3 只收到 record_id / account_email，22 步全填空。
+       * 空值不补（表里没有的键仍让它缺着），避免把空串覆盖进作用域。 */
+      const srvParams = (UI.currentTask && UI.currentTask.params) || {};
+      Object.keys(srvParams).forEach(function (k) {
+        if (params[k] !== undefined) return;
+        const v = srvParams[k];
+        if (v === undefined || v === null || String(v) === '') return;
+        params[k] = String(v);
+      });
       /* 参数记忆只记非凭据项：GM 存储是明文落盘的，密码写进去等于在本机留一份长期副本，
        * 而且「下次自动回填」会把密码塞回 DOM。凭据每次从 /task 重新取，不落本地。 */
       const keep = {};
