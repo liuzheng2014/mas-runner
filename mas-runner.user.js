@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.36
+// @version      0.9.37
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.37：trigger.record_optional —— 场景声明「不需要记录」时，地址里没有 recordId 也照常执行
+// （不取数、不回写）。用于收尾类场景（退出登录 + 关页）：结果页 approve-result 的地址里
+// 没有 recordId，而它本来就是零写入、零参数，以前会被「无法取数」拦下，收尾永远不执行。
 //
 // 0.9.36：触发执行时，服务端按 task_source 取回、但本 spec 没声明的参数也装配进作用域。
 // 背景（2026-11-13 17:08 真机）：P2 登录只声明 5 个参数，handoff 白名单写了 65 个键，
@@ -1983,7 +1987,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.36',
+    RUNNER_VERSION: '0.9.37',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -6410,9 +6414,10 @@
       .map(function (p) { return p.name; });
     UI.appendLog({
       t: Date.now(), level: 'ok',
-      msg: (task.from_url ? '已从页面地址读取参数'
-        : (task.from_pend ? '参数取自上游交接上下文（本页未查业务表） ' + task.record_id
-          : '已按页面记录取数 ' + task.record_id)) + '（' + s.spec_id + ' v' + s.version +
+      msg: (task.record_optional ? '本场景不需要记录（record_optional），未取数'
+        : (task.from_url ? '已从页面地址读取参数'
+          : (task.from_pend ? '参数取自上游交接上下文（本页未查业务表） ' + task.record_id
+            : '已按页面记录取数 ' + task.record_id))) + '（' + s.spec_id + ' v' + s.version +
         (cached ? '｜本地缓存，取 spec 用时 ' + (Date.now() - t0) + 'ms' : '｜联网取 spec 用时 ' + (Date.now() - t0) + 'ms') + '）' +
         (keys.length ? '；参数 ' + (logParams
           ? keys.map(function (k) {
@@ -6442,7 +6447,7 @@
       }
     }
     // 只有「要往业务表回写」的场景才需要捂热那张表；纯填表场景（URL 自带参数）不查表也不写表，捂热纯属浪费。
-    if (!task.from_url) SVC.warmStart(90000, task.script_id);
+    if (!task.from_url && !task.record_optional) SVC.warmStart(90000, task.script_id);
   };
 
   /* 监听 URL 变化：hashchange / popstate + 1.2s 轮询兜底（SPA 可能用 pushState 静默改地址） */
@@ -6541,7 +6546,18 @@
         /* 本条命中最终用哪个任务：地址里没有 recordId 的两条新入口（②③）会先把任务取好，
          * 后面「取数 → 装载 → 按 on_match 处理」那段只认这个变量，不再各自复制一份。 */
         let preTask = null;
-        if (!hit.record_id && !hasUrlParams) {
+        /* 0.9.37：record_optional —— 场景声明「不需要记录」时，地址里没有 recordId 也照常执行。
+         * 用它的是收尾类场景（退出登录 + 关页）：落点 approve-result 的地址在提交后**一定**带
+         * ?recordId=，但退出/续跑一跳之后也可能不带；而该场景零参数、零写入，本就不需要记录。
+         * 这里也不去借运行态/pend 里的记录——那会把上一条记录绑到一个与它无关的收尾上。 */
+        if (hit.record_optional === true) {
+          preTask = {
+            record_id: '', script_id: hit.script_id, params: {}, display: null,
+            write_token: '', record_optional: true,
+          };
+          UI.appendLog({ t: Date.now(), level: 'info',
+            msg: '本场景声明 record_optional：不看 recordId，按页面直接执行（不取数、不回写）' });
+        } else if (!hit.record_id && !hasUrlParams) {
           /* ⓪ 交接上下文优先（0.9.35，read-once）：参数齐了就不要再读业务表。
            * 以前 pend 只作为「②页面身份」之后的兜底，结果登录交棒过来的页面明明带着全套参数，
            * 仍然先按账户ID 反查一次表（真机 4~8s）。 */
@@ -6690,7 +6706,12 @@
          * 回退是隐式的——上下文缺参数/过期/不是给本场景的，就照旧查表一次，
          * 并且打一行说明为什么回退，避免「说好只读一次却读两次」变成查不出来的谜。 */
         let task = preTask;
-        if (task) {
+        if (task && task.record_optional) {
+          /* 0.9.37：不需要记录的场景，别打「已取数」——那会让人以为又查了一次表。 */
+          UI.appendLog({ t: Date.now(), level: 'info',
+            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按页面直接执行（' + reason + '）' });
+          task.on_match = hit.on_match;
+        } else if (task) {
           /* 任务已经在 ⓪/②/③ 里取好了（交接上下文 / 页面身份反查 / 运行态 record_id），这里只补 on_match */
           if (!hit.record_id && task.record_id) hit.record_id = task.record_id;
           UI.appendLog({ t: Date.now(), level: 'info',
