@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.37
+// @version      0.9.38
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,10 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.38：①补 0.9.37 的漏：record_optional 没写进命中对象（fire() 判了但 hit 里没有），
+// 声明了等于没声明；②nav_after.until_visible —— 点了「登录」后如果页面**不跳转**而是弹出
+// 改密弹层，命中该元素就立刻结束等待，不再空耗 wait_ms（真机 2026-11-13 17:49 白等 4.8s）。
 //
 // 0.9.37：trigger.record_optional —— 场景声明「不需要记录」时，地址里没有 recordId 也照常执行
 // （不取数、不回写）。用于收尾类场景（退出登录 + 关页）：结果页 approve-result 的地址里
@@ -1617,7 +1621,8 @@
             /* 轮询而不是固定睡 1500ms：退出登录要整页崩到 CAS 登录页，实测常见 2~3s，
              * 固定时长会把「慢」误判成「没跳」，进而回滚续跑状态、把流程掐在退出这一步。 */
             const navMs = Number(navA.wait_ms) > 0 ? Number(navA.wait_ms) : 3000;
-            const navDeadline = Date.now() + navMs;
+            const navT0 = Date.now();
+            const navDeadline = navT0 + navMs;
             /* confirm:"leave"（0.9.31）：只要地址**离开当前页**就算这一跳成立，不等最终落点。
              * 为什么需要——2026-11-12 16:09 真机：华为「登录」是一串整页跳转
              * （ads → oauth-login → id1 CAS → ads），中间页的地址永远不含最终落点，
@@ -1626,14 +1631,36 @@
              * 声明 leave 后，一检测到地址变化就返回，运行态原样留给落地页；
              * 落点是否正确仍由 navExpect.url_contains 在落地页二次校验，不会把错误页认成落点。 */
             const leaveOnly = navA.confirm === 'leave';
-            let moved = false, urlOk = false;
+            /* 0.9.38：until_visible —— 「登录后可能不跳转、而是弹一个改密弹层」这类路径的提前出口。
+             * 声明后轮询里顺带判一次可见性，命中就立即结束本步（不等满 wait_ms）。
+             * 为什么要它：首次登录的改密弹层出现在**同一页**，S4 的 4s 一直在等一个不会来的跳转，
+             * 真机 2026-11-13 17:49 白等 4.8s；弹层其实早就出来了。 */
+            const navUntil = String(navA.until_visible || '');
+            let navSettled = false, moved = false, urlOk = false;
             do {
               await sleep(250);
               moved = String(location.href) !== hrefB;
               urlOk = leaveOnly ? true : (!navA.url_contains || String(location.href).indexOf(navA.url_contains) >= 0);
               if (moved && urlOk) break;
+              if (navUntil) {
+                try {
+                  const rs = document.evaluate(navUntil, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                  for (let i = 0; i < rs.snapshotLength; i++) {
+                    const nn = rs.snapshotItem(i);
+                    if (nn && nn.nodeType === 1 && ENGINE.uiIsVisible(nn)) { navSettled = true; break; }
+                  }
+                } catch (e) { /* 选择器写错不该改变跳转判定 */ }
+                if (navSettled) break;
+              }
             } while (Date.now() < navDeadline);
             if (!(moved && urlOk)) {
+              if (navSettled) {
+                /* 与 soft 分支同样处理：回滚续跑标记（本页不会跳走），按声明继续下一步。 */
+                if (opts.onNavAfter) opts.onNavAfter(false);
+                log('页面已进入弹层状态（nav_after.until_visible 命中），不再等跳转，用时 ' +
+                  (Date.now() - navT0) + 'ms');
+                return;
+              }
               /* soft：这一次跳转不是硬门禁，确认不了就继续往下走。
                * 用在「退出登录」这类地方——没跳成功也要接着进下一环节（下一环节本来就要重新
                * 输账号密码），卡在这里反而让整条链停住。回滚续跑标记，避免留下一个永远等不到
@@ -1987,7 +2014,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.37',
+    RUNNER_VERSION: '0.9.38',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3645,6 +3672,9 @@
           script_id: s.script_id, name: s.name, record_id: rid,
           record_id_from_pend: ridFromPend,
           record_id_deep: (tr.record_id_deep === true),
+          /* record_optional（0.9.38）：场景不需要记录（收尾类），命中后不取数、不回写。
+           * 0.9.37 漏了这一个字段（fire() 里判了、命中对象里没带），等于声明了也不生效。 */
+          record_optional: (tr.record_optional === true),
           on_match: tr.on_match || 'fill',
           redirect_to: tr.redirect_to || '',
           /* 页面身份入口（0.9.33）：地址里没有 recordId 时，允许 spec 声明「从页面哪个元素读出业务身份
