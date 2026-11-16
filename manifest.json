@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.45",
+  "version": "0.9.46",
   "file": "mas-runner.user.js",
-  "sha256": "5a8f10339a0def22c7a0aa5c70a8f47b70e14c6997be17e35cf682103f72913e",
-  "bytes": 474209,
-  "published_at": "2026-11-13T20:07:59+08:00",
+  "sha256": "12894d6145092e035c22efa103493979ae60607ff80c507edb3cdb33f19dff06",
+  "bytes": 478288,
+  "published_at": "2026-11-16T14:41:29+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "runner 0.9.45: 步骤时间线跨标签页/跨场景对齐（共享步骤清单 + 1.5s 回放）"
+  "notes": "runner 0.9.46: 跑完立刻回写（修复收尾场景抢占导致最终状态丢失）+ /result 回包解析"
 }

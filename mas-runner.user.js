@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.45
+// @version      0.9.46
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,15 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.46：**跑完立刻回写**。最终回写原来只由「发起页轮询器」（1.5s 一拍）消费 final 触发，
+// 而成功路径把 final 留在运行态里等它；下一个场景（收尾·退出登录）0.3s 后就启动，
+// runTask 一进来 RunState.set(running) 就把还没被消费的 final 冲掉 —— 真机 2026-11-16 14:29
+// 3C 提交成功后「开户状态=已完成」永远没写进表。现在：①本页跑完当场 pushTaskResult（仍登记在
+// _pendingWrites，下一场景的 drainWrites 会等它落表再动页面）；②runTask 起跑前再兜一刀
+// settlePreviousFinal，把任何还没写的 final 补掉。
+// 顺带修掉回包解析：服务端 /result 是 `{ ok, updated:{ written:[...] } }`，客户端一直读
+// `wr.written`（永远 undefined）——于是「✓ 局部回写完成：」后面永远空白、字段核对也从没生效过。
 //
 // 0.9.45：步骤时间线真的跟着「在跑的那个标签页」走。0.9.43 只把**终态**写进共享存储，
 // 且观察页必须自己渲染过同一份 spec 才有行可画——真机现场是「这页看着 3C、实际在另一页跑」，
@@ -1395,7 +1404,9 @@
         if (typeof opts.onWriteback !== 'function') throw new Error('E_SPEC writeback 未接线（引擎没有回写通道）');
         log('局部回写 ' + Object.keys(out).join(',') + '（后台写，不阻塞后续动作）');
         opts.onWriteback(out).then(function (wr) {
-          log('✓ 局部回写完成：' + ((wr && wr.written) || []).join(','));
+          const wl = wrWritten(wr);
+          log('✓ 局部回写完成：' + ((wl && wl.join(',')) ||
+            ((wl === null) ? '（服务端未回报字段名）' : '（服务端没写任何列）')));
         }).catch(function (e) {
           log('⚠ 局部回写失败：' + ((e && e.message) || e) + '（不影响后续填写）');
         });
@@ -2070,7 +2081,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.45',
+    RUNNER_VERSION: '0.9.46',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4762,6 +4773,8 @@
   UI.runTask = async function (task, btn) {
     if (UI._running) return;
     UI._running = true;
+    /* 0.9.46：上一轮的结果若还没写进表，先补写（新的一轮马上会把运行态整个覆盖掉）。 */
+    if (UI.settlePreviousFinal) UI.settlePreviousFinal();
     /* 0.9.40：上一条流程的 final 回写可能还在路上（典型：提交完成 → 收尾场景同秒启动）。
      * 不等它就开始新流程，最坏结果是 0.5s 后整页跳转把请求打断 → 表里状态没更新、也没有报错。 */
     await UI.drainWrites(90000);
@@ -5283,6 +5296,21 @@
     if (!declared || !Array.isArray(written) || !written.length) return [];
     return declared.filter(function (k) { return written.indexOf(k) < 0; });
   }
+  /* /result 的回包形状是 `{ ok, me, updated:{ record_id, written:[...] } }`（服务端 0.6.x）。
+   * 0.9.46 之前客户端读的是 `wr.written` —— 永远 undefined，于是：
+   *   ①「✓ 局部回写完成：」后面永远空白（11-13~11-16 每条日志都这样，看着像没写）；
+   *   ② 字段核对永远拿不到真实结果，「写了哪几列」只能靠人去看表。
+   * 返回 null = 服务端没回报这个字段（无法判断，按「已处理」放行）；[] = 明确一个字段都没写。 */
+  function wrWritten(wr) {
+    if (!wr) return null;
+    const u = (wr.updated && typeof wr.updated === 'object') ? wr.updated : wr;
+    return Array.isArray(u.written) ? u.written : null;
+  }
+  function wrWrote(wr) {
+    const wl = wrWritten(wr);
+    return wl === null ? true : wl.length > 0;
+  }
+
   function warnMissingFields(declared, written, tag) {
     const miss = wbMissing(declared, written);
     if (!miss.length) return;
@@ -5362,14 +5390,14 @@
             const wr = await writeWithRetry(localPayload(payload));
             pwDel(task.record_id, task.script_id);   // 真写成功才出队（只删自己这一份）
             markWbOk(task.record_id);
-            const wrote = !wr || !Array.isArray(wr.written) || wr.written.length > 0;
+            const wrote = wrWrote(wr);
             UI.appendLog({
               t: Date.now(), level: 'ok',
               msg: (wrote ? '✅ 后台回写完成（上报状态=' + (ok ? '成功' : '失败 ' + payload.error_type) + '）'
                 : '本场景该分支声明不回写（业务表无对应字段），已跳过写入') +
                 '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）',
             });
-            warnMissingFields(wbDeclared(st, ok), (wr && wr.written) || [], '回写');
+            warnMissingFields(wbDeclared(st, ok), wrWritten(wr) || [], '回写');
             if (!UI._running) UI.renderTasks();
             return { written: true, skipped: !wrote, background: true, msg: '' };
           } catch (e) {
@@ -5399,7 +5427,7 @@
         /* 服务端可能「按声明故意不写」：例如 writeback.fail 声明为空对象（业务表没有失败态字段），
          * 它返回 written: []。这时候打印「已回写成功」是假的——表里一个字段都没动。
          * 业务上两者差别很大：真写了才会看到「开户状态」变化，没写就得人工去表里补。 */
-        const wrote = !wr || !Array.isArray(wr.written) || wr.written.length > 0;
+        const wrote = wrWrote(wr);
         UI.appendLog({
           t: Date.now(), level: 'ok',
           /* 文案歧义修正：原先写「✅ 已回写飞书：失败」——「失败」到底是「回写失败」还是
@@ -5411,7 +5439,7 @@
         });
         if (!UI._running) UI.renderTasks();
         /* 字段级核对：写了几个、少了哪几个，当场说清（见 wbDeclared 上方注释） */
-        warnMissingFields(wbDeclared(st, ok), (wr && wr.written) || [], '回写');
+        warnMissingFields(wbDeclared(st, ok), wrWritten(wr) || [], '回写');
         /* written 的语义是「这次回写已经处理完、收尾不要再发一次」，不是「字段真的写了」。
          * 空分支（noop）也算处理完——否则收尾会再发一遍请求。是否真写用 skipped 表达。 */
         return { written: true, skipped: !wrote, msg: '' };
@@ -5447,6 +5475,25 @@
     job.finally(function () { try { UI._pendingWrites.delete(job); } catch (e) {} });
     return job;
   }
+  /* 0.9.46：新场景起跑前，先把本页上一轮**还没被消费**的 final 写掉。
+   * final 原本只由「发起页轮询器」每 1.5s 消费一次，而新场景一启动就会 RunState.set(running)
+   * 把它整个冲掉。真机 2026-11-16 14:29：3C 14:29:35 提交成功，收尾场景 0.3s 后就启动，
+   * 「开户状态=已完成」再也没机会写进表。这里是起跑线前的最后一道兜底（doRun 里已改为立刻回写）。 */
+  UI.settlePreviousFinal = function () {
+    try {
+      const s = RunState.get();
+      if (!s || s.phase !== 'done' || !s.final) return false;
+      if (s.final.consumed || s.final.written || s.final.manual) return false;
+      if (!s.task || !s.task.record_id) return false;
+      s.final.consumed = true;
+      s.final.written = true;
+      RunState.set(s);
+      UI.appendLog({ t: Date.now(), level: 'warn',
+        msg: '上一轮（' + (s.final.specId || '?') + '）的结果还没写进表就被新流程接管：先补写记录 ' + s.task.record_id });
+      pushTaskResult(s, !!s.final.ok, s.final.outputs || {}, { code: s.final.error, message: s.final.message });
+      return true;
+    } catch (e) { return false; }
+  };
   /* 0.9.40：跳转/开新场景前，把「在途回写」等完（最多 ms 毫秒）。
    * 真机 2026-11-13 18:04：P3 的 final 回写 18:04:56 发出；收尾场景同秒启动，旧版 S1 等 15s
    * 等不到就导航登出 —— 请求还在飞就被整页卸载打断，既没写进表、也没进待写队列（失败分支
@@ -5494,7 +5541,7 @@
         okN++;
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
         /* 补写成功 ≠ 字段补齐：模板取不到值时服务端照样 200 却跳过该字段 */
-        warnMissingFields(expect, (wr && wr.written) || [], '补写');
+        warnMissingFields(expect, wrWritten(wr) || [], '补写');
       } catch (e) {
         left.push(p);
         UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 补写仍失败：' + body.record_id + ' · ' + e.message });
@@ -5541,7 +5588,7 @@
         pwDel(body.record_id, p._script);
         markWbOk(body.record_id);
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 自动补写成功：' + body.record_id });
-        warnMissingFields(expect, (wr && wr.written) || [], '自动补写');
+        warnMissingFields(expect, wrWritten(wr) || [], '自动补写');
       } catch (e) {
         UI.appendLog({ t: Date.now(), level: 'warn',
           msg: '自动补写没成功（' + String((e && e.message) || e) + '）：结果还在本机队列，' +
@@ -6333,6 +6380,17 @@
         if (stc.wbDone) delete stc.wbDone;
         RunState.set(stc);
         CloseSig.mark(stc.runId);   // 广播收摊：链条上所有辅助页（含上游的子客门户）自毁，发起页留
+        /* 0.9.46：本页就是发起页 → **立刻**回写，不再等 1.5s 的发起页轮询器。
+         * 真机 2026-11-16 14:29:35：3C 提交成功（=== 执行完成 ===），下一个收尾场景 0.3s 后就启动；
+         * runTask 一进来就用 RunState.set(running) 把还没被消费的 final 整个冲掉，
+         * 轮询器再也没看到它 → 「开户状态=已完成」永远没写进表（表里一直停在旧状态）。
+         * 回写仍然登记在 _pendingWrites 里：下一个场景 runTask 的 drainWrites 会等它落表再动页面。 */
+        if (role === 'origin' && stc.task && stc.task.record_id && !stc.final.written) {
+          stc.final.written = true;
+          stc.final.consumed = true;   // 本页已经处理过：轮询器别再重复播报/回写
+          RunState.set(stc);
+          pushTaskResult(stc, true, stc.final.outputs || {}, null);
+        }
         if (role !== 'origin') {
           UI.appendLog({ t: Date.now(), level: 'info', msg: '⏪ 本页为辅助标签页，2 秒后自动关闭；结果将回到发起页展示' });
           setTimeout(function () { try { window.close(); } catch (e) {} }, 2000);
