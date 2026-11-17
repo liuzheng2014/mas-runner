@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.48
+// @version      0.9.49
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.49：**回写先入队、再发请求**。以前只有「失败分支」才落本机队列：如果请求还在飞时
+//   页面被关/跳转，失败分支可能来不及跑，这条结果就丢了（表里保持旧状态，只在日志里留一句
+//   「未完成」）。现在前台写也先 pwAdd 再发，成功才 pwDel；关页/断网/跳转都不可能丢结果，
+//   最多是下次打开 ADS 页面时自动补写。成功路径同时 markWbOk，让「失败不许覆盖成功」的
+//   跨页保护对前台写也生效。
 //
 // 0.9.48：回写两块修正。
 //   ① 收尾场景（record_optional，退出登录并关页）起跑前不再等满 90s 回写——它后面没有任何步骤
@@ -2096,7 +2102,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.48',
+    RUNNER_VERSION: '0.9.49',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -5246,6 +5252,11 @@
   // 执行完成 → 回写飞书（按 record_id 更新，服务端二次校验归属）
   /* 回写失败不丢结果：落本地待办队列，服务恢复后一键重试（本机验证服务常被关掉） */
   const PENDW_KEY = 'masr_pending_writes_v1';
+  /* 正在由**本页**发送的队列项（内存，页面一关就没了）。
+   * 0.9.49 起前台写也先入队再发，如果 autoFlushPending 在同一页看到这条，
+   * 会再发一份一模一样的请求（同 payload 幂等，但会多占一条连接、干扰 1254607 重试计数）。
+   * 页面万一崩了，这个 Set 随内存消失，下一个页面照常补写——不会因此漏。 */
+  const _inflightQ = new Set();
   function pwList() { try { return JSON.parse(GM_getValue(PENDW_KEY, '[]')) || []; } catch (e) { return []; } }
   function pwSave(arr) { try { GM_setValue(PENDW_KEY, JSON.stringify(arr.slice(-100))); } catch (e) {} } // 上限 100：批量一次 50 条，留 20 会丢掉最早的结果
   /* 队列项的主键 = 「场景 + 记录」，不是只用记录。
@@ -5481,6 +5492,7 @@
       if (opt && opt.background) {
         payload._expect_fields = wbDeclared(st, ok) || undefined;
         pwAdd(payload);   // 键含场景：别把别的场景还没写的那份顶掉          // 先落盘：这一步成功了，后面无论怎么断都不会丢
+        _inflightQ.add(pwKey(payload));
         UI.appendLog({ t: Date.now(), level: 'info',
           msg: '结果已存入本机队列，后台开始回写（不阻塞流程，页面继续往下走）' });
         const bgJob = (async function () {
@@ -5515,14 +5527,26 @@
         /* 0.9.40：登记「真的在途」的写，供 drainWrites 在跳转前等 */
         if (!UI._pendingWrites) UI._pendingWrites = new Set();
         UI._pendingWrites.add(bgJob);
-        bgJob.finally(function () { try { UI._pendingWrites.delete(bgJob); } catch (e) {} });
+        bgJob.finally(function () {
+          try { UI._pendingWrites.delete(bgJob); } catch (e) {}
+          _inflightQ.delete(pwKey(payload));
+        });
         /* 对外语义仍是「这条已经处理了、收尾别再发一次」；是否真写成功由 background/queued 表达 */
         return Promise.resolve({ written: true, queued: true, background: true, job: bgJob, msg: '' });
       }
+      /* 0.9.49：**先入队、再发请求**（前台写也一样）。
+       * 以前只有失败分支才 pwAdd，如果请求还在飞时页面被关/跳转，失败分支可能来不及跑，
+       * 这条结果就丢了（表里保持旧状态）。先落盘只多一次本地写，换来「怎么关都不丢」。
+       * 成功后再出队；失败时队列里本来就有，catch 里的 pwAdd 只是刷新 queued_at。 */
+      payload._expect_fields = wbDeclared(st, ok) || undefined;
+      pwAdd(payload);
+      _inflightQ.add(pwKey(payload));
       const t0 = Date.now();
       UI.appendLog({ t: t0, level: 'info', msg: '→ 正在回写飞书（' + task.record_id + '）…' });
       try {
         const wr = await writeWithRetry(payload);
+        pwDel(task.record_id, task.script_id);   // 真写成功才出队
+        markWbOk(task.record_id);                // 供「失败不许覆盖成功」的跨页判定
         /* 服务端可能「按声明故意不写」：例如 writeback.fail 声明为空对象（业务表没有失败态字段），
          * 它返回 written: []。这时候打印「已回写成功」是假的——表里一个字段都没动。
          * 业务上两者差别很大：真写了才会看到「开户状态」变化，没写就得人工去表里补。 */
@@ -5562,6 +5586,10 @@
         if (!UI._running) UI.renderTasks();
         updResultWarn(pwList().length);
         return { written: false, msg: msg };
+      } finally {
+        /* 本次尝试结束（成或败）：允许同一页的 autoFlush / 手动重试再次认领这条。
+         * 失败时它已经留在队列里，下一次补写由下一页或用户触发。 */
+        _inflightQ.delete(pwKey(payload));
       }
     })();
     // 登记 job：批量收尾用 UI._writeJobs[record_id] 直接 await 到飞书接口的真实返回
@@ -5625,7 +5653,8 @@
   }
 
   UI.retryWrites = async function (btn) {
-    const all = pwList();
+    /* 本页正在发的那条不重复发（否则一次点击会打出两份一样的请求） */
+    const all = pwList().filter(function (p) { return p && !_inflightQ.has(pwKey(p)); });
     if (!all.length) { UI.renderTasks(); return; }
     if (btn) { btn.disabled = true; btn.textContent = '重试中…'; }
     const left = [];
@@ -5661,7 +5690,8 @@
      * 和下一段流程可以并行。反倒是跳过之后没人再触发，队列会一直躺到下次页面加载。 */
     if (_autoFlush || !SVC.base()) return;
     const all = pwList().filter(function (p) {
-      return p && p.record_id && (Date.now() - (p.queued_at || 0)) < 30 * 60 * 1000;
+      return p && p.record_id && (Date.now() - (p.queued_at || 0)) < 30 * 60 * 1000 &&
+        !_inflightQ.has(pwKey(p));   // 本页正在发的不要重复发（0.9.49）
     });
     if (!all.length) {
       /* 老结果不硬撞是对的（后端没起来时一条条超时只会更慢），但**不能静默**：
