@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.51
+// @version      0.9.52
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.52：人工确认弹窗打开时可以用滚轮查看下面的表单。遮罩是整屏 fixed、自身不可滚，
+//   以前滚轮落在它身上，表单自己的滚动容器不动，人在提交前没法核对。现在把滚轮转发给
+//   鼠标下方的真实元素（临时把遮罩设为 pointer-events:none 做命中测试），滚它最近的
+//   可滚动祖先；点击仍然被遮罩挡住，不会误点到下面的按钮。弹窗里加了一行提示。
+//   同版顺带：/bootstrap 返回 5xx 空壳时也退回 /tasks（以前只认 404），避免待办列表整个空掉。
 //
 // 0.9.51：日期区间控件「选完回读」改为轮询 + 重点一次结束日。2026-11-17 14:28 真机
 //   S18 报「选完回读不符：控件里是「」~「」」——点完结束日期后组件是异步把值写回 input 的，
@@ -836,12 +842,38 @@
           '<div style="background:#fff;color:#1f2329;max-width:520px;border-radius:10px;padding:18px 20px;box-shadow:0 10px 40px rgba(0,0,0,.25)">' +
           '<div style="font-size:16px;font-weight:600;margin-bottom:8px">' + esc(o.title || '需要你确认') + '</div>' +
           '<div style="white-space:pre-wrap;color:#3d4757">' + esc(o.message || '') + '</div>' +
+          '<div style="margin-top:10px;font-size:12px;color:#8f959e">可以用滚轮查看下面的页面；点按钮才会继续</div>' +
           '<div style="margin-top:16px;text-align:right">' +
           (o.cancel ? ('<button id="masr-gate-cancel" style="padding:6px 18px;margin-right:10px;border:1px solid #d0d3d9;border-radius:6px;background:#fff;color:#3d4757;font-size:14px;cursor:pointer">' +
             esc(o.cancel) + '</button>') : '') +
           '<button id="masr-gate-ok" style="padding:6px 18px;border:0;border-radius:6px;background:#1664ff;color:#fff;font-size:14px;cursor:pointer">' +
           esc(o.button || '我知道了') + '</button></div></div>';
         document.body.appendChild(wrap);
+        /* 0.9.52：弹窗打开时允许用滚轮查看下面的表单。
+         * 遮罩是整屏 fixed、自身没有可滚动内容，滚轮落在它身上，里面那个滚动容器
+         * （华为开户表单不是靠 document 滚，而是自己的 div）就不动。
+         * 做法：拦下滚轮 → 临时让遮罩不参与命中测试 → 取鼠标下方的真实元素 →
+         * 滚它最近的滚动祖先；找不到可滚动祖先才滚 window。
+         * 只转发「滚轮」，点击仍然被遮罩挡住（不会误点到下面的提交按钮）。 */
+        wrap.addEventListener('wheel', function (e) {
+          e.preventDefault();
+          let el = null;
+          const prev = wrap.style.pointerEvents;
+          wrap.style.pointerEvents = 'none';
+          try { el = document.elementFromPoint(e.clientX, e.clientY); } catch (err) {}
+          wrap.style.pointerEvents = prev || '';
+          if (!el) return;
+          let n = el;
+          while (n && n !== document.documentElement) {
+            const st = window.getComputedStyle(n);
+            if (/(auto|scroll)/.test(st.overflowY) && n.scrollHeight > n.clientHeight + 1) {
+              n.scrollTop += e.deltaY;
+              return;
+            }
+            n = n.parentElement;
+          }
+          window.scrollBy(0, e.deltaY);
+        }, { passive: false });
         wrap.querySelector('#masr-gate-ok').addEventListener('click', function () {
           try { wrap.parentNode && wrap.parentNode.removeChild(wrap); } catch (e) {}
           resolve({ confirmed: true, at: Date.now() });
@@ -2136,7 +2168,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.51',
+    RUNNER_VERSION: '0.9.52',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4311,7 +4343,9 @@
       return { tasks: j.tasks || { total: 0, items: [] }, spec: j.spec || null, version: j.version || '' };
     }).catch(function (e) {
       const m = String((e && e.message) || '');
-      if (/E_SVC 40[45]|E_ROUTE|E_SVC_PARSE/.test(m)) return fallback();   // 老服务端
+      /* 老服务端没有 /bootstrap（404/E_ROUTE）；某些代理会回 5xx 空壳。这两类都退回 /tasks，
+       * 不能因为一次合并请求失败就让待办列表整个空掉。 */
+      if (/E_SVC \d{3}|E_ROUTE|E_SVC_PARSE/.test(m)) return fallback();
       throw e;
     });
   };
