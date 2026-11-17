@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.46
+// @version      0.9.47
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,14 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.47：少跳几次。服务端 0.7.0 把 spec 放进 KV（不再每次扫飞书表），Runner 这边配套：
+//   ① 场景页改用 /bootstrap：一次拿齐 me + 场景 + 该场景 spec + 待办，并把 spec 直接落本地缓存，
+//      于是点「执行」时不再有那次 0.5~14s 的 /spec（老服务端没有该路由时自动退回 /tasks）；
+//   ② /task 回包自带 spec 正文（服务端 0.7.0），触发型流程同样省一跳；
+//   ③ /spec 带 if_none_match：内容没变只回几十字节，不再重传整份 spec；
+//   ④ 预检后端从「90 秒内成功过就跳过」放宽到 10 分钟，批量执行的每条也不再打 /health；
+//   ⑤ 预热从「每 6 秒一枪、最长 120 秒」收敛为起跑时一枪（产物层上线后飞书冷表只剩回写那一次）。
 //
 // 0.9.46：**跑完立刻回写**。最终回写原来只由「发起页轮询器」（1.5s 一拍）消费 final 触发，
 // 而成功路径把 final 留在运行态里等它；下一个场景（收尾·退出登录）0.3s 后就启动，
@@ -2081,7 +2089,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.46',
+    RUNNER_VERSION: '0.9.47',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4152,7 +4160,16 @@
   };
 
   SVC.bind = async function () {
-    const me = (await SVC.call('GET', '/me')).me;
+    /* v0.9.47：绑定成功顺手把场景列表带回来（/bootstrap 一次回包），省掉面板首屏那次 /scenes。
+     * 老服务端没有该路由 → 退回 /me，行为不变。 */
+    let j = null;
+    try { j = await SVC.call('GET', '/bootstrap', { tasks: '0' }); } catch (e) { j = null; }
+    const me = (j && j.me) || (await SVC.call('GET', '/me')).me;
+    if (j && Array.isArray(j.scenes)) {
+      const c = { at: Date.now(), list: j.scenes };
+      SVC._sceneCache = c;
+      try { GM_setValue(SVC.SCENES_KEY, JSON.stringify(c)); } catch (e) {}
+    }
     GM_setValue(SVC.M_KEY, JSON.stringify(me));
     return me;
   };
@@ -4182,7 +4199,15 @@
     /* ticket_only（0.9.35）：只签回写票据，服务端不读业务表。参数来自交接上下文时用它。 */
     if (opts && opts.ticket_only) q.ticket_only = '1';
     return SVC.call('GET', '/task', q).then(function (j) {
-      return j.item;
+      /* 服务端 0.7.0 起 /task 回包带 spec 正文：直接落缓存，触发型流程少一次 /spec。 */
+      const it = j.item;
+      if (it && it.spec && it.spec_version) {
+        SVC.specCache.put(scriptId, {
+          spec_id: scriptId, version: it.spec_version, status: it.spec_status || '',
+          spec: it.spec, sha256: it.spec_sha256 || '',
+        });
+      }
+      return it;
     });
   };
   /* 单条取数（页面身份入口，0.9.33）：地址里没有 recordId 时，用页面上读到的业务身份（账户ID/客仓ID）
@@ -4192,13 +4217,56 @@
     if (!field) return Promise.reject(new Error('E_SPEC 场景未声明 identity.lookup_field'));
     if (!value) return Promise.reject(new Error('E_PARAM 页面上读不到身份值（' + field + '）'));
     return SVC.call('GET', '/task', { script_id: scriptId, lookup_field: field, lookup_value: value }).then(function (j) {
-      return j.item;
+      const it = j.item;
+      if (it && it.spec && it.spec_version) {
+        SVC.specCache.put(scriptId, {
+          spec_id: scriptId, version: it.spec_version, status: it.spec_status || '',
+          spec: it.spec, sha256: it.spec_sha256 || '',
+        });
+      }
+      return it;
     });
   };
   SVC.spec = function (scriptId, opts) {
     const id = scriptId || SVC.scriptFor();
     if (!id) return Promise.reject(new Error('E_SCENE 未能确定场景：该行没有 script_id，且当前不止一个场景'));
-    return SVC.call('GET', '/spec', { script_id: id }, null, opts && opts.timeout ? { timeout: opts.timeout } : null);
+    const q = { script_id: id };
+    const c = SVC.specCache.get(id);
+    /* v0.9.47：带上本地内容的 hash。服务端 0.7.0 起，hash 没变只回 {not_modified:true}，
+     * 不再把整份 spec 重传一遍；版本对不上时 hash 自然不同，照常回正文。 */
+    if (c && c.sha256) q.if_none_match = c.sha256;
+    const o = opts && opts.timeout ? { timeout: opts.timeout } : null;
+    return SVC.call('GET', '/spec', q, null, o).then(function (j) {
+      if (j && j.not_modified && c) {
+        return { spec_id: id, version: j.version || c.version, status: j.status || c.status || '',
+                 sha256: c.sha256, spec: c.spec, not_modified: true };
+      }
+      return j;
+    });
+  };
+
+  /* 场景页取数（v0.9.47）：一次拿齐 me + 场景 + 该场景 spec + 待办。
+   * spec 顺手落本地缓存 → 点「执行」时 runTask 直接命中，不再有那次 0.5~14s 的 /spec。
+   * 老服务端没有 /bootstrap（404）时自动退回 /tasks，行为与上一版一致。 */
+  SVC.sceneBundle = function (scriptId) {
+    const fallback = function () {
+      return SVC.tasks(scriptId).then(function (t) { return { tasks: t, spec: null, version: '' }; });
+    };
+    return SVC.call('GET', '/bootstrap', { script_id: scriptId }).then(function (j) {
+      if (j.me) { try { GM_setValue(SVC.M_KEY, JSON.stringify(j.me)); } catch (e) {} }
+      if (j.spec && j.version) {
+        SVC.specCache.put(scriptId, {
+          spec_id: scriptId, version: j.version, status: j.spec_status || '',
+          spec: j.spec, sha256: j.sha256 || '',
+        });
+      }
+      if (!j.tasks && j.tasks_error) throw new Error(j.tasks_error);
+      return { tasks: j.tasks || { total: 0, items: [] }, spec: j.spec || null, version: j.version || '' };
+    }).catch(function (e) {
+      const m = String((e && e.message) || '');
+      if (/E_SVC 40[45]|E_ROUTE|E_SVC_PARSE/.test(m)) return fallback();   // 老服务端
+      throw e;
+    });
   };
 
   /* ---------- spec 本地缓存（v0.8.1） ----------
@@ -4224,7 +4292,8 @@
       if (!id || !s || !s.spec) return;
       try {
         GM_setValue(SPEC_KEY + id, JSON.stringify({
-          spec_id: s.spec_id || id, version: s.version, status: s.status || '', spec: s.spec, ts: Date.now(),
+          spec_id: s.spec_id || id, version: s.version, status: s.status || '',
+          sha256: s.sha256 || '', spec: s.spec, ts: Date.now(),
         }));
       } catch (e) { /* 存不下不影响本次执行 */ }
     },
@@ -4268,12 +4337,10 @@
   };
   SVC.warmStart = function (ms, scriptId) {
     if (!SVC.base()) return null;
+    /* v0.9.47：只打一枪。以前是每 6 秒一枪、最长 120 秒——产物层上线后 spec 不再走飞书，
+     * 冷表只剩回写那一次，反复预热只是在和真正的回写抢连接。 */
     SVC.warm(scriptId);
-    const rec = { iv: null, to: null };
-    rec.iv = setInterval(function () { SVC.warm(scriptId); }, 6000);
-    rec.to = setTimeout(function () { clearInterval(rec.iv); _warmTimers.delete(rec); }, ms || 90000);
-    _warmTimers.add(rec);
-    return rec.iv;
+    return null;
   };
 
   SVC.bindMeta = function () { return SVC.call('GET', '/bind/meta'); };
@@ -4649,7 +4716,10 @@
       document.getElementById('masr-back-picker').addEventListener('click', renderScenePicker);
       const list = document.getElementById('masr-task-list');
       try {
-        const j = await SVC.tasks(sid);
+        /* v0.9.47：/bootstrap 一次拿齐「场景 + 该场景 spec + 待办」，spec 顺手进本地缓存，
+         * 点「执行」时就不用再等一次 /spec。 */
+        const bundle = await SVC.sceneBundle(sid);
+        const j = bundle.tasks;
         if (!j.total) {
           list.innerHTML = '<div style="font-size:11px;color:#8f959e">' + esc(view.emptyHint) + '</div>';
           return;
@@ -4831,7 +4901,7 @@
          * 判定窗口 90s（跨页也认：写进 GM 存储，整页跳转后仍然有效）。
          * 不写日志：这是「省掉一次重复探测」，不是业务事件；写了反而让每单多一行噪音、
          * 把 golden 基线全部打花。（真连不上时仍然会 fatal，行为和以前一致。） */
-        const chanFresh = SVC.chanFreshMs() < 90000;
+        const chanFresh = SVC.chanFreshMs() < 600000;   // 10 分钟：产物层上线后 /health 只剩「第一次开跑」才有意义
         if (!chanFresh) {
           const tPing = Date.now();
           try { await SVC.ping(); }
@@ -5122,8 +5192,11 @@
       write_token: task.write_token || '',
     };
     {
-      try { await SVC.ping(); }
-      catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），中止批量' }); throw e; }
+      /* v0.9.47：10 分钟内这条通道成功过就不再探（批量里每条都打一次 /health 纯属浪费）。 */
+      if (SVC.chanFreshMs() >= 600000) {
+        try { await SVC.ping(); }
+        catch (e) { UI.appendLog({ t: Date.now(), level: 'fatal', msg: '后端连不上（' + e.message + '），中止批量' }); throw e; }
+      }
     }
     const scene = SVC.scriptFor(UI.currentTask);
     let s = specCache && specCache.scene === scene ? specCache.s : null;
