@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.50
+// @version      0.9.51
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,11 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.51：日期区间控件「选完回读」改为轮询 + 重点一次结束日。2026-11-17 14:28 真机
+//   S18 报「选完回读不符：控件里是「」~「」」——点完结束日期后组件是异步把值写回 input 的，
+//   固定等 250ms 偶尔读早；也可能第一次点结束日被 Vue 重渲染吞掉。现在轮询最多 2.5s，
+//   仍不对就重开面板、重新翻到目标月、重点一次结束日（幂等），再不行才报错。
 //
 // 0.9.50：**把最终回写交给服务端重试**。每条结果带一个 write_id（幂等键）：
 //   ① /result 同步写失败时，服务端把整份写入计划放进 KV，返回 202；Cron 每分钟重试，
@@ -1174,15 +1179,37 @@
     log('起点已选：' + o.from);
     await gotoMonth(p, to);
     clickDay(p, to);
-    await sleep(250);
 
-    const got = readRange();
-    if (!got) throw new Error('E_UI_PICKDATE 控件里找不到 .el-range-input（结构变了）');
-    const g0 = ENGINE.parseYmd(got[0]), g1 = ENGINE.parseYmd(got[1]);
     const same = function (a, b) { return a && b && a.y === b.y && a.m === b.m && a.d === b.d; };
-    if (!same(g0, from) || !same(g1, to)) {
+    const rangeOk = function (g) {
+      return !!g && same(ENGINE.parseYmd(g[0]), from) && same(ENGINE.parseYmd(g[1]), to);
+    };
+    /* 2026-11-17 真机：点完结束日回读是「」~「」——组件把值写回 input 是异步的，
+     * 固定等 250ms 偶尔读早；也可能第一次点结束日被 Vue 重渲染吞掉。
+     * 改成轮询 2.5s，仍不对就重开面板重点一次结束日（幂等），再不行才报错。 */
+    const waitRange = async function (ms) {
+      const t0 = Date.now();
+      let g = readRange();
+      while (Date.now() - t0 < ms) {
+        if (rangeOk(g)) return g;
+        await sleep(150);
+        g = readRange();
+      }
+      return g;
+    };
+    let got = await waitRange(2500);
+    if (!rangeOk(got)) {
+      log('首次选完回读不符（' + (got ? got.join(' ~ ') : '找不到输入框') + '），重开面板重点一次结束日期…');
+      p = await open();
+      await gotoMonth(p, to);
+      clickDay(p, to);
+      got = await waitRange(2500);
+    }
+
+    if (!got) throw new Error('E_UI_PICKDATE 控件里找不到 .el-range-input（结构变了）');
+    if (!rangeOk(got)) {
       throw new Error('E_UI_PICKDATE 选完回读不符：期望 ' + o.from + ' ~ ' + o.to
-        + '，控件里是「' + got[0] + '」~「' + got[1] + '」——组件没接受（受控组件只认面板点击）');
+        + '，控件里是「' + got[0] + '」~「' + got[1] + '」——组件没接受（受控组件只认面板点击；已重试一次）');
     }
     log('区间已写入控件：' + got[0] + ' ~ ' + got[1]);
     /* 收起面板：Escape → 仍开着就点空白处（面板是绝对定位，挡着后面的按钮会点空）。
@@ -2109,7 +2136,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.50',
+    RUNNER_VERSION: '0.9.51',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
