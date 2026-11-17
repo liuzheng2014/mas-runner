@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.49
+// @version      0.9.50
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,13 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.50：**把最终回写交给服务端重试**。每条结果带一个 write_id（幂等键）：
+//   ① /result 同步写失败时，服务端把整份写入计划放进 KV，返回 202；Cron 每分钟重试，
+//      页面关了/网断了都不用等下次打开 ADS 才补；
+//   ② 有了 write_id，POST 可以安全重发（服务端按 id 去重），客户端不再「写请求绝不重放」；
+//   ③ 收到 202 就出队并提示「已交给服务端」，不再报失败；本地队列只兜「一次都没送到」。
+//   客户端超时收到 30s、传输重试 1 次；服务端最坏 30s，超了转 202，不再死等 45s×2。
 //
 // 0.9.49：**回写先入队、再发请求**。以前只有「失败分支」才落本机队列：如果请求还在飞时
 //   页面被关/跳转，失败分支可能来不及跑，这条结果就丢了（表里保持旧状态，只在日志里留一句
@@ -2102,7 +2109,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.49',
+    RUNNER_VERSION: '0.9.50',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4322,7 +4329,9 @@
   };
   SVC.writeResult = function (payload) {
     // 45s：服务端对飞书是 15s 硬超时 + 重试一次，客户端预算必须比它大，否则会把"正在重试"误判成失败
-    return SVC.call('POST', '/result', null, payload, { timeout: 45000 });
+    /* 0.9.50：带 write_id 后 POST 可以安全重发——服务端按 id 去重，重发不会写两遍。
+     * 预算 30s + 一次换连接（服务端最坏 30s，超了它会转成 202 入队，客户端不必死等）。 */
+    return SVC.call('POST', '/result', null, payload, { timeout: 30000, retries: 1 });
   };
   /* 预热任务表：飞书侧对某张表的**第一次**访问很慢（实测 15~20s，热了 2s）。
    * 流程跑一趟要十几秒，正好用来把表捂热，等真回写时就是热路径。
@@ -5270,6 +5279,11 @@
     const sc = (script === undefined ? (p && p._script) : script) || '';
     return sc + '|' + rid;
   }
+  /* 0.9.50：一次结果一个幂等键。服务端按它去重，所以 POST 可以安全重发；
+   * 服务端同步写失败后也会带着它入队，Cron 重试成功即可。 */
+  function newWriteId() {
+    return 'w' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
   function pwAdd(payload) {
     const a = pwList();
     const k = pwKey(payload);
@@ -5322,7 +5336,9 @@
     return b;
   }
   async function writeWithRetry(payload, tries) {
-    tries = tries || 2;
+    /* 0.9.50：默认只在这里试 1 次——传输层重试已经交给 SVC.call（带 write_id 幂等），
+     * 再叠加会变成 4 次 × 45s。1254607 仍单独给两次机会（服务端也会就地重试）。 */
+    tries = tries || 1;
     let lastErr = null;
     let notReadyTries = 0;
     for (let i = 0; i < tries; i++) {
@@ -5411,6 +5427,13 @@
     const u = (wr.updated && typeof wr.updated === 'object') ? wr.updated : wr;
     return Array.isArray(u.skipped_fields) ? u.skipped_fields : [];
   }
+  /* 服务端 202：同步写没成，但写入计划已经落进服务端队列，Cron 会继续重试。
+   * 对客户端来说这条「已经交出去了」——可以出队、关页，不能再报「没写」。 */
+  function wrQueued(wr) {
+    if (!wr) return false;
+    const u = (wr.updated && typeof wr.updated === 'object') ? wr.updated : wr;
+    return !!u.queued;
+  }
 
   function warnMissingFields(declared, written, tag, skipped) {
     const sk = Array.isArray(skipped) ? skipped : [];
@@ -5479,6 +5502,9 @@
         runner_version: GV.RUNNER_VERSION,
         spec_version: st.specVersion || '',
       };
+      /* 幂等键：服务端据此去重（重发/入队重试都不会写两遍）。必须在入队前生成，
+       * 本地队列重试时会带着同一个 id。 */
+      payload.write_id = newWriteId();
       if (!ok) {
         payload.error_type = ENGINE.failReason(err);
         payload.error_message = (err && (err.message || err.code)) || '';
@@ -5501,6 +5527,13 @@
             const wr = await writeWithRetry(localPayload(payload));
             pwDel(task.record_id, task.script_id);   // 真写成功才出队（只删自己这一份）
             markWbOk(task.record_id);
+            if (wrQueued(wr)) {
+              const wq = (wr.updated && wr.updated.write_id) || payload.write_id;
+              UI.appendLog({ t: Date.now(), level: 'ok',
+                msg: '✅ 已交给服务端（同步写未完成，Cron 每分钟自动重试，write_id=' + wq + '）' });
+              if (!UI._running) UI.renderTasks();
+              return { written: true, queued: true, background: true, msg: '' };
+            }
             const wrote = wrWrote(wr);
             UI.appendLog({
               t: Date.now(), level: 'ok',
@@ -5547,6 +5580,14 @@
         const wr = await writeWithRetry(payload);
         pwDel(task.record_id, task.script_id);   // 真写成功才出队
         markWbOk(task.record_id);                // 供「失败不许覆盖成功」的跨页判定
+        if (wrQueued(wr)) {
+          const wq = (wr.updated && wr.updated.write_id) || payload.write_id;
+          UI.appendLog({ t: Date.now(), level: 'ok',
+            msg: '✅ 已交给服务端（同步写未完成，Cron 每分钟自动重试，write_id=' + wq + '）（' +
+              ((Date.now() - t0) / 1000).toFixed(1) + 's）' });
+          if (!UI._running) UI.renderTasks();
+          return { written: true, queued: true, msg: '' };
+        }
         /* 服务端可能「按声明故意不写」：例如 writeback.fail 声明为空对象（业务表没有失败态字段），
          * 它返回 written: []。这时候打印「已回写成功」是假的——表里一个字段都没动。
          * 业务上两者差别很大：真写了才会看到「开户状态」变化，没写就得人工去表里补。 */
@@ -5667,9 +5708,15 @@
       try {
         const wr = await writeWithRetry(body, 2);
         okN++;
-        UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
-        /* 补写成功 ≠ 字段补齐：模板取不到值时服务端照样 200 却跳过该字段 */
-        warnMissingFields(expect, wrWritten(wr) || [], '补写', wrSkipped(wr));
+        if (wrQueued(wr)) {
+          const wq = (wr.updated && wr.updated.write_id) || body.write_id || '';
+          UI.appendLog({ t: Date.now(), level: 'ok',
+            msg: '✅ 已交给服务端（Cron 自动重试，write_id=' + wq + '）：' + body.record_id });
+        } else {
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
+          /* 补写成功 ≠ 字段补齐：模板取不到值时服务端照样 200 却跳过该字段 */
+          warnMissingFields(expect, wrWritten(wr) || [], '补写', wrSkipped(wr));
+        }
       } catch (e) {
         left.push(p);
         UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 补写仍失败：' + body.record_id + ' · ' + e.message });
@@ -5716,8 +5763,14 @@
         const wr = await writeWithRetry(body, 1);
         pwDel(body.record_id, p._script);
         markWbOk(body.record_id);
-        UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 自动补写成功：' + body.record_id });
-        warnMissingFields(expect, wrWritten(wr) || [], '自动补写', wrSkipped(wr));
+        if (wrQueued(wr)) {
+          const wq = (wr.updated && wr.updated.write_id) || body.write_id || '';
+          UI.appendLog({ t: Date.now(), level: 'ok',
+            msg: '✅ 已交给服务端（Cron 自动重试，write_id=' + wq + '）：' + body.record_id });
+        } else {
+          UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 自动补写成功：' + body.record_id });
+          warnMissingFields(expect, wrWritten(wr) || [], '自动补写', wrSkipped(wr));
+        }
       } catch (e) {
         UI.appendLog({ t: Date.now(), level: 'warn',
           msg: '自动补写没成功（' + String((e && e.message) || e) + '）：结果还在本机队列，' +
