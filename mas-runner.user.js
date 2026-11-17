@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.47
+// @version      0.9.48
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,13 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.48：回写两块修正。
+//   ① 收尾场景（record_optional，退出登录并关页）起跑前不再等满 90s 回写——它后面没有任何步骤
+//      要读表，真机 2026-11-17 11:31 白等了 47s 才去点退出。现在最多等 5s；有记录的流程也从
+//      90s 收到 30s（结果先入本地队列，跳转打断会在下一页自动补写，等待只为省一次补写）。
+//   ② 服务端新增 writeback.guard（防止旧阶段把「已完成」改回上一阶段）后，被 guard 有意
+//      跳过的列不再误报「漏写」，单独打一行「按 spec 的 guard 有意跳过」。
 //
 // 0.9.47：少跳几次。服务端 0.7.0 把 spec 放进 KV（不再每次扫飞书表），Runner 这边配套：
 //   ① 场景页改用 /bootstrap：一次拿齐 me + 场景 + 该场景 spec + 待办，并把 spec 直接落本地缓存，
@@ -2089,7 +2096,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.47',
+    RUNNER_VERSION: '0.9.48',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2919,9 +2926,9 @@
       return { initiated: false, handoff: true, openedTab: true, stepId: step.id };
     }
 
-    /* 0.9.40：真导航前先等在途回写（最多 90s）。交接（handoff）分支刻意不等——
+    /* 0.9.40：真导航前先等在途回写（0.9.48 起最多 30s）。交接（handoff）分支刻意不等——
      * 它的回写本来就是「先入队、后台写」，阻塞它等于废掉异步化。 */
-    await UI.drainWrites(90000);
+    await UI.drainWrites(30000);
     const newTab = step.open === 'new-tab';
     log({ t: Date.now(), level: 'info', msg: step.id + ' → ' + (newTab ? '新标签页打开 ' : '导航 ') + maskUrl(url) + '（运行态已保存）' });
     onStep(step.id, 'navigating');
@@ -4846,8 +4853,11 @@
     /* 0.9.46：上一轮的结果若还没写进表，先补写（新的一轮马上会把运行态整个覆盖掉）。 */
     if (UI.settlePreviousFinal) UI.settlePreviousFinal();
     /* 0.9.40：上一条流程的 final 回写可能还在路上（典型：提交完成 → 收尾场景同秒启动）。
-     * 不等它就开始新流程，最坏结果是 0.5s 后整页跳转把请求打断 → 表里状态没更新、也没有报错。 */
-    await UI.drainWrites(90000);
+     * 不等它就开始新流程，最坏结果是 0.5s 后整页跳转把请求打断 → 表里状态没更新、也没有报错。
+     * 0.9.48：① 有记录的流程最多等 30s（结果先入队，打断也能在下一页自动补写）；
+     *         ② 无记录场景（record_optional，如「退出登录并关页」）只等 5s——它是终点，
+     *            后面没有任何步骤要读表，实测这里白等了 47s 才去点退出。 */
+    await UI.drainWrites(task.record_id ? 30000 : 5000);
     const paceStop = startPaceWatch();
     const old = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
@@ -5383,9 +5393,25 @@
     const wl = wrWritten(wr);
     return wl === null ? true : wl.length > 0;
   }
+  /* 服务端按 spec 的 writeback.guard 有意跳过的列（例：开户状态已经是「已完成」，
+   * 导出的补写不许把它改回上一阶段）。这些列没写是**正确行为**，不该报「漏写」。 */
+  function wrSkipped(wr) {
+    if (!wr) return [];
+    const u = (wr.updated && typeof wr.updated === 'object') ? wr.updated : wr;
+    return Array.isArray(u.skipped_fields) ? u.skipped_fields : [];
+  }
 
-  function warnMissingFields(declared, written, tag) {
-    const miss = wbMissing(declared, written);
+  function warnMissingFields(declared, written, tag, skipped) {
+    const sk = Array.isArray(skipped) ? skipped : [];
+    if (sk.length) {
+      UI.appendLog({
+        t: Date.now(), level: 'info',
+        msg: (tag || '回写') + '按 spec 的 guard 有意跳过：' + sk.join('、') +
+          '（这些列的当前值比本次上报更新，不回退）',
+      });
+      if (!Array.isArray(written)) return;
+    }
+    const miss = wbMissing(declared, written).filter(function (k) { return sk.indexOf(k) < 0; });
     if (!miss.length) return;
     UI.appendLog({
       t: Date.now(), level: 'warn',
@@ -5470,7 +5496,7 @@
                 : '本场景该分支声明不回写（业务表无对应字段），已跳过写入') +
                 '（' + ((Date.now() - t0) / 1000).toFixed(1) + 's）',
             });
-            warnMissingFields(wbDeclared(st, ok), wrWritten(wr) || [], '回写');
+            warnMissingFields(wbDeclared(st, ok), wrWritten(wr) || [], '回写', wrSkipped(wr));
             if (!UI._running) UI.renderTasks();
             return { written: true, skipped: !wrote, background: true, msg: '' };
           } catch (e) {
@@ -5512,7 +5538,7 @@
         });
         if (!UI._running) UI.renderTasks();
         /* 字段级核对：写了几个、少了哪几个，当场说清（见 wbDeclared 上方注释） */
-        warnMissingFields(wbDeclared(st, ok), wrWritten(wr) || [], '回写');
+        warnMissingFields(wbDeclared(st, ok), wrWritten(wr) || [], '回写', wrSkipped(wr));
         /* written 的语义是「这次回写已经处理完、收尾不要再发一次」，不是「字段真的写了」。
          * 空分支（noop）也算处理完——否则收尾会再发一遍请求。是否真写用 skipped 表达。 */
         return { written: true, skipped: !wrote, msg: '' };
@@ -5614,7 +5640,7 @@
         okN++;
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 补写成功：' + body.record_id });
         /* 补写成功 ≠ 字段补齐：模板取不到值时服务端照样 200 却跳过该字段 */
-        warnMissingFields(expect, wrWritten(wr) || [], '补写');
+        warnMissingFields(expect, wrWritten(wr) || [], '补写', wrSkipped(wr));
       } catch (e) {
         left.push(p);
         UI.appendLog({ t: Date.now(), level: 'fatal', msg: '⚠️ 补写仍失败：' + body.record_id + ' · ' + e.message });
@@ -5661,7 +5687,7 @@
         pwDel(body.record_id, p._script);
         markWbOk(body.record_id);
         UI.appendLog({ t: Date.now(), level: 'ok', msg: '✅ 自动补写成功：' + body.record_id });
-        warnMissingFields(expect, wrWritten(wr) || [], '自动补写');
+        warnMissingFields(expect, wrWritten(wr) || [], '自动补写', wrSkipped(wr));
       } catch (e) {
         UI.appendLog({ t: Date.now(), level: 'warn',
           msg: '自动补写没成功（' + String((e && e.message) || e) + '）：结果还在本机队列，' +
