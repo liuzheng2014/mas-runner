@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.58
+// @version      0.9.59
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,16 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.59：附件下载不再静默等待（可观测 + 快速失败）。
+//   2026-11-18 真机：S9 传软著时整单「卡住」，日志停在「等到 软著块第 1 个空格」后面一片空白。
+//   实际是 3.3MB 的软著在 6 路并行下要 40s+（实测单发 9s / 并行 44s），而 upload 在
+//   `await uiFetchBytes` 之前一个字都不打，跟死机无法区分。改动：
+//     ① 预取每个文件下完各打一行（文件名/体积/耗时/速度），失败也单独报一行；
+//     ② ≥512KB 的文件每 5s 打一次下载百分比；
+//     ③ upload 等字节前打「等待附件下载（预取中）/开始下载附件」，并加硬上限
+//        （缺省 150s，spec 可用 download_timeout_ms 覆盖），超时直接报错指出 URL 与排查方向，
+//        不再无限挂起。纯观测 + 兜底，不改任何上传/判定逻辑。
 //
 // 0.9.58：type 新增 `sanitize` —— 按 spec 声明的字符集/长度清洗填充值。
 //   场景（2026-11-18 真机）：开户表单「账户名称」取自表里「企业名称」，值里的全角「！」命中华为
@@ -559,6 +569,7 @@
         return;
       }
       let done = false;
+      let lastBeep = 0;   // 下载进度日志节流（5s）
       const fail = function (msg) { if (!done) { done = true; reject(new Error(msg)); } };
       GM_xmlhttpRequest({
         method: 'GET',
@@ -591,6 +602,20 @@
         ontimeout: function () {
           fail('E_UI_FILE_SRC 取文件超时（' + Math.round(ENGINE.FILE_TIMEOUT_MS / 1000) + 's）：' + url);
         },
+        /* 0.9.59：大文件（≥512KB）下载期间每 5 秒报一次百分比。
+         * 此前这段时间页面完全安静，看不出是「在下」还是「卡死」。 */
+        onprogress: function (r) {
+          if (done || !r) return;
+          const total = Number(r.total) || 0;
+          const loaded = Number(r.loaded) || 0;
+          if (!total || total < 512 * 1024) return;
+          const now = Date.now();
+          if (now - lastBeep < 5000) return;
+          lastBeep = now;
+          ENGINE.uiFileLog('下载中 ' + ENGINE.shortUrlTail(url) + ' '
+            + Math.round((loaded / total) * 100) + '%（' + Math.round(loaded / 1024) + '/'
+            + Math.round(total / 1024) + 'KB）');
+        },
       });
     });
   };
@@ -621,21 +646,30 @@
    * 为什么值得：3C 一次要传 5 个文件（执照 876KB、身份证 2 张、软著 PDF 1.28MB + 授权书），
    * 串行「用到才下」时每个上传动作都在干等网络，S2 的 25.5s 里 24s 是下载。
    * 预取不阻塞流程、失败不终止（上传时还有一次重试），下不动的文件不该让整单停在这里。 */
-  ENGINE.collectUploadSrcs = function (spec, scope) {
+  ENGINE.collectUploads = function (spec, scope) {
     const out = [];
+    const seen = {};
     (spec.steps || []).forEach(function (s) {
       ((s.ui && s.ui.actions) || []).forEach(function (a) {
         if (!a || String(a.do) !== 'upload' || !a.src) return;
         let v = '';
         try { v = String(ENGINE.resolvePlaceholders(String(a.src), scope) || '').trim(); } catch (e) { v = ''; }
-        if (/^https?:\/\//i.test(v) && out.indexOf(v) < 0) out.push(v);
+        if (!/^https?:\/\//i.test(v) || seen[v]) return;
+        seen[v] = 1;
+        let n = '';
+        try { n = String(ENGINE.resolvePlaceholders(String(a.filename || ''), scope) || '').trim(); } catch (e) { n = ''; }
+        out.push({ url: v, name: n });
       });
     });
     return out;
   };
+  ENGINE.collectUploadSrcs = function (spec, scope) {
+    return ENGINE.collectUploads(spec, scope).map(function (x) { return x.url; });
+  };
   ENGINE.uiPrefetchUploads = function (spec, scope, log) {
-    const urls = ENGINE.collectUploadSrcs(spec, scope);
-    if (!urls.length) return 0;   // 没附件就一个字节都不动：老场景日志逐字节不变
+    const items = ENGINE.collectUploads(spec, scope);
+    if (!items.length) return 0;   // 没附件就一个字节都不动：老场景日志逐字节不变
+    const urls = items.map(function (x) { return x.url; });
     const say = log || function () {};
     /* 预取阶段就把「下载失败→重试」接到同一条日志流上：这一步没有步骤号，
      * 但它是真机上最先出问题的地方（链路丢包），静默重试等于让人看不到发生过什么。 */
@@ -646,21 +680,55 @@
      * 最慢那个算，不再有第二段排队。 */
     say('附件预取：' + urls.length + ' 个文件并行下载（页面一加载就开始，与填表同时进行）');
     let ok = 0, bad = 0, bytes = 0, lastErr = '';
-    const one = function (u) {
-      return ENGINE.uiFetchBytes(u).then(function (ab) {
+    const one = function (it) {
+      /* 0.9.59：每个文件单独报一行。此前只在 6 个全部结束后打一行汇总，
+       * 于是「3.3MB 的软著还在下」与「整条流程卡死」在日志里长得一模一样
+       * （2026-11-18 真机：S9 要传软著，等了 40s+，日志一片空白）。 */
+      const t1 = Date.now();
+      return ENGINE.uiFetchBytes(it.url).then(function (ab) {
         ok++; bytes += (ab && ab.byteLength) || 0;
+        const sec = Math.max(0.1, (Date.now() - t1) / 1000);
+        const kb = Math.round((((ab && ab.byteLength) || 0) / 1024));
+        say('附件就绪 ' + (it.name || ENGINE.shortUrlTail(it.url)) + '（' + kb + 'KB，'
+          + sec.toFixed(1) + 's，' + Math.round(kb / sec) + 'KB/s）');
       }, function (e) {
         bad++; lastErr = (e && e.message) || String(e);
+        say('附件失败 ' + (it.name || ENGINE.shortUrlTail(it.url)) + '：' + String(lastErr).slice(0, 160));
       });
     };
     (async function () {
-      await Promise.all(urls.map(one));
+      await Promise.all(items.map(one));
       const mb = (bytes / 1024 / 1024).toFixed(1);
       say('附件预取' + (bad ? '部分失败' : '完成') + '：' + ok + '/' + urls.length + ' 就绪，' + mb + 'MB，用时 '
         + ((Date.now() - t0) / 1000).toFixed(1) + 's'
         + (bad ? '；失败的上传时会再试一次（' + String(lastErr).slice(0, 140) + '）' : ''));
     })();
     return urls.length;
+  };
+  /* 日志里展示 URL 用短尾巴（token 前 8 位），不刷屏也不泄露完整地址。 */
+  ENGINE.shortUrlTail = function (url) {
+    const s = String(url || '');
+    const seg = s.split('/').filter(Boolean).pop() || s;
+    return seg.length > 12 ? seg.slice(0, 8) + '…' : seg;
+  };
+  /* 给「等下载完成」加硬上限：Promise 本身没有超时，GM_xhr 万一一个回调都不给
+   * （扩展被挂起/页面被冻结），upload 会静默等下去，看起来就是整单卡死。 */
+  ENGINE.uiAwaitTimeout = function (p, ms, msg) {
+    return new Promise(function (resolve, reject) {
+      let done = false;
+      const timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        reject(new Error(msg));
+      }, Math.max(0, Number(ms) || 0));
+      p.then(function (v) {
+        if (done) return;
+        done = true; clearTimeout(timer); resolve(v);
+      }, function (e) {
+        if (done) return;
+        done = true; clearTimeout(timer); reject(e);
+      });
+    });
   };
 
   /* 等元素出现：命中即刻返回（正常路径零额外耗时），未命中每 100ms 重试至超时。
@@ -1737,8 +1805,21 @@
           for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         } else {
           if (!/^https?:\/\//i.test(src)) throw new Error('E_SPEC upload 的 src 必须是 http(s) 地址，实际「' + src + '」');
-          const ab = await ENGINE.uiFetchBytes(src);
+          /* 0.9.59：等字节前先报一行，并给硬上限。
+           * 此前这里是纯 await：预取没下完（大文件几十秒）时日志一片空白，和「卡死」无法区分；
+           * 扩展/页面被挂起时 GM 回调不回来，则会无限等下去（2026-11-18 真机 S9 软著）。 */
+          const dlWaitMs = Math.max(1000, Number(a.download_timeout_ms) || 150000);
+          const cached = !!ENGINE.uiFileCache[String(src)];
+          const tDl = Date.now();
+          log((cached ? '等待附件下载（预取中）' : '开始下载附件') + '：' + (a.name || label)
+            + '（' + (fname || '未命名') + '，最多等 ' + Math.round(dlWaitMs / 1000) + 's）');
+          const ab = await ENGINE.uiAwaitTimeout(ENGINE.uiFetchBytes(src), dlWaitMs,
+            'E_UI_FILE_SRC ' + (a.name || label) + '：等待附件下载超过 ' + Math.round(dlWaitMs / 1000)
+            + 's 仍未完成（' + src + '）——看上一条「附件预取/附件就绪/下载中」日志判断是慢还是卡住；'
+            + '页面被切到后台冻结时下载回调不会回来，请保持该标签页在前台重跑');
           bytes = new Uint8Array(ab);
+          log('附件字节就绪：' + (a.name || label) + '（' + Math.round(bytes.length / 1024) + 'KB，等了 '
+            + ((Date.now() - tDl) / 1000).toFixed(1) + 's）');
         }
         if (!bytes.length) throw new Error('E_UI_FILE_SRC ' + (a.name || '') + '：取到 0 字节（源文件为空或下载被截断）');
 
@@ -2281,7 +2362,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.58',
+    RUNNER_VERSION: '0.9.59',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
