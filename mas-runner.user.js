@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.56
+// @version      0.9.57
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,11 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.57：wait_for 新增 `any` —— 一组条件，任一满足即返回。
+//   用于「等 OCR 结束」：完成信号不止一种。字段被回填是一种；页面弹「有暂未解析到的证件信息，
+//   请手动填写」也是一种（识别结束、只是没认全）。只等字段的话，没认出东西时就得白等满超时。
+//   任一命中会记下命中的是哪个条件；老的单 xpath 写法行为不变。
 //
 // 0.9.56：多场景命中时，用**交接上下文**（pend.script_id）决出唯一。
 //   2026-11-18 真机：邀请落地页 id.cloud/CAS/portal/userRegister/regbyphone.html 的 service
@@ -1327,6 +1332,40 @@
        *   value_nonempty  元素存在**且** value 非空（等 OCR 回填这种「先出现再被写入」的框）
        * optional：等不到只记一行日志，不失败（「本来就没有」与「选择器写错」的区别靠日志看）。 */
       if (act === 'wait_for') {
+        /* any（0.9.57）：一组条件，**任一**满足即返回。用于「等 OCR 结束」这类有多种完成信号
+         * 的场合——字段被回填是一种，页面弹「有暂未解析到的证件信息，请手动填写」也是一种
+         * （识别结束但没认出全部）。老的单 xpath 写法完全不受影响。 */
+        const anyList = Array.isArray(a.any) ? a.any : null;
+        if (anyList) {
+          const tmaxA = Math.max(0, Number(a.timeout_ms) || 8000);
+          const t0a = Date.now();
+          while (Date.now() - t0a < tmaxA) {
+            for (let i = 0; i < anyList.length; i++) {
+              const c = anyList[i] || {};
+              const cxp = ENGINE.resolvePlaceholders(String(c.xpath || ''), scope);
+              if (!cxp) continue;
+              const wantV = c.value_nonempty === true;
+              const wantS = c.visible === true;
+              let nodes = null;
+              try { nodes = document.evaluate(cxp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); }
+              catch (e) { throw new Error('E_UI_TARGET wait_for.any 选择器无效: ' + cxp); }
+              for (let k = 0; k < nodes.snapshotLength; k++) {
+                const n = nodes.snapshotItem(k);
+                if (!n || n.nodeType !== 1) continue;
+                if (wantS && !ENGINE.uiIsVisible(n)) continue;
+                if (wantV && !String(n.value == null ? '' : n.value).trim().length) continue;
+                log('等到 ' + (c.name || a.name || '目标元素') + '（任一条件命中），用时 ' + (Date.now() - t0a) + 'ms');
+                return;
+              }
+            }
+            await sleep(120);
+          }
+          if (a.optional === true) {
+            log('等不到 ' + (a.name || '任一条件') + '（' + tmaxA + 'ms）——spec 声明 optional，继续');
+            return;
+          }
+          throw new Error('E_UI_TARGET wait_for.any 超时（' + tmaxA + 'ms）：' + (a.name || '任一条件未命中'));
+        }
         const wxp = ENGINE.resolvePlaceholders(String(a.xpath || ''), scope);
         if (!wxp) throw new Error('E_SPEC wait_for 缺 xpath');
         const tmax = Math.max(0, Number(a.timeout_ms) || 8000);
@@ -2211,7 +2250,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.56',
+    RUNNER_VERSION: '0.9.57',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
