@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.52
+// @version      0.9.53
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,14 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.53：trigger.deep_query —— 认领参数从 service/redirect_uri 深链里取。
+//   背景（2026-11-18）：复制开户与新开户并行，两边都会落到同一个 CAS 登录页 / 邀请页，
+//   URL 只差 tableId；但 tableId 跨域一跳后被编进 service（实测 5 层），顶层 query 里没有，
+//   table_id_query/action_query 因此永远取不到 → 加不加声明都是「多命中，谁都不认领」。
+//   现在 spec 可在 trigger.deep_query 里逐名列参数，取不到顶层值时沿 service/redirect_uri
+//   链逐层解码再取；**不在名单里的参数一律不深挖**（别的站点 service 里也有同名参数，
+//   自动捞会认领错场景）。record_id_deep 那条老路径不动。
 //
 // 0.9.52：人工确认弹窗打开时可以用滚轮查看下面的表单。遮罩是整屏 fixed、自身不可滚，
 //   以前滚轮落在它身上，表单自己的滚动容器不动，人在提交前没法核对。现在把滚轮转发给
@@ -2168,7 +2176,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.52',
+    RUNNER_VERSION: '0.9.53',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3720,6 +3728,38 @@
       }
       return SVC.decodeParam(v);
     }
+    /* 深链取值（0.9.53）：有的认领参数不在顶层 query，而在 service/redirect_uri 里
+     * ——跨域一跳之后顶层 query 全丢（record_id_deep 早就踩过这个坑）。
+     * 这里给 table_id_query / action_query 这类「认领判据」用同一套链路。
+     * 必须由 spec 在 trigger.deep_query 里逐名列出来，不做自动猜：
+     * 别的站点 service 里也可能有同名参数，猜着捞会把页面认领成别的场景。 */
+    function deepQ(name, tr) {
+      const cd = tr && tr.cross_domain;
+      const names = (cd && Array.isArray(cd.service_query)) ? cd.service_query : ['service', 'redirect_uri'];
+      for (let i = 0; i < names.length; i++) {
+        let raw = q(names[i]);
+        /* 每一跳都可能再编码一次：解析出 URL → 取目标参数；取不到就顺着
+         * 这一跳自己的 service/redirect_uri 继续往里走（最多 4 跳，实测 5 层编码留余量）。 */
+        for (let hop = 0; hop < 4 && raw; hop++) {
+          let u = null;
+          try { u = new URL(raw); } catch (e) { break; }
+          const hitValue = u.searchParams.get(name);
+          if (hitValue) return SVC.decodeParam(hitValue, 8);
+          let next = '';
+          for (let k = 0; k < names.length && !next; k++) next = u.searchParams.get(names[k]) || '';
+          if (!next) break;
+          raw = SVC.decodeParam(next, 8);
+        }
+      }
+      return '';
+    }
+    /* 认领参数：先顶层/hash query；取不到再看 spec 有没有把这个名字列进 deep_query */
+    function claimParam(tr, name) {
+      const v = q(name);
+      if (v) return v;
+      if (tr && Array.isArray(tr.deep_query) && tr.deep_query.indexOf(name) >= 0) return deepQ(name, tr);
+      return '';
+    }
     /* 跨域登录页的安全阀：同一个 CAS 登录页服务很多站点，脚本装在这里不能见登录页就接管。
      * spec 声明 cross_domain.hosts（会落到哪些域）+ require_service_hosts（只接管回跳本业务的登录）。
      * 判定用 URL 里的 service / redirect_uri 参数的主机名；拿不到或不匹配 → 不认领。 */
@@ -3786,7 +3826,7 @@
         // 表认领：多个场景共用同一个入口 URL（中转页）时，只能靠表 ID 区分。
         // 声明了 table_id_query 就必须对得上，否则跳过——宁可不动，也不猜是哪个场景。
         if (tr.table_id_query) {
-          const tid = q(tr.table_id_query);
+          const tid = claimParam(tr, tr.table_id_query);
           if (!tid || !s.table_id || tid !== s.table_id) continue;
         }
         // 动作认领：同一张表可能有多个操作按钮（发邀请 / 导入成员 / 一键开户），
@@ -3794,7 +3834,7 @@
         // 声明了 action_query 就必须对得上；声明了 action_query 但没配 action 视为声明不完整，跳过。
         if (tr.action_query) {
           if (!tr.action) continue;
-          if (q(tr.action_query) !== String(tr.action)) continue;
+          if (claimParam(tr, tr.action_query) !== String(tr.action)) continue;
         }
         // 跨域登录页：不是回跳本业务的登录就不认领（别把别人的登录页接管掉）
         if (!crossDomainOk(tr)) continue;
