@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.57
+// @version      0.9.58
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,11 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.58：type 新增 `sanitize` —— 按 spec 声明的字符集/长度清洗填充值。
+//   场景（2026-11-18 真机）：开户表单「账户名称」取自表里「企业名称」，值里的全角「！」命中华为
+//   ENTERPRISE_NAME_PATTERN_64（/^[^=！\\"%&*<>;@#${}\[\]_\^`|~?«»“”°:\/]{1,64}$/），一填就报红、
+//   提交被拦。spec 里写 sanitize:{strip_chars,max_len} 即可，未声明的动作行为完全不变。
 //
 // 0.9.57：wait_for 新增 `any` —— 一组条件，任一满足即返回。
 //   用于「等 OCR 结束」：完成信号不止一种。字段被回填是一种；页面弹「有暂未解析到的证件信息，
@@ -682,6 +687,23 @@
     if (desc && desc.set) desc.set.call(el, val); else el.value = val; // 用原生 setter 绕过 Vue 重写的 value
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  /* sanitizeValue（0.9.58）：按 spec 声明的字符集/长度清洗要填进表单的值。
+   * 只处理「平台明确拒收的字符」这类硬性输入约束，不猜测业务语义（不改空格、不改大小写）。
+   * 未声明 sanitize 的动作走原路径，行为零变化。 */
+  ENGINE.sanitizeValue = function (val, rule) {
+    let s = (val === null || val === undefined) ? '' : String(val);
+    const r = rule || {};
+    if (typeof r.strip_chars === 'string' && r.strip_chars.length) {
+      const bad = new Set(Array.from(r.strip_chars));
+      s = Array.from(s).filter(function (ch) { return !bad.has(ch); }).join('');
+    }
+    const max = Number(r.max_len) || 0;
+    if (max > 0) {
+      const chars = Array.from(s);
+      if (chars.length > max) s = chars.slice(0, max).join('');
+    }
+    return s;
   };
   /* 元素是否可见：下拉「收起」是 display:none（节点还在），所以不能只看节点是否存在。
    * 不用 offsetParent —— jsdom 里恒为 null，测试无法模拟可见状态。 */
@@ -1925,7 +1947,12 @@
           }
           if (!(await verifyExpect())) continue;
         } else if (act === 'type') {
-          const val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
+          let val = ENGINE.resolvePlaceholders(String(a.value == null ? '' : a.value), scope);
+          /* sanitize（0.9.58）：平台对某些输入框有硬性字符集/长度约束（例：开户「账户名称」
+           * 只收 /^[^=！\"%&*<>;@#${}\[\]_^`|~?«»“”°:\/]{1,64}$/）。表里原值带非法字符时，
+           * 不清洗就一填报红、提交被拦。只在 spec 显式声明时生效。 */
+          const rawVal = val;
+          if (a.sanitize && typeof a.sanitize === 'object') val = ENGINE.sanitizeValue(val, a.sanitize);
           /* 可空字段：只有 spec 显式声明 skip_if_empty 才允许空值跳过。
            * 缺省仍然报错——「解析为空」多半是参数没取到，静默跳过会让人以为填过了。
            * 声明了就必须留日志，别让「跳过一个字段」变成看不见的事。 */
@@ -1948,6 +1975,10 @@
             : (String(v).length > 200 ? String(v).slice(0, 200) + '…（共 ' + String(v).length + ' 字符）' : String(v));
           log('填写 ' + label + ' = ' + showVal(val) +
             (secretVal ? (ENGINE.logSecretsOn() ? '（secret 参数，明文）' : '（敏感值，已打码）') : '') + (k > 1 ? '（第 ' + k + ' 次）' : ''));
+          if (a.sanitize && String(val) !== String(rawVal)) {
+            log('按 spec.sanitize 清洗 ' + label + '：' + showVal(rawVal) + ' → ' + showVal(val) +
+              '（去掉平台拒收的字符/超长）');
+          }
           ENGINE.uiSetValue(el, val);
           /* 读回自检：受控组件（Vue v-model）可能在重渲染时把值刷回旧值。
            * 判据只认 el.value 实际值，不认「事件已派发」——事件派发成功不代表值留住了。 */
@@ -2250,7 +2281,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.57',
+    RUNNER_VERSION: '0.9.58',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
