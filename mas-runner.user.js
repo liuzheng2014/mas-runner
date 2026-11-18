@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.59
+// @version      0.9.60
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -13,14 +13,15 @@
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
 //
-// 0.9.59：附件下载不再静默等待（可观测 + 快速失败）。
+// 0.9.60：附件下载不再静默等待（可观测 + 快速失败）。0.9.59 首发，本版修正等待上限与缓存清理。
 //   2026-11-18 真机：S9 传软著时整单「卡住」，日志停在「等到 软著块第 1 个空格」后面一片空白。
 //   实际是 3.3MB 的软著在 6 路并行下要 40s+（实测单发 9s / 并行 44s），而 upload 在
 //   `await uiFetchBytes` 之前一个字都不打，跟死机无法区分。改动：
 //     ① 预取每个文件下完各打一行（文件名/体积/耗时/速度），失败也单独报一行；
 //     ② ≥512KB 的文件每 5s 打一次下载百分比；
 //     ③ upload 等字节前打「等待附件下载（预取中）/开始下载附件」，并加硬上限
-//        （缺省 150s，spec 可用 download_timeout_ms 覆盖），超时直接报错指出 URL 与排查方向，
+//        （缺省 260s —— 必须大于「单次 120s × 重试 1 次」，否则会误杀还在重试的慢下载；
+//         spec 可用 download_timeout_ms 覆盖）。超时清掉该 URL 的缓存并报错指出 URL 与排查方向，
 //        不再无限挂起。纯观测 + 兜底，不改任何上传/判定逻辑。
 //
 // 0.9.58：type 新增 `sanitize` —— 按 spec 声明的字符集/长度清洗填充值。
@@ -693,7 +694,8 @@
           + sec.toFixed(1) + 's，' + Math.round(kb / sec) + 'KB/s）');
       }, function (e) {
         bad++; lastErr = (e && e.message) || String(e);
-        say('附件失败 ' + (it.name || ENGINE.shortUrlTail(it.url)) + '：' + String(lastErr).slice(0, 160));
+        say('附件失败 ' + (it.name || ENGINE.shortUrlTail(it.url)) + '：'
+          + String(lastErr).replace(it.url, ENGINE.shortUrlTail(it.url)).slice(0, 160));
       });
     };
     (async function () {
@@ -1807,16 +1809,26 @@
           if (!/^https?:\/\//i.test(src)) throw new Error('E_SPEC upload 的 src 必须是 http(s) 地址，实际「' + src + '」');
           /* 0.9.59：等字节前先报一行，并给硬上限。
            * 此前这里是纯 await：预取没下完（大文件几十秒）时日志一片空白，和「卡死」无法区分；
-           * 扩展/页面被挂起时 GM 回调不回来，则会无限等下去（2026-11-18 真机 S9 软著）。 */
-          const dlWaitMs = Math.max(1000, Number(a.download_timeout_ms) || 150000);
+           * 扩展/页面被挂起时 GM 回调不回来，则会无限等下去（2026-11-18 真机 S9 软著）。
+           * 上限必须大于底层「单次 120s × 最多 2 次」= 240s，否则会把还在重试的正常慢下载判死
+           * （实测最慢链路 20KB/s，3.3MB 约 165s）；260s 只在回调彻底不回来时才会触发。 */
+          const dlWaitMs = Math.max(1000, Number(a.download_timeout_ms) || 260000);
           const cached = !!ENGINE.uiFileCache[String(src)];
           const tDl = Date.now();
           log((cached ? '等待附件下载（预取中）' : '开始下载附件') + '：' + (a.name || label)
             + '（' + (fname || '未命名') + '，最多等 ' + Math.round(dlWaitMs / 1000) + 's）');
-          const ab = await ENGINE.uiAwaitTimeout(ENGINE.uiFetchBytes(src), dlWaitMs,
-            'E_UI_FILE_SRC ' + (a.name || label) + '：等待附件下载超过 ' + Math.round(dlWaitMs / 1000)
-            + 's 仍未完成（' + src + '）——看上一条「附件预取/附件就绪/下载中」日志判断是慢还是卡住；'
-            + '页面被切到后台冻结时下载回调不会回来，请保持该标签页在前台重跑');
+          let ab;
+          try {
+            ab = await ENGINE.uiAwaitTimeout(ENGINE.uiFetchBytes(src), dlWaitMs,
+              'E_UI_FILE_SRC ' + (a.name || label) + '：等待附件下载超过 ' + Math.round(dlWaitMs / 1000)
+              + 's 仍未完成（' + src + '）——看上一条「附件预取/附件就绪/下载中」日志判断是慢还是卡住；'
+              + '页面被切到后台冻结时下载回调不会回来，请保持该标签页在前台重跑');
+          } catch (e) {
+            /* 超时后把缓存里的 pending Promise 清掉：不清的话这条 URL 永久「在下载中」，
+             * 后面每次 upload 都会再等满一次上限，永远拿不到第二次机会。 */
+            delete ENGINE.uiFileCache[String(src)];
+            throw e;
+          }
           bytes = new Uint8Array(ab);
           log('附件字节就绪：' + (a.name || label) + '（' + Math.round(bytes.length / 1024) + 'KB，等了 '
             + ((Date.now() - tDl) / 1000).toFixed(1) + 's）');
@@ -2362,7 +2374,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.59',
+    RUNNER_VERSION: '0.9.60',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
