@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.53
+// @version      0.9.54
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.54：零命中/多命中时把**当前完整 URL** 打进日志。
+//   背景（2026-11-18 真机）：P3 交接后落在 ads.huawei.com，日志只有「（开户·填写开户信息
+//   声明的跨域落地域），但没有场景认领本页」，没有地址，无法判断是路由变了还是 pattern 缺一条。
+//   现在这两条诊断都带上 location.href；零命中那条仍在「本域被某场景声明」时才打（避免污染
+//   无关页面）。纯日志改动，不参与任何判定。
 //
 // 0.9.53：trigger.deep_query —— 认领参数从 service/redirect_uri 深链里取。
 //   背景（2026-11-18）：复制开户与新开户并行，两边都会落到同一个 CAS 登录页 / 邀请页，
@@ -2176,7 +2182,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.53',
+    RUNNER_VERSION: '0.9.54',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -7217,7 +7223,7 @@
           if (amb && amb.length > 1) {
             UI._triggerErrRetry = false;
             UI._triggerErr = '当前地址同时匹配多个场景（' + amb.join('、') + '）：声明里缺少区分标记（action_query），引擎不做猜测，已跳过';
-            UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr });
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr + '；地址 ' + String(location.href || '') });
             UI.renderTrigger();
             return;
           }
@@ -7231,6 +7237,9 @@
             return SVC.hostListHit(hs, here);
           }).map(function (x) { return x.name || x.script_id; });
           if (owners.length) {
+            /* 0.9.54：把完整地址打出来。只靠「没有场景认领本页」判不出是路由变了、
+             * 还是 pattern 缺一条——2026-11-18 真机就卡在这一步，没有任何地址可查。 */
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: '零命中诊断 · 当前地址：' + String(location.href || '') });
             UI.appendLog({ t: Date.now(), level: 'warn', msg: '当前在「' + here + '」（' + owners.join('、') +
               ' 声明的跨域落地域），但没有场景认领本页：多半是场景列表还是旧缓存，或登录页 service 里没有回跳本业务的地址' });
           }
