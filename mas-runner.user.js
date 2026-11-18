@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.55
+// @version      0.9.56
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,15 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.56：多场景命中时，用**交接上下文**（pend.script_id）决出唯一。
+//   2026-11-18 真机：邀请落地页 id.cloud/CAS/portal/userRegister/regbyphone.html 的 service
+//   链里只剩 inviteCode，既没 tableId 也没 recordId —— 新开户 3A 与复制开户 ②C 的 url_patterns
+//   都匹配它，于是「多命中 → 谁都不认领」，链断在这里。现在若两条都命中，且本机 pend 的
+//   script_id 恰好只对应其中一个场景（pend 有 TTL + host 校验），就选它并留一行日志；
+//   没有 pend 时仍然谁都不认领——不按顺序取第一个。
+//   配套：trigger.table_id_query_soft —— 地址里**没有** tableId 时不算冲突（邀请注册页只剩
+//   inviteCode），这类页交给 pend 决出；参数在但对不上仍然跳过。
 //
 // 0.9.55：wait_for 新增 stable_ms —— 「值连续 N 毫秒不再变化」才算等到。
 //   背景：执照 OCR 是异步回填，先写一次、晚些还可能再写一次。老写法只能「等非空 + 再固定睡
@@ -2202,7 +2211,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.55',
+    RUNNER_VERSION: '0.9.56',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3741,6 +3750,7 @@
   /* URL 触发匹配（纯函数）：规则全部来自 spec.scene.trigger，引擎不认识任何具体网站 */
   SVC.matchTriggerIn = function (list, url) {
     const href = String(url || location.href);
+    SVC._triggerByPend = null;
     // 触发参数既可能在 query，也可能在 hash 内的 query（SPA 路由习惯）
     function q(name) {
       if (!name) return '';
@@ -3851,9 +3861,16 @@
         if (!re.test(href)) continue;
         // 表认领：多个场景共用同一个入口 URL（中转页）时，只能靠表 ID 区分。
         // 声明了 table_id_query 就必须对得上，否则跳过——宁可不动，也不猜是哪个场景。
+        // table_id_query_soft（0.9.56）：地址里**根本没有**这个参数时不算冲突，继续往下判。
+        //   用于「同一页服务两个业务、但这一页拿不到表 ID」的落地页（邀请注册页只有 inviteCode）：
+        //   这类页由交接上下文（pend）决出归属，见函数末尾。参数在但对不上时仍然跳过。
         if (tr.table_id_query) {
           const tid = claimParam(tr, tr.table_id_query);
-          if (!tid || !s.table_id || tid !== s.table_id) continue;
+          if (tid) {
+            if (!s.table_id || tid !== s.table_id) continue;
+          } else if (tr.table_id_query_soft !== true) {
+            continue;
+          }
         }
         // 动作认领：同一张表可能有多个操作按钮（发邀请 / 导入成员 / 一键开户），
         // 它们指向同一个入口 URL、同一个 recordId，只能靠按钮链接里自带的标记参数区分。
@@ -3937,6 +3954,21 @@
     // 这种情况一律不认领，绝不按顺序取第一个——那等于赌。
     if (hits.length === 1) return hits[0];
     if (hits.length > 1) {
+      /* 0.9.56：交接链决出唯一。两个业务共用同一页、而这一页地址里没有可分判据时
+       * （例：邀请落地页 id*.cloud/CAS/portal/userRegister/regbyphone.html —— service 链里
+       * 只剩 inviteCode，既没有 tableId 也没有 recordId），只能看**本机交接上下文**指向谁：
+       * pend 里只有一个 script_id，且带 TTL + host 校验。
+       * 这不是「猜」——交接上下文是上一段流程明确写下的下一步；没有它时仍然谁都不认领。 */
+      const pd = SVC.pendGet();
+      if (pd && pd.t && pd.t.script_id && SVC.pendAccept(pd, location.host)) {
+        const want = String(pd.t.script_id);
+        const only = hits.filter(function (h) { return String(h.script_id) === want; });
+        if (only.length === 1) {
+          SVC._triggerAmbiguous = null;
+          SVC._triggerByPend = want;
+          return only[0];
+        }
+      }
       SVC._triggerAmbiguous = hits.map(function (h) { return h.script_id; });
       return null;
     }
@@ -7234,6 +7266,12 @@
         await SVC.scenes();
         const hit = SVC.matchTrigger();
         UI._trigger = hit;
+        /* 0.9.56：多场景命中但被交接上下文选中时要留痕——否则人只看到「跑了」，
+         * 不知道引擎是靠什么在两条业务之间做的选择。 */
+        if (hit && SVC._triggerByPend) {
+          UI.appendLog({ t: Date.now(), level: 'info',
+            msg: '多场景命中，按交接上下文选中「' + (hit.name || hit.script_id) + '」（' + SVC._triggerByPend + '）' });
+        }
         if (!hit) {
           /* 静默是这里最坏的选项：人站在登录页上，面板挂出来了、什么都没发生、
            * 日志一行没有，只能猜是脚本坏了。两种情况必须说话：
