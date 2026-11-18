@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.54
+// @version      0.9.55
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.55：wait_for 新增 stable_ms —— 「值连续 N 毫秒不再变化」才算等到。
+//   背景：执照 OCR 是异步回填，先写一次、晚些还可能再写一次。老写法只能「等非空 + 再固定睡
+//   5s」，快的时候白等、慢的时候又不够（2026-11-17 真机 S3 秒过 → S4 覆盖 → OCR 晚到把
+//   企业地址清空）。现在 spec 可直接声明 stable_ms，OCR 一停就往下走；空值不算稳定。
+//   纯增量：不声明 stable_ms 的老步骤行为完全不变。
 //
 // 0.9.54：零命中/多命中时把**当前完整 URL** 打进日志。
 //   背景（2026-11-18 真机）：P3 交接后落在 ads.huawei.com，日志只有「（开户·填写开户信息
@@ -1324,6 +1330,13 @@
          * 「不需要」，一路走到收尾（2026-11-12 真机：S5 报「存在但不可见」→ S9 硬停）。
          * 声明式表达不了「等到可见为止」，所以在这里补一个开关。 */
         const wantVis = a.visible === true;
+        /* stable_ms（0.9.55）：值**连续 N 毫秒不再变化**才算等到。
+         * 用于 OCR 这类「先出现、再被异步回填一次甚至多次」的字段：只判非空会在第一次
+         * 写入时就返回，后面那次覆盖落到我们写好的值上（2026-11-17 真机：S3 秒过 →
+         * S4 覆盖 → OCR 晚到把企业地址清空）。声明了它就不再用固定 sleep 去赌时间窗。 */
+        const stableMs = Math.max(0, Number(a.stable_ms) || 0);
+        let lastVal = '';
+        let lastChangeAt = 0;
         const t0w = Date.now();
         let hit = null;
         /* 0.9.34：wantVis 时不再只判「第一个匹配节点」。
@@ -1344,12 +1357,18 @@
         while (Date.now() - t0w < tmax) {
           let el = null;
           try { el = findVisibleAny(); } catch (e) { throw new Error('E_UI_TARGET wait_for 选择器无效: ' + wxp); }
-          if (el) { hit = el; break; }
+          if (el) {
+            if (!stableMs) { hit = el; break; }
+            const v = String(el.value == null ? '' : el.value).trim();
+            if (v !== lastVal) { lastVal = v; lastChangeAt = Date.now(); }
+            else if (v && Date.now() - lastChangeAt >= stableMs) { hit = el; break; }
+          }
           await sleep(120);
         }
         const cost = Date.now() - t0w;
         if (hit) {
-          log('等到 ' + (a.name || '目标元素') + (wantVis ? '（已可见）' : '') + (wantVal ? '（已有值）' : '') + '，用时 ' + cost + 'ms');
+          log('等到 ' + (a.name || '目标元素') + (wantVis ? '（已可见）' : '') + (wantVal ? '（已有值）' : '') +
+            (stableMs ? '（值已稳定 ' + stableMs + 'ms）' : '') + '，用时 ' + cost + 'ms');
           return;
         }
         if (a.optional === true) {
@@ -1358,6 +1377,7 @@
         }
         throw new Error('E_UI_TARGET wait_for 超时（' + tmax + 'ms）：' + (a.name || wxp)
           + (wantVis ? ' 仍未出现或仍不可见' : ' 仍未出现') + (wantVal ? '或仍为空' : '')
+          + (stableMs ? '，或值一直在变（stable_ms=' + stableMs + '）' : '')
           + '——页面没渲染到该状态，或选择器已改版');
       }
       /* 关页是纯本地动作：不等网络、不依赖任何元素。调用后页面可能立刻销毁，
@@ -2182,7 +2202,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.54',
+    RUNNER_VERSION: '0.9.55',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
