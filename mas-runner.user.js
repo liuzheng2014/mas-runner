@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.62
+// @version      0.9.63
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,14 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.63：认领即写「最小交接上下文」，修「认领后页面秒跳、记录丢失」。
+//   真机（2026-11-19 14:20:45）：复制开户 ②C 在 ads 邀请页认领成功 → 要 /task 取数（2~4s）→
+//   ads 当场 302 到 CAS regbyphone，取数没回来页面就没了 → pend 从未写成 →
+//   落地页 ②C 因 table_id_query_soft=pend_only 不认领、3A 又没有 recordId，链断在这里。
+//   现在：命中且地址自带 recordId、场景声明了 cross_domain 时，**同步**写一条
+//   {script_id, record_id} 的最小 pend（不含参数），落地页靠 record_id_pend 拿到记录、再照常 /task。
+//   本场景已有任一 pend 时不覆盖（不冲掉上游带来的完整参数）；落地页消费后立即 pendClear。
 //
 // 0.9.62：`table_id_query_soft` 新增第三态 "pend_only"。
 //   背景：复制开户 ②C 与新开户 3A 在**不带 tableId** 的中转页（CAS regbyphone / login /
@@ -2392,7 +2400,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.62',
+    RUNNER_VERSION: '0.9.63',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -7556,6 +7564,27 @@
           UI.appendLog({ t: Date.now(), level: 'warn', msg: lo.msg });
           UI.renderTrigger();
           return;
+        }
+        /* 0.9.63：认领即落「最小交接上下文」——防「刚认领、页面就整页跳走」把记录丢掉。
+         * 真机（2026-11-19 14:20:45）：复制开户 ②C 在 ads 邀请页认领成功，紧接着要 /task 取数
+         * （2~4s），而 ads 当场 302 到 CAS regbyphone —— 取数还没回来页面就没了，pend 从没写成。
+         * 落地页于是：②C 因 table_id_query_soft=pend_only 不认领、3A 又没有 recordId，链断在这里。
+         * 只写「场景 + 记录号」这一层（params 空、params_complete=false）：落地页靠它拿到记录，
+         * 再照常 /task 取参数。本场景已有任一 pend 时不覆盖，避免冲掉上游交过来的完整参数。 */
+        if (hit.record_id) {
+          const sc0 = SVC.sceneById(hit.script_id);
+          const hasCd = !!(sc0 && sc0.trigger && sc0.trigger.cross_domain);
+          const curP = SVC.pendGet();
+          const pendForScene = !!(curP && curP.t && String(curP.t.script_id) === String(hit.script_id)
+            && SVC.pendAccept(curP, location.host));
+          if (hasCd && !pendForScene) {
+            SVC.pendSet({
+              script_id: hit.script_id, record_id: String(hit.record_id),
+              params: {}, params_complete: false, display: null, on_match: hit.on_match,
+            }, location.host);
+            UI.appendLog({ t: Date.now(), level: 'info',
+              msg: '认领即写入最小交接上下文（防跳转丢记录）：' + hit.script_id + ' ← ' + hit.record_id });
+          }
         }
         /* 0.9.42：开跑前对齐 spec 版本。/scenes 现在下发每个场景的 spec_version，
          * 缓存落后就当场重取 —— 触发型场景没有 /task，靠这一条才不会跑到旧流程。 */
