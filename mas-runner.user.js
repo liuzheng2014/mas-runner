@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.60
+// @version      0.9.61
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,15 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.61：触发诊断把「判据」全打出来（用户要求：URL 都要有）。
+//   现场：复制开户 ②C 与新开户 3A 同时匹配 regbyphone，日志只说「多命中、已跳过」，
+//   看不出是缺 tableId 还是缺 action、也看不出 pend 有没有。改动：
+//     ① 「URL 触发命中…」四类日志统一追加「；地址 <完整 href>」；
+//     ② 多命中时逐场景打：命中的 pattern、table_id_query 读到什么（值/无/soft）、本场景声明的表、
+//        action_query 读到什么、record_id 来源（地址/允许 pend）；
+//     ③ 多命中时再打一行 pend 状态（script_id / host / 多久前写入）与结论（有 pend 为何没选中）。
+//   纯日志，不改任何匹配/裁决逻辑。
 //
 // 0.9.60：附件下载不再静默等待（可观测 + 快速失败）。0.9.59 首发，本版修正等待上限与缓存清理。
 //   2026-11-18 真机：S9 传软著时整单「卡住」，日志停在「等到 软著块第 1 个空格」后面一片空白。
@@ -2374,7 +2383,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.60',
+    RUNNER_VERSION: '0.9.61',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4014,10 +4023,15 @@
     }
 
     const hits = [];
+    /* 0.9.61：多命中诊断。每个「匹配上的场景」记下它是靠哪条 URL、哪个判据进来的，
+     * 以及判据参数实际读到的值——否则人只看到「同时匹配多个场景」，看不出缺哪一个标记。 */
+    const probe = [];
+    SVC._triggerProbe = probe;
     for (let i = 0; i < (list || []).length; i++) {
       const s = list[i], tr = s.trigger;
       if (!tr || !Array.isArray(tr.url_patterns)) continue;
       let matched = false;
+      let tidRead = '', tidParam = '';
       for (let k = 0; k < tr.url_patterns.length && !matched; k++) {
         let re = null;
         try { re = new RegExp(tr.url_patterns[k]); } catch (e) { continue; }
@@ -4027,8 +4041,11 @@
         // table_id_query_soft（0.9.56）：地址里**根本没有**这个参数时不算冲突，继续往下判。
         //   用于「同一页服务两个业务、但这一页拿不到表 ID」的落地页（邀请注册页只有 inviteCode）：
         //   这类页由交接上下文（pend）决出归属，见函数末尾。参数在但对不上时仍然跳过。
+        tidRead = ''; tidParam = '';
         if (tr.table_id_query) {
+          tidParam = String(tr.table_id_query);
           const tid = claimParam(tr, tr.table_id_query);
+          tidRead = tid || '';
           if (tid) {
             if (!s.table_id || tid !== s.table_id) continue;
           } else if (tr.table_id_query_soft !== true) {
@@ -4038,13 +4055,27 @@
         // 动作认领：同一张表可能有多个操作按钮（发邀请 / 导入成员 / 一键开户），
         // 它们指向同一个入口 URL、同一个 recordId，只能靠按钮链接里自带的标记参数区分。
         // 声明了 action_query 就必须对得上；声明了 action_query 但没配 action 视为声明不完整，跳过。
+        let actRead = '', actParam = '';
         if (tr.action_query) {
           if (!tr.action) continue;
-          if (claimParam(tr, tr.action_query) !== String(tr.action)) continue;
+          actParam = String(tr.action_query);
+          actRead = claimParam(tr, tr.action_query);
+          if (actRead !== String(tr.action)) continue;
         }
         // 跨域登录页：不是回跳本业务的登录就不认领（别把别人的登录页接管掉）
         if (!crossDomainOk(tr)) continue;
         matched = true;
+        probe.push({
+          sid: String(s.script_id || ''),
+          name: String(s.name || s.script_id || ''),
+          pattern: String(tr.url_patterns[k - 1] || ''),
+          table_id: String(s.table_id || ''),
+          tid_param: tidParam, tid_read: tidRead,
+          tid_soft: tr.table_id_query_soft === true,
+          act_param: actParam, act_read: actRead,
+          rid_param: String(tr.record_id_query || ''),
+          rid_pend: tr.record_id_pend === true,
+        });
         // params_query：spec 声明「哪些参数由页面地址直接带」（省掉查业务表那一步）。
         // 映射方向：spec 参数名 → URL 里的 query 参数名。引擎只认这份声明，不认识业务含义。
         // 凭据类参数（secret）禁止走这里：URL 会进浏览器历史/日志/他人截屏，加载期校验会拦下这种声明。
@@ -7442,9 +7473,38 @@
            *   ②命中但取不到 recordId（recordId 在 service 里且 spec 没声明 record_id_deep）。 */
           const amb = SVC._triggerAmbiguous;
           if (amb && amb.length > 1) {
+            const hrefNow = String(location.href || '');
             UI._triggerErrRetry = false;
-            UI._triggerErr = '当前地址同时匹配多个场景（' + amb.join('、') + '）：声明里缺少区分标记（action_query），引擎不做猜测，已跳过';
-            UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr + '；地址 ' + String(location.href || '') });
+            UI._triggerErr = '当前地址同时匹配多个场景（' + amb.join('、') + '）：声明里缺少区分标记（action_query），引擎不做猜测，已跳过'
+              + '（地址：' + hrefNow + '）';
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: UI._triggerErr });
+            /* 0.9.61：逐场景打出「判据读到了什么」。多命中排不出来时，人只能靠这些值判断
+             * 是缺 tableId/action 标记，还是两个场景的声明本来就该互斥（spec 要改）。 */
+            const probe = SVC._triggerProbe || [];
+            probe.forEach(function (p) {
+              const bits = [];
+              bits.push('规则=' + p.pattern);
+              if (p.tid_param) {
+                bits.push('表认领参数 ' + p.tid_param + '=' + (p.tid_read ? p.tid_read : '（地址里没有' + (p.tid_soft ? '，soft 放行' : '，严格模式本应跳过') + '）')
+                  + '｜本场景表=' + (p.table_id || '未声明'));
+              } else {
+                bits.push('未声明 table_id_query');
+              }
+              if (p.act_param) bits.push('动作标记 ' + p.act_param + '=' + (p.act_read || '（无）'));
+              else bits.push('未声明 action_query');
+              if (p.rid_param) bits.push('记录参数 ' + p.rid_param + (p.rid_pend ? '（允许取交接上下文）' : '（只认地址）'));
+              UI.appendLog({ t: Date.now(), level: 'warn',
+                msg: '  · 命中「' + p.name + '」' + (p.sid ? '（' + p.sid + '）' : '') + '：' + bits.join('；') });
+            });
+            const pdNow = SVC.pendGet();
+            UI.appendLog({ t: Date.now(), level: 'warn',
+              msg: '  · 交接上下文（pend）：' + (pdNow && pdNow.t
+                ? ('script_id=' + (pdNow.t.script_id || '') + '，host=' + (pdNow.host || '') + '，' + Math.round((Date.now() - Number(pdNow.ts || 0)) / 1000) + 's 前写入')
+                : '无') });
+            UI.appendLog({ t: Date.now(), level: 'warn',
+              msg: '  · 结论：' + (pdNow && pdNow.t
+                ? '有 pend 但没选中唯一场景（pend 的 script_id 不在命中列表里，或超过 TTL/host 校验不过）'
+                : '没有 pend，引擎不会在多个场景之间猜——要么从上一段的交接进来，要么给入口链接补上 tableId/action 标记') });
             UI.renderTrigger();
             return;
           }
@@ -7620,7 +7680,7 @@
             on_match: hit.on_match,
           };
           UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，参数直接取自页面地址（不查业务表）：' +
-            Object.keys(hit.params).map(k => k + '=' + hit.params[k]).join('，') + '（' + reason + '）' });
+            Object.keys(hit.params).map(k => k + '=' + hit.params[k]).join('，') + '（' + reason + '）；地址 ' + String(location.href || '') });
           await UI.loadTriggeredTask(task);
           if (hit.on_match === 'fill_and_run') {
             UI.appendLog({ t: Date.now(), level: 'warn', msg: '该场景声明 on_match=fill_and_run：参数已就位，立即开跑' });
@@ -7642,13 +7702,13 @@
         if (task && task.record_optional) {
           /* 0.9.37：不需要记录的场景，别打「已取数」——那会让人以为又查了一次表。 */
           UI.appendLog({ t: Date.now(), level: 'info',
-            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按页面直接执行（' + reason + '）' });
+            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按页面直接执行（' + reason + '）；地址 ' + String(location.href || '') });
           task.on_match = hit.on_match;
         } else if (task) {
           /* 任务已经在 ⓪/②/③ 里取好了（交接上下文 / 页面身份反查 / 运行态 record_id），这里只补 on_match */
           if (!hit.record_id && task.record_id) hit.record_id = task.record_id;
           UI.appendLog({ t: Date.now(), level: 'info',
-            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，记录 ' + (hit.record_id || '（待定）') + ' 已取数，按声明继续（' + reason + '）' });
+            msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，记录 ' + (hit.record_id || '（待定）') + ' 已取数，按声明继续（' + reason + '）；地址 ' + String(location.href || '') });
           task.on_match = hit.on_match;
         } else if ((task = SVC.taskFromPend(hit))) {
           UI.appendLog({ t: Date.now(), level: 'info',
@@ -7659,7 +7719,7 @@
             UI.appendLog({ t: Date.now(), level: 'warn',
               msg: '本场景声明「参数取自交接上下文」，但上下文不可用（' + (SVC.taskFromPend.lastReason || 'unknown') + '）→ 回退查表一次' });
           }
-          UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' + (hit.record_id_from_pend ? '｜记录来自上游交接（本页地址不含 recordId）' : '') });
+          UI.appendLog({ t: Date.now(), level: 'info', msg: 'URL 触发命中「' + (hit.name || hit.script_id) + '」，按记录 ' + hit.record_id + ' 取数…（' + reason + '）' + (hit.record_id_from_pend ? '｜记录来自上游交接（本页地址不含 recordId）' : '') + '；地址 ' + String(location.href || '') });
           /* 这一枪要服务端回读业务表（真机 4~8s，冷表更久），是「命中→开跑」这段空档的主要成分。
            * 只在慢的时候报一行，快的不打——否则每个页面都多一行噪音。 */
           const tRec = Date.now();
