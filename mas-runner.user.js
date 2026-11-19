@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.65
+// @version      0.9.66
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -2407,7 +2407,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.65',
+    RUNNER_VERSION: '0.9.66',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3480,7 +3480,7 @@
       /* --- 0.9.65：业务分组首页 / 单场景工作区 / 日志分区 --- */
       #masr-panel .masr-muted{font-size:11px;color:#8f959e}
       #masr-panel .masr-home-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px;color:#4e5969;margin:2px 0 6px}
-      #masr-panel .masr-group{margin:8px 0 2px;font-size:11.5px;font-weight:700;color:#243447;display:flex;align-items:center;gap:6px}
+      #masr-panel .masr-group{margin:8px 0 2px;font-size:11.5px;font-weight:700;color:#243447;display:flex;align-items:center;gap:6px;cursor:pointer}
       #masr-panel .masr-group .cnt{font-weight:400;color:#8f959e;font-size:10.5px}
       #masr-panel .masr-groupbox{border:1px solid #e3e8f0;border-radius:8px;padding:2px 8px 8px;margin:6px 0;background:#fbfcfe}
       #masr-panel .masr-scene-card{border:1px solid #b7d8f5;background:#f2f8ff;border-radius:6px;padding:6px 9px;margin:4px 0;cursor:pointer}
@@ -3528,11 +3528,11 @@
         </div>
       </div>
       <div class="row" id="masr-pending" style="display:none"></div>
+      <div id="masr-trigger-box"></div>
       <div class="row" id="masr-tasks" style="display:none;border:1px solid #d6e4ff;background:#f7faff;border-radius:8px;padding:6px 8px"></div>
       <div id="masr-home" style="display:none"></div>
       <div id="masr-work" style="display:none">
         <div id="masr-work-head"></div>
-        <div id="masr-trigger-box"></div>
         <div id="masr-task-list"></div>
         <div class="row" id="masr-params" style="display:none"></div>
         <div class="row" id="masr-steps-row" style="display:none"><b>步骤时间线</b><div id="masr-steps"></div></div>
@@ -5101,6 +5101,10 @@
   // 分组名、场景名、待办列、触发规则全部来自 /scenes（spec），引擎不登记任何业务知识。
   const ACTIVE_SCENE_KEY = 'masr_active_scene_v1';
   UI.activeScene = null;
+  /* 当前视图：home=业务分组首页（默认，分组全收起）；work=单场景工作区。
+   * 分开记是因为「页面命中场景」只要求首页展开对应分组、给日志定归属，
+   * 不等于用户要进那个场景的工作区（mark/仅提示类场景尤其如此）。 */
+  UI.viewMode = 'home';
   UI.logView = 'common';       // 未选场景时看公共日志；选场景后自动切到「本场景」
   UI._sceneRestoreTried = false;
   UI._tasksShownFor = '';
@@ -5163,6 +5167,7 @@
       UI.appendLog({ t: Date.now(), level: 'warn', msg: '正在执行任务，暂不能切换业务场景（跑完再切，避免日志串场）' });
       return false;
     }
+    UI.viewMode = 'work';
     return UI._setActiveScene(sid, opts);
   };
   /* 内部：执行中也要能把面板对齐到「正在跑的场景」（不切页、不重取待办） */
@@ -5201,6 +5206,7 @@
       return;
     }
     UI.activeScene = null;
+    UI.viewMode = 'home';
     UI._tasksShownFor = '';
     UI.renderCurScene();
     UI.renderTasks();
@@ -5243,6 +5249,7 @@
         if (alt && alt !== sid) { sid = alt; s = find(alt); }
       }
       if (!s || s.status === 'draft' || UI.activeScene) return;
+      UI.viewMode = 'work';
       UI._setActiveScene(sid, { render: true });
     }).catch(function () {});
   };
@@ -5260,16 +5267,23 @@
     if (rw) rw.addEventListener('click', function () { UI.retryWrites(rw); });
   }
 
-  function sceneCardHtml(s, i, isLast) {
+  function sceneCardHtml(s, i, isLast, isHit) {
     const draft = s.status === 'draft';
     const deprecated = s.status === 'deprecated';
     return '<div data-i="' + i + '" class="masr-scene-card' + (draft ? ' draft' : '') + (UI._running ? ' locked' : '') + '">' +
       '<span class="nm">' + escHtml(s.name || s.script_id) + '</span>' +
       (s.spec_version ? ' <span class="masr-chip" style="font-size:10px">v' + escHtml(s.spec_version) + '</span>' : '') +
+      (isHit ? ' <span class="masr-chip spec" style="font-size:10px" title="当前页面命中了这个场景">本页命中</span>' : '') +
       (isLast ? ' <span class="masr-chip" style="font-size:10px" title="上次使用的场景">上次</span>' : '') +
       (deprecated ? ' <span style="font-size:11px;color:#8f959e">已弃用</span>' : '') +
       (draft ? ' <span style="font-size:11px;color:#b26a00">草稿 · 暂不可执行</span>' : '') +
       '</div>';
+  }
+
+  /* 当前页面命中的场景（只认本次 URL 判定结果 UI._trigger）：
+   * _trigger 在每次 fire 时重写，无命中就是 null，不会拿"上一次命中的残留"展开分组。 */
+  function hitSceneId() {
+    return String((UI._trigger && UI._trigger.script_id) || '');
   }
 
   /* 第 1 页：业务分组首页（列表来自 /scenes，分组来自发布产物；引擎不登记任何场景） */
@@ -5287,8 +5301,9 @@
     const body = document.getElementById('masr-scene-body');
     try {
       const r = await SVC.scenes();
-      // 等场景列表期间可能已经选中了场景（URL 触发/用户点了卡片）→ 不再覆盖工作区
-      if (UI.activeScene || !body.isConnected) return;
+      // 等场景列表期间可能已经切进工作区（URL 触发/用户点了卡片）→ 不再覆盖工作区。
+      // 注意不能按 activeScene 判：命中场景时 activeScene 有值但视图仍停在首页（要展开对应分组）。
+      if (UI.viewMode !== 'home' || !body.isConnected) return;
       const list = (Array.isArray(r) ? r : (r && r.list) || []).slice();
       if (!list.length) { body.innerHTML = '<div class="masr-muted">服务端暂无可用业务场景</div>'; return; }
       const groups = [];
@@ -5300,24 +5315,27 @@
       });
       // 「其他」永远排最后：老服务端/未分组场景不该插在业务分组中间
       groups.sort(function (a, b) { return (a.name === '其他' ? 1 : 0) - (b.name === '其他' ? 1 : 0); });
-      let html = '<div class="masr-muted" style="margin:2px 0 4px">选择要处理的业务场景；也可以直接点业务表里的按钮，页面会自动识别记录。</div>';
+      let html = '<div class="masr-muted" style="margin:2px 0 4px">业务分组默认收起；当前页面命中哪个业务，就自动展开那一组。也可以直接点业务表里的按钮，页面会自动识别记录。</div>';
       let idx = 0;
       const indexOf = new Map();
       let lastSid = '';
       try { lastSid = String(GM_getValue(ACTIVE_SCENE_KEY, '') || ''); } catch (e) {}
+      const hitSid = hitSceneId();
       groups.forEach(function (g) {
-        // 折叠与否由发布产物声明（group_collapsed），引擎不认识任何具体分组名
-        const collapsed = !!g.items[0].group_collapsed;
+        /* 默认全部收起：不看具体 spec，先把业务分组摆出来。
+         * 只有「本页命中的那个业务」自动展开（并把命中的场景标出来），其它分组保持收起。 */
+        const hitHere = !!hitSid && g.items.some(function (s) { return String(s.script_id) === hitSid; });
         const cards = g.items.map(function (s) {
           const i = idx++; indexOf.set(i, s);
-          return sceneCardHtml(s, i, lastSid && String(s.script_id) === lastSid);
+          const sid = String(s.script_id);
+          return sceneCardHtml(s, i, lastSid === sid, hitSid === sid);
         }).join('');
-        html += '<div class="masr-groupbox">' +
-          (collapsed
-            ? '<details><summary class="masr-group" style="cursor:pointer">' + escHtml(g.name) +
-                ' <span class="cnt">' + g.items.length + ' 个场景</span></summary>'
-            : '<div class="masr-group">' + escHtml(g.name) + ' <span class="cnt">' + g.items.length + ' 个场景</span></div>') +
-          cards + (collapsed ? '</details>' : '') + '</div>';
+        html += '<div class="masr-groupbox"><details' + (hitHere ? ' open' : '') + '>' +
+          '<summary class="masr-group">' + escHtml(g.name) +
+            ' <span class="cnt">' + g.items.length + ' 个场景</span>' +
+            (hitHere ? ' <span class="masr-chip spec" style="font-size:10px">本页命中</span>' : '') +
+          '</summary>' +
+          cards + '</details></div>';
       });
       body.innerHTML = html;
       body.querySelectorAll('[data-i]').forEach(function (el) {
@@ -5456,7 +5474,8 @@
       return;
     }
     UI.maybeRestoreScene();
-    if (UI.activeScene || (UI.devOn && UI.spec)) {
+    const wantWork = (UI.activeScene && UI.viewMode === 'work') || (UI.devOn && UI.spec && !UI.activeScene);
+    if (wantWork) {
       home.style.display = 'none';
       renderWork();
     } else {
@@ -5546,8 +5565,11 @@
       };
       const scene = SVC.scriptFor(UI.currentTask);
       /* 0.9.65：面板对齐到「真正在跑的这个场景」——日志/步骤/参数都归它，避免跑到一半面板
-       * 还停在别的场景上（触发自动开跑时尤其明显）。不重新拉待办，只切状态。 */
+       * 还停在别的场景上（触发自动开跑时尤其明显）。不重新拉待办，只切状态。
+       * 0.9.66：开跑一定切到工作区（哪怕之前停在业务分组首页）。 */
+      UI.viewMode = 'work';
       UI._setActiveScene(scene, { keepTask: true, render: false });
+      if (!document.getElementById('masr-work') || document.getElementById('masr-work').style.display === 'none') UI.renderTasks();
       // 任务摘要只取 scene.display 的第一个值（列名是业务侧声明的，Runner 不认识具体含义）
       const dk = task.display ? Object.keys(task.display) : [];
       const dv = dk.length ? task.display[dk[0]] : '';
@@ -5635,6 +5657,7 @@
     if (ballRun) ballRun.classList.add('masr-running');
     // 批量日志归「这一批的场景」：先清掉上一条任务残留的 currentTask，再对齐当前场景
     UI.currentTask = null;
+    UI.viewMode = 'work';
     if (tasks[0] && tasks[0].script_id) UI._setActiveScene(tasks[0].script_id, { keepTask: true, render: false });
     UI._batchStop = false;
     if (runBtn) runBtn.style.display = 'none';
@@ -7532,16 +7555,8 @@
   UI.renderTrigger = function () {
     const box = document.getElementById('masr-trigger-box');
     if (!box) return;
-    /* 0.9.65：URL 触发取到了任务、但面板还停在业务分组首页时，先切到该场景的工作区——
-     * 触发卡就在工作区里，不切过去用户只会看到「什么都没发生」。
-     * 用户已经手动选了别的场景时不抢：只在卡片里提示本页属于哪个场景。 */
-    const pre = UI._triggerTask;
-    if (pre && pre.script_id && !UI._trigSwitching && !UI.activeScene) {
-      UI._trigSwitching = true;
-      try { UI._setActiveScene(pre.script_id, { keepTask: true, render: true }); }
-      finally { UI._trigSwitching = false; }
-      return;
-    }
+    /* 触发卡现在是公共区的一块（不在工作区里），首页/工作区都能看到，
+     * 因此这里不再需要为了"让卡片可见"去切场景。是否进工作区由 viewMode 决定。 */
     const t = UI._triggerTask, err = UI._triggerErr || '', mark = UI._triggerMark;
     if (!t && !err && !mark) { box.innerHTML = ''; return; }
     const bar = 'margin-top:4px;padding:5px 7px;border-radius:6px;';
@@ -7621,6 +7636,7 @@
     };
     /* 0.9.65：URL 触发 / 上游交接落到本页时，面板直接切到这个场景的工作区，
      * 触发卡与参数才有地方显示（否则用户看到的是业务分组首页，以为没接上）。 */
+    UI.viewMode = 'work';
     if (task.script_id) UI._setActiveScene(task.script_id, { keepTask: true, render: true });
     // 缓存优先：命中本地 spec 就立刻开跑，不等公网；版本校验放后台（见下面 specRefresh）
     const t0 = Date.now();
@@ -7897,8 +7913,21 @@
         const hit = SVC.matchTrigger();
         UI._trigger = hit;
         /* 0.9.65：一旦命中场景，先把「当前业务」对齐到它，再往下取数/打日志——
-         * 「页面身份入口 / 反查命中」这些日志都属于这个场景，不能落进公共视图。 */
-        if (hit && hit.script_id) UI._setActiveScene(hit.script_id, { keepTask: true, render: false });
+         * 「页面身份入口 / 反查命中」这些日志都属于这个场景，不能落进公共视图。
+         * 0.9.66：命中只让首页展开对应业务分组；是否进工作区由 viewMode 决定
+         * （真正取到任务/开跑时才切过去），避免仅标记类场景把人拽进空工作区。 */
+        if (hit && hit.script_id) {
+          const prevHit = String(UI._lastHitSid || '');
+          UI._lastHitSid = String(hit.script_id);
+          UI._setActiveScene(hit.script_id, { keepTask: true, render: false });
+          if (UI.viewMode === 'home' && UI._lastHitSid !== prevHit) UI.renderTasks();
+        } else if (UI._lastHitSid) {
+          // 离开命中页：清掉上一页的触发上下文，首页收起全部业务分组
+          UI._lastHitSid = '';
+          UI._triggerTask = null;
+          UI._triggerMark = null;
+          if (UI.viewMode === 'home') UI.renderTasks();
+        }
         /* 0.9.56：多场景命中但被交接上下文选中时要留痕——否则人只看到「跑了」，
          * 不知道引擎是靠什么在两条业务之间做的选择。 */
         if (hit && SVC._triggerByPend) {
