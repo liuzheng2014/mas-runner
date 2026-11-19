@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.64
+// @version      0.9.65
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -2407,7 +2407,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.64',
+    RUNNER_VERSION: '0.9.65',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3469,7 +3469,7 @@
       #masr-panel button:disabled{color:#7a828c;background:#eceef2;border-color:#d4d7de;cursor:default}
       #masr-panel .log{background:#101418;color:#d7e8ff;font:11px/1.5 Consolas,monospace;padding:8px;border-radius:8px;
         max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;color-scheme:dark}
-      #masr-panel .ok{color:#63d193}.fatal{color:#ff8b8b}.warn{color:#ffc266}
+      #masr-panel .ok{color:#63d193}#masr-panel .fatal{color:#ff8b8b}#masr-panel .warn{color:#ffc266}
       #masr-panel table{border-collapse:collapse;width:100%}
       #masr-panel td,#masr-panel th{border:1px solid #e3e3ec;padding:2px 6px;text-align:left;font-size:11px}
       #masr-panel input,#masr-panel textarea{padding:2px 6px;border:1px solid #c6cad2;border-radius:4px;width:200px;
@@ -3477,6 +3477,31 @@
       #masr-panel input::placeholder,#masr-panel textarea::placeholder{color:#6b7785;opacity:1}
       #masr-panel input:disabled,#masr-panel textarea:disabled{background:#f3f4f7;color:#6b7785}
       .masr-tag{display:inline-block;padding:0 6px;border-radius:8px;font-size:10px;margin-left:6px}
+      /* --- 0.9.65：业务分组首页 / 单场景工作区 / 日志分区 --- */
+      #masr-panel .masr-muted{font-size:11px;color:#8f959e}
+      #masr-panel .masr-home-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px;color:#4e5969;margin:2px 0 6px}
+      #masr-panel .masr-group{margin:8px 0 2px;font-size:11.5px;font-weight:700;color:#243447;display:flex;align-items:center;gap:6px}
+      #masr-panel .masr-group .cnt{font-weight:400;color:#8f959e;font-size:10.5px}
+      #masr-panel .masr-groupbox{border:1px solid #e3e8f0;border-radius:8px;padding:2px 8px 8px;margin:6px 0;background:#fbfcfe}
+      #masr-panel .masr-scene-card{border:1px solid #b7d8f5;background:#f2f8ff;border-radius:6px;padding:6px 9px;margin:4px 0;cursor:pointer}
+      #masr-panel .masr-scene-card:hover{background:#e9f3ff}
+      #masr-panel .masr-scene-card.draft{border-color:#e5e5e5;background:#fafafa;cursor:not-allowed;opacity:.55}
+      #masr-panel .masr-scene-card.locked{cursor:not-allowed;opacity:.6}
+      #masr-panel .masr-scene-card .nm{font-size:12px;font-weight:600}
+      #masr-work-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 6px;
+        border-bottom:1px solid #eef1f6;padding-bottom:5px}
+      #masr-work-head .cur{font-size:12px;font-weight:600;color:#1f2d3d}
+      #masr-work-head .grp{font-size:10.5px;color:#8f959e}
+      #masr-log-tabs{display:flex;gap:4px;margin-bottom:4px;align-items:center}
+      #masr-panel .masr-log-tab{padding:1px 8px;font-size:11px;border-radius:10px;border:1px solid #dfe3ec;
+        background:#fff;color:#5a6b87;cursor:pointer}
+      #masr-panel .masr-log-tab.on{border-color:#b7d8f5;background:#eef4ff;color:#1a5fd0;font-weight:600}
+      #masr-log .logline{margin:0;white-space:pre-wrap;word-break:break-all}
+      #masr-adv{margin-top:8px;border-top:1px dashed #e3e8f0;padding-top:4px}
+      #masr-adv>summary{cursor:pointer;font-size:11.5px;color:#5a6b87;outline:none}
+      #masr-ball.masr-running{animation:masr-runpulse 1.2s infinite}
+      @keyframes masr-runpulse{0%,100%{box-shadow:0 0 0 3px rgba(26,102,255,.28),0 4px 14px rgba(0,0,0,.25)}
+        50%{box-shadow:0 0 0 8px rgba(26,102,255,.06),0 4px 14px rgba(0,0,0,.25)}}
     `;
     document.head.appendChild(css);
 
@@ -3495,42 +3520,60 @@
           <button class="masr-mini" id="masr-check-update" title="检查解释器有没有新版本">检查更新</button>
           <button class="masr-mini" id="masr-dev-toggle" title="手工粘贴 spec.json（仅调试用）">dev</button>
         </div>
-        <div class="h-row" title="业务脚本 = 这一步要跑的 spec（版本由业务方维护，与解释器版本无关）">
-          <span class="lbl">业务脚本</span>
-          <span id="masr-spec-badge"><span class="lbl">未加载</span></span>
+        <div class="h-row" title="当前业务场景：选中后才显示该场景的待办 / 参数 / 步骤 / 结果">
+          <span class="lbl">当前业务</span>
+          <span id="masr-cur-scene"><span class="lbl">未选场景</span></span>
           <span class="grow"></span>
           <button class="masr-mini" id="masr-spec-upgrade" title="联网强制同步：场景触发规则（绕开 10 分钟缓存）+ 全部业务脚本的最新 spec（并行 4 路，绕开本地缓存）。流程执行中不允许点。">同步 spec</button>
         </div>
       </div>
-      <div class="row" id="masr-selfcheck"></div>
-      <div class="row" id="masr-tasks" style="border:1px solid #d6e4ff;background:#f7faff;border-radius:8px;padding:6px 8px"></div>
-      <div class="row" id="masr-conn" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
-      <div class="row" id="masr-spec-box" style="display:none"><b>spec.json（开发调试用，正常不用碰）</b><br></div>
-      <div class="row" id="masr-dev-tools" style="display:none">
-        <div class="row" style="margin-bottom:6px">
-          <button class="primary" id="masr-load">加载 spec</button>
-          <button id="masr-hash">计算 SHA-256</button>
-          <span id="masr-hash-out"></span>
-        </div>
-        <div class="row" style="margin-bottom:6px">
-          <button class="primary" id="masr-run" title="手工重跑当前加载的 spec（调试用；正常走任务区的「执行」）">重跑当前 spec</button>
-          <button id="masr-export" title="把上次运行结果导出为 JSON（调试排查用）">导出结果 JSON</button>
-        </div>
-        <div class="row" id="masr-dev-conn" style="border:1px dashed #d6e4ff;border-radius:8px;padding:6px 8px"></div>
-        <div class="row" style="margin-top:6px">
-          <button id="masr-dev-unbind" title="换人/换电脑用：接入码、身份缓存、授权码一起清掉，回到首次绑定状态">解除绑定（换人用这台电脑）</button>
-          <span style="font-size:11px;color:#8f959e">清除本机绑定信息，不影响已回写的结果</span>
-        </div>
+      <div class="row" id="masr-pending" style="display:none"></div>
+      <div class="row" id="masr-tasks" style="display:none;border:1px solid #d6e4ff;background:#f7faff;border-radius:8px;padding:6px 8px"></div>
+      <div id="masr-home" style="display:none"></div>
+      <div id="masr-work" style="display:none">
+        <div id="masr-work-head"></div>
+        <div id="masr-trigger-box"></div>
+        <div id="masr-task-list"></div>
+        <div class="row" id="masr-params" style="display:none"></div>
+        <div class="row" id="masr-steps-row" style="display:none"><b>步骤时间线</b><div id="masr-steps"></div></div>
+        <div class="row" id="masr-result" style="display:none"></div>
       </div>
-      <div class="row" id="masr-params"></div>
-      <div class="row">
-        <button id="masr-cancel-run" title="续跑卡住时用：清掉本机的续跑进度（不影响线上数据）">清除续跑状态</button>
-        <button id="masr-copy-logs" title="把全部日志（含历史，带时间戳）复制为纯文本，方便贴给同事或发群里排查">复制日志</button>
-        <button id="masr-clear-logs">清空日志</button>
+      <div class="row" id="masr-logs">
+        <div id="masr-log-tabs">
+          <button class="masr-log-tab" id="masr-log-tab-scene" title="只看当前业务场景的日志">本场景</button>
+          <button class="masr-log-tab" id="masr-log-tab-common" title="同步 spec、绑定/连接、检查更新、自检等公共日志">公共</button>
+          <span class="grow"></span>
+          <button id="masr-copy-logs" title="复制当前日志视图（本场景 / 公共）为纯文本，带时间戳">复制日志</button>
+          <button id="masr-clear-logs" title="只清空当前日志视图">清空日志</button>
+        </div>
+        <div class="log" id="masr-log"></div>
       </div>
-      <div class="row"><b>步骤时间线</b><div id="masr-steps"></div></div>
-      <div class="row"><b>日志</b><div class="log" id="masr-log"></div></div>
-      <div class="row" id="masr-result"></div>
+      <details id="masr-adv">
+        <summary>高级 / 诊断</summary>
+        <div class="row" id="masr-selfcheck"></div>
+        <div class="row" id="masr-conn" style="border:1px solid #e5e6eb;border-radius:8px;padding:6px 8px"></div>
+        <div class="row">
+          <button id="masr-cancel-run" title="续跑卡住时用：清掉本机的续跑进度（不影响线上数据）">清除续跑状态</button>
+          <span class="masr-muted">续跑卡住时用，不影响线上数据</span>
+        </div>
+        <div class="row" id="masr-spec-box" style="display:none"><b>spec.json（开发调试用，正常不用碰）</b><br></div>
+        <div class="row" id="masr-dev-tools" style="display:none">
+          <div class="row" style="margin-bottom:6px">
+            <button class="primary" id="masr-load">加载 spec</button>
+            <button id="masr-hash">计算 SHA-256</button>
+            <span id="masr-hash-out"></span>
+          </div>
+          <div class="row" style="margin-bottom:6px">
+            <button class="primary" id="masr-run" title="手工重跑当前加载的 spec（调试用；正常走任务区的「执行」）">重跑当前 spec</button>
+            <button id="masr-export" title="把上次运行结果导出为 JSON（调试排查用）">导出结果 JSON</button>
+          </div>
+          <div class="row" id="masr-dev-conn" style="border:1px dashed #d6e4ff;border-radius:8px;padding:6px 8px"></div>
+          <div class="row" style="margin-top:6px">
+            <button id="masr-dev-unbind" title="换人/换电脑用：接入码、身份缓存、授权码一起清掉，回到首次绑定状态">解除绑定（换人用这台电脑）</button>
+            <span style="font-size:11px;color:#8f959e">清除本机绑定信息，不影响已回写的结果</span>
+          </div>
+        </div>
+      </details>
     `;
     document.body.appendChild(ball); document.body.appendChild(panel);
     UI.makeSpecInput();
@@ -3552,13 +3595,14 @@
       UI.devOn = on;
       this.style.background = on ? '#e8f3ff' : '';
       if (on) UI.renderConn(); // dev 展开时把后端地址编辑区一并渲染出来
+      UI.renderTasks();        // dev 粘贴 spec 时没有业务场景，也要能看到参数/步骤/结果
     });
 
     document.getElementById('masr-dev-unbind').addEventListener('click', function () {
       if (!confirm('解除绑定：接入码、身份缓存、授权码全部清除（换人用这台电脑时用）。\\n确定继续？')) return;
       GM_deleteValue(SVC.C_KEY); GM_deleteValue(SVC.M_KEY);
       clearAuthCode();
-      UI.appendLog({ t: Date.now(), level: 'warn', msg: '已解除绑定（本机绑定信息已清除），回到首次绑定状态' });
+      UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common', msg: '已解除绑定（本机绑定信息已清除），回到首次绑定状态' });
       UI.renderTasks();
     });
 
@@ -3584,10 +3628,12 @@
       a.click();
     });
     document.getElementById('masr-cancel-run').addEventListener('click', () => {
-      RunState.clear(); UI.appendLog({ t: Date.now(), level: 'warn', msg: '续跑状态已清除' });
+      RunState.clear(); UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common', msg: '续跑状态已清除' });
     });
     document.getElementById('masr-copy-logs').addEventListener('click', UI.copyLogs);
     document.getElementById('masr-clear-logs').addEventListener('click', UI.clearLogs);
+    document.getElementById('masr-log-tab-scene').addEventListener('click', function () { UI.setLogView('scene'); });
+    document.getElementById('masr-log-tab-common').addEventListener('click', function () { UI.setLogView('common'); });
     document.getElementById('masr-check-update').addEventListener('click', function () {
       if (UI._newVer) UI.startUpdate(); else UI.checkUpdate();
     });
@@ -3657,9 +3703,9 @@
       let scenes = [];
       try {
         scenes = await SVC.scenes(true);
-        UI.appendLog({ t: Date.now(), level: 'ok', msg: '场景触发规则已同步（' + scenes.length + ' 个场景）' });
+        UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common', msg: '场景触发规则已同步（' + scenes.length + ' 个场景）' });
       } catch (e) {
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '场景触发规则同步失败（' + e.message + '）：继续同步 spec，触发规则仍是本机旧版' });
+        UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common', msg: '场景触发规则同步失败（' + e.message + '）：继续同步 spec，触发规则仍是本机旧版' });
       }
       /* ② 目标场景（0.9.23）：只同步「人正看着的那一份」，不碰别的场景。
        * 顺序：当前任务 → 面板已加载 → 面板里正显示的 spec（spec_id → script_id）→ 当前页命中。
@@ -3690,13 +3736,13 @@
       scenes.forEach(function (s) { if (s && s.script_id) push(String(s.script_id)); });
       if (!ids.length && sid) push(sid);
       if (ids.length > 1) {
-        UI.appendLog({ t: Date.now(), level: 'info',
+        UI.appendLog({ t: Date.now(), level: 'info', scope: 'common',
           msg: '同步目标：全部 ' + ids.length + ' 个场景（并行 4 路）' + (sid ? '；当前任务 ' + sid : '') });
       } else if (sid) {
-        UI.appendLog({ t: Date.now(), level: 'info', msg: '同步目标：' + sid + '（' + sidFrom + '）' });
+        UI.appendLog({ t: Date.now(), level: 'info', scope: 'common', msg: '同步目标：' + sid + '（' + sidFrom + '）' });
       }
       if (!ids.length) {
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '没有可同步的业务脚本：面板没加载 spec、当前页没命中场景、场景列表也拿不到。先打开一次业务页面或点「加载 spec」再试' });
+        UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common', msg: '没有可同步的业务脚本：面板没加载 spec、当前页没命中场景、场景列表也拿不到。先打开一次业务页面或点「加载 spec」再试' });
         return;
       }
       let ups = 0, same = 0, bad = 0;
@@ -3710,10 +3756,10 @@
           const oldV = before ? String(before.version) : '';
           if (oldV && oldV === String(s.version)) {
             same++;
-            UI.appendLog({ t: Date.now(), level: 'info', msg: 'spec 已是最新：' + id + ' v' + s.version });
+            UI.appendLog({ t: Date.now(), level: 'info', scope: 'common', msg: 'spec 已是最新：' + id + ' v' + s.version });
           } else {
             ups++;
-            UI.appendLog({ t: Date.now(), level: 'ok',
+            UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common',
               msg: 'spec 已升级：' + id + ' ' + (oldV ? 'v' + oldV + ' → ' : '（本机无缓存）→ ') + 'v' + s.version + '（本地缓存已更新）' });
           }
           /* 只有「面板正显示的那一份」才换上面板，别的场景只更新缓存。
@@ -3728,12 +3774,12 @@
           if (isPanelOne) {
             UI._specCache = { script_id: id, spec: s.spec, version: s.version };
             UI.applySpec(JSON.stringify(s.spec), { persist: true });
-            UI.appendLog({ t: Date.now(), level: 'ok',
+            UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common',
               msg: '面板已切到 v' + s.version + '（本地缓存同步更新，刷新后也是这一版）' });
           }
         } catch (e) {
           bad++;
-          UI.appendLog({ t: Date.now(), level: 'warn',
+          UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common',
             msg: 'spec 同步失败：' + id + '（' + UI.syncErrText(e) + '）' + (before ? '——本机缓存 v' + before.version + ' 保留，仍可执行' : '——本机没有该场景缓存') });
         }
       };
@@ -3747,11 +3793,11 @@
         })());
       }
       await Promise.all(lanes);
-      UI.appendLog({ t: Date.now(), level: bad && !ups ? 'fatal' : 'info',
+      UI.appendLog({ t: Date.now(), level: bad && !ups ? 'fatal' : 'info', scope: 'common',
         msg: '同步完成（' + ((Date.now() - T0) / 1000).toFixed(1) + 's）：升级 ' + ups + '、已是最新 ' + same + '、失败 ' + bad +
           (bad && !ups ? '——后端连不上时先把服务起来，再点一次「同步 spec」' : '') });
     } catch (e) {
-      UI.appendLog({ t: Date.now(), level: 'fatal', msg: '同步失败：' + e.message });
+      UI.appendLog({ t: Date.now(), level: 'fatal', scope: 'common', msg: '同步失败：' + e.message });
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = oldLabel || '同步 spec'; }
     }
@@ -4975,7 +5021,7 @@
     function onBound(j) {
       GM_setValue(SVC.C_KEY, j.device_code);
       GM_setValue(SVC.M_KEY, JSON.stringify({ name: j.name, open_id: j.open_id, dept: j.dept || '' }));
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: '身份绑定完成：' + j.name + (j.dept ? '（' + j.dept + '）' : '') + '，之后只显示你自己的待办' });
+      UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common', msg: '身份绑定完成：' + j.name + (j.dept ? '（' + j.dept + '）' : '') + '，之后只显示你自己的待办' });
       UI.renderTasks();
     }
 
@@ -5049,142 +5095,355 @@
     acquire(false);
   }
 
-  // ③ 已绑定 → 场景选择 → 该场景的待办
-  // 交互（用户 2026-11-03 拍板）：打开面板先选业务场景，选完自动按该场景 spec 声明的
-  // 过滤条件拉记录；不设「拉待办」总按钮。场景列表/列名/空提示全部来自 /scenes（spec）。
-  function renderBound(box, me) {
-    const pend = pwList();
-    box.innerHTML =
-      '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">' +
-        '<b>任务</b>' +
-        '<span style="color:#1a7f45">' + (me.name || '已绑定') + (me.dept ? ' · ' + me.dept : '') + '</span>' +
-        modeTag() +
-        '<span style="flex:1 1 auto"></span>' +
-        (pend.length ? '<button id="masr-retry-writes" class="masr-mini primary" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button>' : '') +
-      '</div>' +
-      '<div id="masr-trigger-box"></div>' +
-      '<div id="masr-scene-body" style="margin-top:4px"></div>';
+  // ③ 已绑定：业务分组首页 → 单场景工作区（0.9.65）
+  // 交互（用户 2026-11-19 拍板）：打开面板先看「业务分组」（开户新开 / 开户复制 / 取密钥…），
+  // 选中场景后才显示该场景的待办/参数/步骤/结果；其它场景的内容一律不显示。
+  // 分组名、场景名、待办列、触发规则全部来自 /scenes（spec），引擎不登记任何业务知识。
+  const ACTIVE_SCENE_KEY = 'masr_active_scene_v1';
+  UI.activeScene = null;
+  UI.logView = 'common';       // 未选场景时看公共日志；选场景后自动切到「本场景」
+  UI._sceneRestoreTried = false;
+  UI._tasksShownFor = '';
 
+  function escHtml(s) {
+    return String(s === undefined || s === null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  // 单元格取值：优先 display（服务端按 scene.display 算好的），其次 params，最后原字段
+  function cellOf(t, f) {
+    if (!t) return '';
+    if (t.display && t.display[f] !== undefined) return t.display[f];
+    if (t.params && t.params[f] !== undefined) return t.params[f];
+    return t[f];
+  }
+
+  /* 顶部第二行「当前业务」：只显示组名 + 场景名，不再把 spec 徽标塞在公共区 */
+  UI.renderCurScene = function () {
+    const el = document.getElementById('masr-cur-scene');
+    if (!el) return;
+    const sc = UI.activeScene;
+    if (!sc) { el.innerHTML = '<span class="lbl">未选场景</span>'; return; }
+    el.innerHTML = '<span class="masr-chip">' + escHtml(sc.group || '其他') + '</span> ' +
+      '<span class="masr-spec-name" title="' + escHtml(sc.name) + '">' + escHtml(sc.name) + '</span>';
+    const ball = document.getElementById('masr-ball');
+    if (ball) ball.title = 'MAS-Runner v' + GV.RUNNER_VERSION + ' · 场景：' + sc.name + '（点击打开/收起）';
+  };
+
+  /* 面板上的 spec / 任务是不是「这个场景的」——决定参数、步骤、结果三块要不要显示 */
+  function specMatchesScene(sc) {
+    if (!sc) return false;
+    const sid = String(sc.script_id || '');
+    if (UI._specCache && String(UI._specCache.script_id) === sid) return true;
+    if (UI.currentTask && String(UI.currentTask.script_id) === sid) return true;
+    if (UI.spec && UI.spec.spec_id && String(UI.spec.spec_id).replace(/[.\-]/g, '_') === sid) return true;
+    return false;
+  }
+  UI.updateWorkVisibility = function () {
+    const sc = UI.activeScene;
+    const devSpec = !!(UI.devOn && UI.spec && !sc);
+    const mine = devSpec || specMatchesScene(sc);
+    const params = document.getElementById('masr-params');
+    const steps = document.getElementById('masr-steps-row');
+    const result = document.getElementById('masr-result');
+    if (params) params.style.display = mine ? '' : 'none';
+    let hasStepState = false;
+    try {
+      const st = readStepStates();
+      hasStepState = !!(st && st.states && sc &&
+        String(st.spec_id || '').replace(/[.\-]/g, '_') === String(sc.script_id));
+    } catch (e) {}
+    if (steps) steps.style.display = (mine || hasStepState) ? '' : 'none';
+    if (result) result.style.display = (mine && UI.lastResult) ? '' : 'none';
+  };
+
+  /* 选中场景（公开入口）：执行中不允许切换，避免日志/步骤串场 */
+  UI.selectScene = function (sid, opts) {
+    opts = opts || {};
+    if (UI._running) {
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '正在执行任务，暂不能切换业务场景（跑完再切，避免日志串场）' });
+      return false;
+    }
+    return UI._setActiveScene(sid, opts);
+  };
+  /* 内部：执行中也要能把面板对齐到「正在跑的场景」（不切页、不重取待办） */
+  UI._setActiveScene = function (sid, opts) {
+    opts = opts || {};
+    const s = SVC.sceneById(sid) ||
+      { script_id: sid, name: (UI.currentTask && UI.currentTask.scene_name) || String(sid), group: '', status: '' };
+    const newSid = String(s.script_id || sid);
+    const changed = !UI.activeScene || String(UI.activeScene.script_id) !== newSid;
+    UI.activeScene = {
+      script_id: newSid,
+      name: s.name || String(sid),
+      group: s.group || '其他',
+      status: s.status || '',
+    };
+    if (!opts.keepTask) {
+      UI.currentTask = null;
+      UI.lastResult = null;             // 换场景后上一次的结果不再显示（避免张冠李戴）
+      const rEl = document.getElementById('masr-result');
+      if (rEl) { rEl.innerHTML = ''; rEl.style.display = 'none'; }
+    }
+    try { GM_setValue(ACTIVE_SCENE_KEY, UI.activeScene.script_id); } catch (e) {}
+    UI.renderCurScene();
+    if (opts.render === false) {
+      UI.updateWorkVisibility();
+      if (changed) UI.setLogView('scene');
+      return true;
+    }
+    UI.renderTasks();
+    if (changed) UI.setLogView('scene');
+    return true;
+  };
+  UI.clearActiveScene = function () {
+    if (UI._running) {
+      UI.appendLog({ t: Date.now(), level: 'warn', msg: '正在执行任务，暂不能离开当前场景（跑完再切）' });
+      return;
+    }
+    UI.activeScene = null;
+    UI._tasksShownFor = '';
+    UI.renderCurScene();
+    UI.renderTasks();
+    UI.setLogView('common');
+  };
+  /* 在途流程（跨页续跑 / 待交接）才自动回到上次场景；
+   * 平时打开面板一律停在业务分组首页（「默认只看分组」是面板的基本形态），
+   * 上次用过的场景只在首页卡片上打一个「上次」标记，不替用户做选择。 */
+  UI.maybeRestoreScene = function () {
+    if (UI.activeScene || UI._sceneRestoreTried) return;
+    UI._sceneRestoreTried = true;
+    const st = RunState.get();
+    const stBusy = !!(st && (st.phase === 'running' || st.phase === 'await_nav_check'));
+    /* 优先级：在途流程自己的场景 > 落在本页的交接 > 上次手动选的场景 > spec_id 归一化推断。
+     * 在途期间用户可能手动把面板切到别的场景，ACTIVE_SCENE_KEY 会被改写；
+     * 如果拿它恢复，续跑的日志/步骤就会落进另一个场景（正是本次改造要杜绝的串场）。 */
+    let sid = stBusy ? String((st.task && st.task.script_id) || '') : '';
+    if (!sid) {
+      const pend = SVC.pendGet();
+      if (pend && pend.t && pend.t.script_id && SVC.pendAccept(pend, location.host)) {
+        sid = String(pend.t.script_id);
+      }
+    }
+    if (!sid && stBusy) {
+      try { sid = String(GM_getValue(ACTIVE_SCENE_KEY, '') || ''); } catch (e) {}
+    }
+    /* 最后才按 spec_id 推断：个别 spec 的 script_id 不遵循点号→下划线约定
+     * （如 huawei-ads.get-api-key → huawei_ads_get_key），推断只能当兜底。 */
+    if (!sid && stBusy) sid = String(st.specId || '').replace(/[.\-]/g, '_');
+    if (!sid) return;
+    SVC.scenes().then(function (list) {
+      const find = function (id) {
+        return (list || []).filter(function (x) { return x && String(x.script_id) === String(id); })[0];
+      };
+      let s = find(sid);
+      if (!s && stBusy) {
+        // 推断/记录对不上时，再用「上次手动选的场景」试一次（仍然要求存在且非 draft）
+        let alt = '';
+        try { alt = String(GM_getValue(ACTIVE_SCENE_KEY, '') || ''); } catch (e) {}
+        if (alt && alt !== sid) { sid = alt; s = find(alt); }
+      }
+      if (!s || s.status === 'draft' || UI.activeScene) return;
+      UI._setActiveScene(sid, { render: true });
+    }).catch(function () {});
+  };
+
+  /* 未回写结果：公共位置提示一次（首页 / 工作区都能看到） */
+  function renderPendingBar() {
+    const box = document.getElementById('masr-pending');
+    if (!box) return;
+    const pend = pwList();
+    if (!pend.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.style.display = '';
+    box.innerHTML = '<span style="font-size:11px;color:#b26a00">有 ' + pend.length + ' 条结果还没写进飞书</span> ' +
+      '<button class="masr-mini primary" id="masr-retry-writes" title="把上次没写进飞书的结果重新提交">重试回写 (' + pend.length + ')</button>';
     const rw = document.getElementById('masr-retry-writes');
     if (rw) rw.addEventListener('click', function () { UI.retryWrites(rw); });
-    // 单元格取值：优先 display（服务端按 scene.display 算好的），其次 params，最后原字段
-    function cellOf(t, f) {
-      if (!t) return '';
-      if (t.display && t.display[f] !== undefined) return t.display[f];
-      if (t.params && t.params[f] !== undefined) return t.params[f];
-      return t[f];
-    }
-    function esc(s) {
-      return String(s === undefined || s === null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
+  }
 
+  function sceneCardHtml(s, i, isLast) {
+    const draft = s.status === 'draft';
+    const deprecated = s.status === 'deprecated';
+    return '<div data-i="' + i + '" class="masr-scene-card' + (draft ? ' draft' : '') + (UI._running ? ' locked' : '') + '">' +
+      '<span class="nm">' + escHtml(s.name || s.script_id) + '</span>' +
+      (s.spec_version ? ' <span class="masr-chip" style="font-size:10px">v' + escHtml(s.spec_version) + '</span>' : '') +
+      (isLast ? ' <span class="masr-chip" style="font-size:10px" title="上次使用的场景">上次</span>' : '') +
+      (deprecated ? ' <span style="font-size:11px;color:#8f959e">已弃用</span>' : '') +
+      (draft ? ' <span style="font-size:11px;color:#b26a00">草稿 · 暂不可执行</span>' : '') +
+      '</div>';
+  }
+
+  /* 第 1 页：业务分组首页（列表来自 /scenes，分组来自发布产物；引擎不登记任何场景） */
+  async function renderHome() {
+    const home = document.getElementById('masr-home');
+    if (!home) return;
+    home.style.display = '';
+    const me = SVC.me() || {};
+    home.innerHTML =
+      '<div class="masr-home-top">' +
+        '<span>已绑定 <b style="color:#1a7f45">' + escHtml(me.name || '') +
+          (me.dept ? ' · ' + escHtml(me.dept) : '') + '</b></span>' + modeTag() +
+      '</div>' +
+      '<div id="masr-scene-body"><span class="masr-muted">正在加载业务场景…</span></div>';
     const body = document.getElementById('masr-scene-body');
-
-    /* 第 1 页：业务场景选择（列表来自 /scenes，引擎不登记任何场景） */
-    async function renderScenePicker() {
-      body.innerHTML = '<span style="font-size:11px;color:#8f959e">正在加载业务场景…</span>';
-      try {
-        const r = await SVC.scenes();
-        const list = (Array.isArray(r) ? r : (r && r.list) || []).slice();
-        if (!list.length) {
-          body.innerHTML = '<div style="font-size:11px;color:#8f959e">服务端暂无可用业务场景</div>';
-          return;
-        }
-        body.innerHTML =
-          '<div style="font-size:11px;color:#8f959e;margin:2px 0">选择要处理的业务场景：</div>' +
-          list.map(function (s, i) {
-            const draft = s.status === 'draft';
-            return '<div data-i="' + i + '" style="border:1px solid ' + (draft ? '#e5e5e5' : '#b7d8f5') +
-              ';background:' + (draft ? '#fafafa' : '#f2f8ff') + ';border-radius:6px;padding:6px 9px;margin:4px 0;cursor:' +
-              (draft ? 'not-allowed' : 'pointer') + ';opacity:' + (draft ? 0.55 : 1) + '">' +
-              '<b style="font-size:12px">' + esc(s.name || s.script_id) + '</b>' +
-              (draft ? ' <span style="font-size:11px;color:#b26a00">草稿 · 暂不可执行</span>' : '') +
-              '</div>';
-          }).join('') +
-          '<div style="font-size:11px;color:#8f959e;margin-top:2px">也可以直接点业务表里的按钮：页面会自动识别记录并填充，无需在这里选。</div>';
-        body.querySelectorAll('[data-i]').forEach(function (el) {
-          el.addEventListener('click', function () {
-            const s = list[Number(el.getAttribute('data-i'))];
-            if (!s || s.status === 'draft') return;      // 草稿场景不可执行
-            renderSceneTasks(s.script_id);
-          });
+    try {
+      const r = await SVC.scenes();
+      // 等场景列表期间可能已经选中了场景（URL 触发/用户点了卡片）→ 不再覆盖工作区
+      if (UI.activeScene || !body.isConnected) return;
+      const list = (Array.isArray(r) ? r : (r && r.list) || []).slice();
+      if (!list.length) { body.innerHTML = '<div class="masr-muted">服务端暂无可用业务场景</div>'; return; }
+      const groups = [];
+      const byName = {};
+      list.forEach(function (s) {
+        const g = String(s.group || '其他');
+        if (!byName[g]) { byName[g] = { name: g, items: [] }; groups.push(byName[g]); }
+        byName[g].items.push(s);
+      });
+      // 「其他」永远排最后：老服务端/未分组场景不该插在业务分组中间
+      groups.sort(function (a, b) { return (a.name === '其他' ? 1 : 0) - (b.name === '其他' ? 1 : 0); });
+      let html = '<div class="masr-muted" style="margin:2px 0 4px">选择要处理的业务场景；也可以直接点业务表里的按钮，页面会自动识别记录。</div>';
+      let idx = 0;
+      const indexOf = new Map();
+      let lastSid = '';
+      try { lastSid = String(GM_getValue(ACTIVE_SCENE_KEY, '') || ''); } catch (e) {}
+      groups.forEach(function (g) {
+        // 折叠与否由发布产物声明（group_collapsed），引擎不认识任何具体分组名
+        const collapsed = !!g.items[0].group_collapsed;
+        const cards = g.items.map(function (s) {
+          const i = idx++; indexOf.set(i, s);
+          return sceneCardHtml(s, i, lastSid && String(s.script_id) === lastSid);
+        }).join('');
+        html += '<div class="masr-groupbox">' +
+          (collapsed
+            ? '<details><summary class="masr-group" style="cursor:pointer">' + escHtml(g.name) +
+                ' <span class="cnt">' + g.items.length + ' 个场景</span></summary>'
+            : '<div class="masr-group">' + escHtml(g.name) + ' <span class="cnt">' + g.items.length + ' 个场景</span></div>') +
+          cards + (collapsed ? '</details>' : '') + '</div>';
+      });
+      body.innerHTML = html;
+      body.querySelectorAll('[data-i]').forEach(function (el) {
+        el.addEventListener('click', function () {
+          if (UI._running) {
+            UI.appendLog({ t: Date.now(), level: 'warn', msg: '正在执行任务，暂不能切换业务场景（跑完再切）' });
+            return;
+          }
+          const s = indexOf.get(Number(el.getAttribute('data-i')));
+          if (!s || s.status === 'draft') return;      // 草稿场景不可执行
+          UI.selectScene(s.script_id);
         });
-      } catch (e) {
-        body.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + esc(e.message) + '</div>';
-      }
+      });
+    } catch (e) {
+      body.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + escHtml(e.message) + '</div>';
     }
+  }
 
-    /* 第 2 页：单个场景的待办——过滤条件完全由该场景 spec 声明，服务端执行 */
-    async function renderSceneTasks(sid) {
-      const view = SVC.sceneView(sid);
-      body.innerHTML =
-        '<div style="display:flex;align-items:center;gap:6px;margin:2px 0">' +
-          '<button id="masr-back-picker" class="masr-mini">← 场景</button>' +
-          '<b style="font-size:12px">' + esc(view.name) + '</b>' +
+  /* 第 2 页：单场景工作区（面包屑 + 该场景待办；参数/步骤/结果按可见性规则出现） */
+  function renderWork() {
+    const work = document.getElementById('masr-work');
+    if (!work) return;
+    work.style.display = '';
+    const sc = UI.activeScene || { script_id: '', name: '开发调试', group: '' };
+    const head = document.getElementById('masr-work-head');
+    head.innerHTML =
+      '<button class="masr-mini" id="masr-back-home"' + (UI._running ? ' disabled title="执行中不能切换场景"' : '') + '>← 业务场景</button>' +
+      '<span class="grp">' + escHtml(sc.group || '') + '</span>' +
+      '<span class="cur">' + escHtml(sc.name || '') + '</span>' +
+      '<span id="masr-spec-badge"></span>' +
+      '<span class="grow"></span>' +
+      '<button class="masr-mini" id="masr-refresh-tasks"' + (UI._running ? ' disabled' : '') +
+        ' title="只重拉当前场景的待办，不切页、不影响日志">刷新待办</button>';
+    const back = document.getElementById('masr-back-home');
+    if (back) back.addEventListener('click', UI.clearActiveScene);
+    const rf = document.getElementById('masr-refresh-tasks');
+    if (rf) rf.addEventListener('click', function () { renderSceneTasks(sc.script_id, { force: true }); });
+    if (UI.spec && (specMatchesScene(sc) || UI.devOn)) UI.renderSpecBadge(UI.spec); else UI.renderSpecBadge(null);
+    renderSceneTasks(sc.script_id);
+    UI.updateWorkVisibility();
+  }
+
+  /* 单个场景的待办——过滤条件完全由该场景 spec 声明，服务端执行。
+   * 同一个场景已画过就不重拉（重绘频繁），点「刷新待办」或跑完一轮才 force 重取。 */
+  async function renderSceneTasks(sid, opts) {
+    const list = document.getElementById('masr-task-list');
+    if (!list) return;
+    if (!sid) { list.innerHTML = ''; return; }
+    if (!(opts && opts.force) && UI._tasksShownFor === sid && list.innerHTML) return;
+    const view = SVC.sceneView(sid);
+    UI._tasksShownFor = sid;
+    list.innerHTML = '<span class="masr-muted">按该场景声明的过滤条件查询中…</span>';
+    try {
+      /* v0.9.47：/bootstrap 一次拿齐「场景 + 该场景 spec + 待办」，spec 顺手进本地缓存，
+       * 点「执行」时就不用再等一次 /spec。 */
+      const bundle = await SVC.sceneBundle(sid);
+      if (UI.activeScene && String(UI.activeScene.script_id) !== String(sid)) return; // 期间切走了
+      const j = bundle.tasks;
+      if (!j.total) {
+        list.innerHTML = '<div class="masr-muted">' + escHtml(view.emptyHint) + '</div>';
+        return;
+      }
+      const totalShown = j.items.length;
+      list.innerHTML =
+        '<div class="masr-muted" style="margin-bottom:2px">共 ' + j.total + ' 条：点「执行」单条跑，或点「批量执行」一次性串行跑完（同一浏览器会话全局共用，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
+        '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
+          '<input id="masr-batch-n" type="number" min="1" max="' + totalShown + '" value="' + totalShown + '" style="width:58px">' +
+          '<button class="primary" id="masr-batch-run">批量执行（前 <span id="masr-batch-n-lab">' + totalShown + '</span> 条）</button>' +
+          '<button id="masr-batch-stop" style="display:none">停止</button>' +
+          '<span id="masr-batch-prog" style="font-size:11px;color:#1a7f45"></span>' +
         '</div>' +
-        '<div id="masr-task-list"><span style="font-size:11px;color:#8f959e">按该场景声明的过滤条件查询中…</span></div>';
-      document.getElementById('masr-back-picker').addEventListener('click', renderScenePicker);
-      const list = document.getElementById('masr-task-list');
-      try {
-        /* v0.9.47：/bootstrap 一次拿齐「场景 + 该场景 spec + 待办」，spec 顺手进本地缓存，
-         * 点「执行」时就不用再等一次 /spec。 */
-        const bundle = await SVC.sceneBundle(sid);
-        const j = bundle.tasks;
-        if (!j.total) {
-          list.innerHTML = '<div style="font-size:11px;color:#8f959e">' + esc(view.emptyHint) + '</div>';
-          return;
-        }
-        const totalShown = j.items.length;
-        list.innerHTML =
-          '<div style="font-size:11px;color:#8f959e;margin-bottom:2px">共 ' + j.total + ' 条：点「执行」单条跑，或点「批量执行」一次性串行跑完（同一浏览器会话全局共用，必须串行，跑的过程中勿把本窗口切到后台/最小化）</div>' +
-          '<div style="display:flex;align-items:center;gap:6px;margin:4px 0;flex-wrap:wrap">' +
-            '<input id="masr-batch-n" type="number" min="1" max="' + totalShown + '" value="' + totalShown + '" style="width:58px">' +
-            '<button class="primary" id="masr-batch-run">批量执行（前 <span id="masr-batch-n-lab">' + totalShown + '</span> 条）</button>' +
-            '<button id="masr-batch-stop" style="display:none">停止</button>' +
-            '<span id="masr-batch-prog" style="font-size:11px;color:#1a7f45"></span>' +
-          '</div>' +
-          '<table><tr>' + view.columns.map(function (c) { return '<th>' + esc(c.label) + '</th>'; }).join('') + '<th></th></tr>' +
-          j.items.map(function (t, i) {
-            return '<tr>' + view.columns.map(function (c) {
-              const v = cellOf(t, c.field);
-              return '<td>' + (v === null || v === undefined || v === '' ? '-' : esc(v)) + '</td>';
-            }).join('') + '<td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
-          }).join('') + '</table>' +
-          '<div id="masr-batch-report"></div>';
-        const nEl = document.getElementById('masr-batch-n');
-        const nLab = document.getElementById('masr-batch-n-lab');
-        const batchRun = document.getElementById('masr-batch-run');
-        const batchStop = document.getElementById('masr-batch-stop');
-        const prog = document.getElementById('masr-batch-prog');
-        if (nEl && nLab) nEl.addEventListener('input', function () { nLab.textContent = nEl.value; });
-        if (batchRun) batchRun.addEventListener('click', function () {
-          const n = Math.min(Math.max(Number(nEl ? nEl.value : totalShown) || totalShown, 1), totalShown);
-          UI.runBatch(j.items.slice(0, n), prog, batchRun, batchStop);
-        });
-        if (batchStop) batchStop.addEventListener('click', function () {
-          UI._batchStop = true; batchStop.disabled = true; batchStop.textContent = '正在停止…';
-        });
-        list.querySelectorAll('button[data-idx]').forEach(function (b) {
-          b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))], b); });
-        });
-      } catch (e) {
-        list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + esc(e.message) + '</div>';
-      }
+        '<table><tr>' + view.columns.map(function (c) { return '<th>' + escHtml(c.label) + '</th>'; }).join('') + '<th></th></tr>' +
+        j.items.map(function (t, i) {
+          return '<tr>' + view.columns.map(function (c) {
+            const v = cellOf(t, c.field);
+            return '<td>' + (v === null || v === undefined || v === '' ? '-' : escHtml(v)) + '</td>';
+          }).join('') + '<td><button class="primary" data-idx="' + i + '">执行</button></td></tr>';
+        }).join('') + '</table>' +
+        '<div id="masr-batch-report"></div>';
+      const nEl = document.getElementById('masr-batch-n');
+      const nLab = document.getElementById('masr-batch-n-lab');
+      const batchRun = document.getElementById('masr-batch-run');
+      const batchStop = document.getElementById('masr-batch-stop');
+      const prog = document.getElementById('masr-batch-prog');
+      if (nEl && nLab) nEl.addEventListener('input', function () { nLab.textContent = nEl.value; });
+      if (batchRun) batchRun.addEventListener('click', function () {
+        const n = Math.min(Math.max(Number(nEl ? nEl.value : totalShown) || totalShown, 1), totalShown);
+        UI.runBatch(j.items.slice(0, n), prog, batchRun, batchStop);
+      });
+      if (batchStop) batchStop.addEventListener('click', function () {
+        UI._batchStop = true; batchStop.disabled = true; batchStop.textContent = '正在停止…';
+      });
+      list.querySelectorAll('button[data-idx]').forEach(function (b) {
+        b.addEventListener('click', function () { UI.runTask(j.items[Number(b.getAttribute('data-idx'))], b); });
+      });
+    } catch (e) {
+      list.innerHTML = '<div style="font-size:11px;color:#c02a2a">' + escHtml(e.message) + '</div>';
     }
-
-    renderScenePicker();
-    if (UI.renderTrigger) UI.renderTrigger();
   }
 
   UI.renderTasks = function () {
-    const box = document.getElementById('masr-tasks');
-    if (!box) return;
+    const tasksBox = document.getElementById('masr-tasks');
+    const home = document.getElementById('masr-home');
+    const work = document.getElementById('masr-work');
+    if (!tasksBox || !home || !work) return;
+    UI.renderCurScene();
+    renderPendingBar();
     // 第一步永远是服务地址（v0.4.13 起没有别的路径）
-    if (!SVC.code()) { renderBind(box); return; }
+    if (!SVC.code()) {
+      tasksBox.style.display = ''; home.style.display = 'none'; work.style.display = 'none';
+      renderBind(tasksBox); return;
+    }
+    tasksBox.style.display = 'none'; tasksBox.innerHTML = '';
     const me = SVC.me();
     if (!me) {
-      box.innerHTML = '<b>任务</b> <span style="color:#c02a2a">设备码失效（可能已在表里撤销）</span>' +
+      /* dev 调试态（手工粘贴 spec）不依赖业务身份：身份失效时仍让工作区可用，
+       * 否则「加载 spec / 同步 spec」在面板上完全看不到回执。 */
+      if (UI.devOn && UI.spec) {
+        home.style.display = 'none';
+        work.style.display = '';
+        renderWork();
+        if (UI.renderTrigger) UI.renderTrigger();
+        return;
+      }
+      home.style.display = ''; work.style.display = 'none';
+      home.innerHTML = '<b>身份</b> <span style="color:#c02a2a">设备码失效（可能已在表里撤销）</span>' +
         '<div class="row"><button id="masr-svc-reset">重新绑定身份</button>' +
         '<button id="masr-svc-rebind">重试连接</button></div><div id="masr-task-out" style="font-size:11px"></div>';
       document.getElementById('masr-svc-reset').addEventListener('click', function () {
@@ -5196,7 +5455,15 @@
       });
       return;
     }
-    renderBound(box, me);
+    UI.maybeRestoreScene();
+    if (UI.activeScene || (UI.devOn && UI.spec)) {
+      home.style.display = 'none';
+      renderWork();
+    } else {
+      work.style.display = 'none';
+      renderHome();
+    }
+    if (UI.renderTrigger) UI.renderTrigger();
   };
 
   // 任务面板每次重绘之后都带上「连接」行，保证入口永远在
@@ -5254,6 +5521,8 @@
   UI.runTask = async function (task, btn) {
     if (UI._running) return;
     UI._running = true;
+    const ballEl = document.getElementById('masr-ball');
+    if (ballEl) ballEl.classList.add('masr-running');
     /* 0.9.46：上一轮的结果若还没写进表，先补写（新的一轮马上会把运行态整个覆盖掉）。 */
     if (UI.settlePreviousFinal) UI.settlePreviousFinal();
     /* 0.9.40：上一条流程的 final 回写可能还在路上（典型：提交完成 → 收尾场景同秒启动）。
@@ -5276,6 +5545,9 @@
         write_token: task.write_token || '',
       };
       const scene = SVC.scriptFor(UI.currentTask);
+      /* 0.9.65：面板对齐到「真正在跑的这个场景」——日志/步骤/参数都归它，避免跑到一半面板
+       * 还停在别的场景上（触发自动开跑时尤其明显）。不重新拉待办，只切状态。 */
+      UI._setActiveScene(scene, { keepTask: true, render: false });
       // 任务摘要只取 scene.display 的第一个值（列名是业务侧声明的，Runner 不认识具体含义）
       const dk = task.display ? Object.keys(task.display) : [];
       const dv = dk.length ? task.display[dk[0]] : '';
@@ -5338,6 +5610,11 @@
     } finally {
       UI._running = false;
       paceStop();
+      const ballDone = document.getElementById('masr-ball');
+      if (ballDone) ballDone.classList.remove('masr-running');
+      // 跑完这一轮：待办状态可能已变，下一次重绘要重新取（而不是命中旧列表缓存）
+      UI._tasksShownFor = '';
+      if (UI.updateWorkVisibility) UI.updateWorkVisibility();
       // 预热是「跑的时候顺手捂热」，跑完就该停：实测它会在流程结束后继续每 6s 打一次 /health?warm=1，
       // 一个标签页挂 90s 就是十几枪白请求，还要跟真正的回写抢连接。
       try { clearInterval(UI._warmTimer); } catch (e) {}
@@ -5354,6 +5631,11 @@
     if (UI._running) return;
     if (!tasks || !tasks.length) return;
     UI._running = true;
+    const ballRun = document.getElementById('masr-ball');
+    if (ballRun) ballRun.classList.add('masr-running');
+    // 批量日志归「这一批的场景」：先清掉上一条任务残留的 currentTask，再对齐当前场景
+    UI.currentTask = null;
+    if (tasks[0] && tasks[0].script_id) UI._setActiveScene(tasks[0].script_id, { keepTask: true, render: false });
     UI._batchStop = false;
     if (runBtn) runBtn.style.display = 'none';
     if (stopBtn) { stopBtn.style.display = ''; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
@@ -5454,6 +5736,9 @@
 
     UI._running = false;
     UI._batchStop = false;
+    const ballBatch = document.getElementById('masr-ball');
+    if (ballBatch) ballBatch.classList.remove('masr-running');
+    UI._tasksShownFor = '';
     if (runBtn) runBtn.style.display = '';
     if (stopBtn) { stopBtn.style.display = 'none'; stopBtn.disabled = false; stopBtn.textContent = '停止'; }
     rows.forEach(function (b) { b.disabled = false; });
@@ -6249,6 +6534,7 @@
       }
       UI._lastSpecKey = specKey;
       if (repaired) UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到弯引号等脏字符，已自动修复——但建议以后先粘到记事本再复制过来，保证与 git 里的原文逐字节一致' });
+      if (UI.updateWorkVisibility) UI.updateWorkVisibility();
       return true;
     } catch (e) {
       if (!opts.fromStore) UI.appendLog({ t: Date.now(), level: 'fatal', msg: 'spec 加载失败: ' + e.message });
@@ -6274,77 +6560,176 @@
       '<span style="margin-right:12px">' + k + '=<b class="' + (/ok|在位/.test(v) ? 'ok' : 'warn') + '">' + v + '</b></span>').join('');
   };
 
-  // 持久化日志：GM 跨页存储，页面跳转/刷新后仍可追溯（v0.1.9）
+  /* 持久化日志：GM 跨页存储，页面跳转/刷新后仍可追溯（v0.1.9）
+   * 0.9.65：每条日志带归属（scope=scene/common + sid=script_id）。
+   * 面板分「本场景 / 公共」两个视图：切场景只显示该场景的日志；同步 spec、绑定/连接、
+   * 检查更新、自检、续跑状态这类跨场景的动作归公共视图，任何场景下都能查。
+   * 老版本（masr_logs_v1）没有标签，一次性迁移成公共日志。 */
   const LogStore = {
-    KEY: 'masr_logs_v1',
-    MAX: 300, // 环形上限，超出淘汰最旧
+    KEY: 'masr_logs_v2',
+    OLD_KEY: 'masr_logs_v1',
+    MAX: 500, // 环形上限，超出淘汰最旧（两个视图共用这个池子）
     get() {
-      try { return JSON.parse(GM_getValue(LogStore.KEY, '[]')) || []; }
-      catch (e) { return []; }
+      try {
+        const arr = JSON.parse(GM_getValue(LogStore.KEY, 'null'));
+        if (Array.isArray(arr)) return arr;
+      } catch (e) { /* 落到迁移 */ }
+      let old = [];
+      try { old = JSON.parse(GM_getValue(LogStore.OLD_KEY, '[]')) || []; } catch (e) {}
+      const arr = old.map(function (e) {
+        return { t: e.t, level: e.level || 'info', msg: String(e.msg || ''), scope: 'common', sid: '' };
+      });
+      try {
+        if (arr.length) GM_setValue(LogStore.KEY, JSON.stringify(arr));
+        GM_deleteValue(LogStore.OLD_KEY);
+      } catch (e) {}
+      return arr;
     },
+    set(arr) { try { GM_setValue(LogStore.KEY, JSON.stringify(arr)); } catch (e) { /* 存储失败不阻断执行 */ } },
     push(entry) {
       const arr = LogStore.get();
-      arr.push({ t: entry.t, level: entry.level, msg: String(entry.msg).slice(0, 2000) });
+      arr.push({
+        t: entry.t || Date.now(), level: entry.level || 'info',
+        msg: String(entry.msg).slice(0, 2000),
+        scope: entry.scope === 'scene' ? 'scene' : 'common',
+        sid: String(entry.sid || ''),
+      });
       while (arr.length > LogStore.MAX) arr.shift();
-      try { GM_setValue(LogStore.KEY, JSON.stringify(arr)); } catch (e) { /* 存储失败不阻断执行 */ }
+      LogStore.set(arr);
     },
+    dropWhere(pred) { LogStore.set(LogStore.get().filter(function (e) { return !pred(e); })); },
     clear() { try { GM_deleteValue(LogStore.KEY); } catch (e) {} }
   };
 
-  UI.renderLogEntry = function (entry) {
+  /* 归属解析：显式 scope=common 的一律进公共视图；其余按「正在跑的任务 → 当前场景」归场景 */
+  UI.entryScope = function (entry) {
+    if (entry && entry.scope === 'common') return { scope: 'common', sid: '' };
+    const sid = String((entry && entry.sid) ||
+      (UI.currentTask && UI.currentTask.script_id) ||
+      (UI.activeScene && UI.activeScene.script_id) || '');
+    return sid ? { scope: 'scene', sid: sid } : { scope: 'common', sid: '' };
+  };
+  UI.logKeyOf = function (rec) {
+    return (rec && rec.scope === 'scene' && rec.sid) ? ('scene:' + rec.sid) : 'common';
+  };
+  UI.visibleLogKey = function () {
+    if (UI.logView === 'scene' && UI.activeScene) return 'scene:' + UI.activeScene.script_id;
+    return 'common';
+  };
+  UI.setLogView = function (v) {
+    UI.logView = (v === 'scene' && UI.activeScene) ? 'scene' : 'common';
+    UI.renderLogs();
+  };
+
+  UI.renderLogTabs = function () {
+    const sceneTab = document.getElementById('masr-log-tab-scene');
+    const commonTab = document.getElementById('masr-log-tab-common');
+    if (!sceneTab || !commonTab) return;
+    const list = LogStore.get();
+    const sceneN = UI.activeScene
+      ? list.filter(function (e) { return UI.logKeyOf(e) === 'scene:' + UI.activeScene.script_id; }).length : 0;
+    const commonN = list.filter(function (e) { return UI.logKeyOf(e) === 'common'; }).length;
+    sceneTab.style.display = UI.activeScene ? '' : 'none';
+    sceneTab.textContent = '本场景 (' + sceneN + ')';
+    commonTab.textContent = '公共 (' + commonN + ')';
+    const key = UI.visibleLogKey();
+    sceneTab.classList.toggle('on', key !== 'common');
+    commonTab.classList.toggle('on', key === 'common');
+  };
+
+  /* 写一条到指定容器；msg 一律按纯文本写入（以前拼 innerHTML，页面/接口文本会串样式甚至注入） */
+  UI.renderLogEntry = function (entry, el) {
+    const box = el || document.getElementById('masr-log');
+    if (!box) return;
+    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+    const cls = entry.level === 'fatal' ? 'fatal' : entry.level === 'warn' ? 'warn' : entry.level === 'ok' ? 'ok' : '';
+    const line = document.createElement('div');
+    line.className = 'logline' + (cls ? ' ' + cls : '');
+    line.textContent = '[' + new Date(entry.t).toLocaleTimeString() + '] ' + entry.msg;
+    box.appendChild(line);
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  };
+
+  /* 整段重绘当前视图（切场景 / 切 Tab / 挂载恢复时用） */
+  UI.renderLogs = function () {
     const el = document.getElementById('masr-log');
     if (!el) return;
-    const cls = entry.level === 'fatal' ? 'fatal' : entry.level === 'warn' ? 'warn' : entry.level === 'ok' ? 'ok' : '';
-    el.innerHTML += '<span class="' + cls + '">[' + new Date(entry.t).toLocaleTimeString() + '] ' + entry.msg + '</span>\n';
+    const key = UI.visibleLogKey();
+    el.innerHTML = '';
+    LogStore.get().forEach(function (rec) {
+      if (UI.logKeyOf(rec) === key) UI.renderLogEntry(rec, el);
+    });
     el.scrollTop = el.scrollHeight;
+    UI.renderLogTabs();
   };
 
   UI.appendLog = function (entry) {
-    LogStore.push(entry);
-    UI.renderLogEntry(entry);
+    const sc = UI.entryScope(entry);
+    const rec = {
+      t: entry.t || Date.now(), level: entry.level || 'info', msg: entry.msg,
+      scope: sc.scope, sid: sc.sid,
+    };
+    LogStore.push(rec);
+    const key = UI.logKeyOf(rec);
+    if (key === UI.visibleLogKey()) {
+      UI.renderLogEntry(rec);
+      UI.renderLogTabs();
+    } else {
+      UI.logUnread = UI.logUnread || {};
+      UI.logUnread[key] = (UI.logUnread[key] || 0) + 1;
+      UI.renderLogTabs();
+    }
   };
 
   /* 传输层重试要说出来（0.9.25）：不静默重试——人看到「第 1/2 次重试」比「等了 20 秒突然失败」
    * 好得多，否则只会以为脚本卡死了。文案里刻意不出现内部错误码
-   * （spec-upgrade-smoke 有一条断言就是「E_SVC_* 这种内部码不许甩给用户」）。 */
+   * （spec-upgrade-smoke 有一条断言就是「E_SVC_* 这种内部码不许甩给用户」）。
+   * 连接属于公共设施，归公共视图。 */
   SVC.onRetry = function (n, max) {
     UI.appendLog({
-      t: Date.now(), level: 'warn',
+      t: Date.now(), level: 'warn', scope: 'common',
       msg: '到后端的这次连接没通，正在重试（第 ' + n + '/' + max + ' 次）…',
     });
   };
 
-  UI.replayPersistedLogs = function () {
-    const el = document.getElementById('masr-log');
-    if (!el) return;
-    const history = LogStore.get();
-    if (!history.length) return;
-    history.forEach(UI.renderLogEntry);
-    // 分隔线：标记历史与本次页面会话的边界（不入存储）
-    const sep = document.createElement('div');
-    sep.style.cssText = 'color:#7a8aa0;border-top:1px dashed #7a8aa0;margin:6px 0;padding-top:4px';
-    sep.textContent = '───── 以上为历史日志（跨页保留）｜本页：' + location.pathname.slice(0, 60) + ' ─────';
-    el.appendChild(sep);
-    el.scrollTop = el.scrollHeight;
-  };
+  /* 挂载时恢复跨页日志：按当前视图整段渲染（不再追加跨页分隔线，视图本身已经按归属过滤） */
+  UI.replayPersistedLogs = function () { UI.renderLogs(); };
 
   UI.clearLogs = function () {
-    LogStore.clear();
-    const el = document.getElementById('masr-log');
-    if (el) el.innerHTML = '';
-    UI.appendLog({ t: Date.now(), level: 'warn', msg: '日志已清空' });
+    const key = UI.visibleLogKey();
+    if (key === 'common') {
+      LogStore.dropWhere(function (e) { return UI.logKeyOf(e) === 'common'; });
+    } else {
+      LogStore.dropWhere(function (e) { return UI.logKeyOf(e) === key; });
+    }
+    UI.renderLogs();
+    UI.appendLog({
+      t: Date.now(), level: 'warn',
+      scope: key === 'common' ? 'common' : 'scene',
+      sid: key === 'common' ? '' : (UI.activeScene ? UI.activeScene.script_id : ''),
+      msg: '日志已清空（' + (key === 'common' ? '公共视图' : '本场景视图') + '）',
+    });
   };
 
-  // 复制日志为纯文本（从 LogStore 取权威数据：含跨页历史，不带 HTML 标记）
+  // 复制日志为纯文本：只复制当前视图（本场景 / 公共），带跨页历史，不带 HTML 标记
   UI.copyLogs = function () {
-    const entries = LogStore.get();
-    if (!entries.length) { alert('暂无日志可复制'); return; }
+    const key = UI.visibleLogKey();
+    const entries = LogStore.get().filter(function (e) { return UI.logKeyOf(e) === key; });
+    if (!entries.length) { alert('当前视图暂无日志可复制'); return; }
     const text = entries.map(function (e) {
       const d = new Date(e.t);
       const pad = function (n) { return (n < 10 ? '0' : '') + n; };
       return '[' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + '] ' + e.msg;
     }).join('\n');
-    const done = function () { UI.appendLog({ t: Date.now(), level: 'ok', msg: '已复制 ' + entries.length + ' 条日志到剪贴板' }); };
+    const done = function () {
+      UI.appendLog({
+        t: Date.now(), level: 'ok',
+        // 回执要落在「你刚复制的那一栏」里，不能跑进另一个视图
+        scope: key === 'common' ? 'common' : 'scene',
+        sid: key === 'common' ? '' : (UI.activeScene ? UI.activeScene.script_id : ''),
+        msg: '已复制 ' + entries.length + ' 条日志到剪贴板',
+      });
+    };
     // GM_setClipboard 不受页面 CSP/焦点限制，最可靠；没有时退回 execCommand 方案
     if (typeof GM_setClipboard === 'function') { GM_setClipboard(text); done(); return; }
     const ta = document.createElement('textarea');
@@ -6384,6 +6769,7 @@
     const ball = document.getElementById('masr-ball');
     if (!ball) return;
     const cur = UI.installedVersion();
+    const sceneTip = (UI.activeScene && UI.activeScene.name) ? ' · 场景：' + UI.activeScene.name : '';
     let dot = document.getElementById('masr-dot');
     if (on) {
       if (!dot) {
@@ -6392,10 +6778,10 @@
         ball.appendChild(dot);
       }
       dot.title = '有新版本 v' + (ver || '') + ' 可更新';
-      ball.title = 'MAS-Runner v' + cur + '｜有新版本 v' + (ver || '') + '（点击打开/收起）';
+      ball.title = 'MAS-Runner v' + cur + sceneTip + '｜有新版本 v' + (ver || '') + '（点击打开/收起）';
     } else {
       if (dot) dot.remove();
-      ball.title = 'MAS-Runner v' + cur + '（点击打开/收起）';
+      ball.title = 'MAS-Runner v' + cur + sceneTip + '（点击打开/收起）';
     }
   }
   UI.setUpdateDot = setUpdateDot;
@@ -6455,7 +6841,7 @@
     const oks = got.filter(function (r) { return !r.err; });
     if (!oks.length) {
       if (!silent) updOut('<span style="color:#b00">检查失败</span>');
-      if (!silent) UI.appendLog({ t: Date.now(), level: 'warn',
+      if (!silent) UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common',
         msg: '更新检查失败（' + (errs[0] ? errs[0].err : '没有可用的更新源') + '）——不影响使用，可稍后重试或手动到仓库安装' });
       return;
     }
@@ -6470,7 +6856,7 @@
       updOut('<span style="color:#1a7f43">新版 v' + ver + '</span>');
       const viaSelf = installUrlOf(best).indexOf('mas.wankahuanju.top') >= 0;
       UI.appendLog({
-        t: Date.now(), level: 'warn',
+        t: Date.now(), level: 'warn', scope: 'common',
         msg: '发现新版本 Runner v' + ver + '（当前 v' + cur + '）：' + (best.m.notes || '') +
           ' —— 点右上角「更新 v' + ver + '」安装，装完切回本页会自动重载' +
           (viaSelf ? '' : '（安装地址改走 ' + best.url.split('/')[2] + '，自建分发源版本落后）')
@@ -6479,12 +6865,12 @@
     }
     applyUpdateState('');
     if (!silent) updOut('<span style="color:#666">已是最新 v' + cur + '</span>');
-    if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已是最新版本 v' + cur });
+    if (!silent) UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common', msg: 'Runner 已是最新版本 v' + cur });
     // 有源报的版本比当前装的还旧 = 那条分发链没跟上（最常见是 KV 里的 commit 没刷新）。
     // 这种时候「检查更新」是瞎的：它只看得见旧版本，必须点名，否则用户会一直以为已是最新。
     const stale = oks.filter(function (r) { return cmpVer(r.m.version, cur) < 0; });
     if (stale.length && !silent) {
-      UI.appendLog({ t: Date.now(), level: 'warn',
+      UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common',
         msg: '⚠️ 有更新源给的版本比当前还旧（' + stale.map(function (r) { return 'v' + r.m.version; }).join(' / ') +
           '）——那条分发链没刷新，自动更新会失灵：需要手动装一次，或由发布方重写分发指针' });
     }
@@ -6512,7 +6898,7 @@
     if (cmpVer(UI.installedVersion(), p.ver) >= 0) {
       // 本页已经是新版本：说明重载已生效，收尾
       pendClear(); UI.renderHead(); applyUpdateState(''); updOut('已更新到 v' + UI.installedVersion());
-      UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已更新到 v' + UI.installedVersion() + '（本页已生效）' });
+      UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common', msg: 'Runner 已更新到 v' + UI.installedVersion() + '（本页已生效）' });
       return;
     }
     if (busyNow()) { updatePendingHint('正在执行任务，跑完后再重载'); return; }
@@ -6562,10 +6948,10 @@
     pendSet({ ver: ver, url: url, at: Date.now(), tries: 0, stale: false });
     updOut('<span style="color:#1a7f43">安装页已打开 v' + ver + '</span>');
     UI.appendLog({
-      t: Date.now(), level: 'info',
+      t: Date.now(), level: 'info', scope: 'common',
       msg: '已打开安装页 v' + ver + '：在油猴弹窗里点「安装」，装完切回本页会自动重载（日志/参数/待办都已存好，重载不丢）'
     });
-    try { window.open(url, '_blank', 'noopener'); } catch (e) { UI.appendLog({ t: Date.now(), level: 'warn', msg: '打开安装页被拦截，请放行弹窗或手动访问 ' + url }); }
+    try { window.open(url, '_blank', 'noopener'); } catch (e) { UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common', msg: '打开安装页被拦截，请放行弹窗或手动访问 ' + url }); }
     armReloadWatch();
   };
 
@@ -7037,6 +7423,7 @@
     rEl.innerHTML = '<b>outputs</b>（导出 JSON 可见完整值；下表已脱敏）<table>' +
       Object.keys(outputs || {}).map(k =>
         '<tr><td>' + k + '</td><td>' + ENGINE.maskValue(outputs[k]) + '</td></tr>').join('') + '</table>';
+    if (UI.updateWorkVisibility) UI.updateWorkVisibility();
   }
 
   /* ==================== 启动 ==================== */
@@ -7145,6 +7532,16 @@
   UI.renderTrigger = function () {
     const box = document.getElementById('masr-trigger-box');
     if (!box) return;
+    /* 0.9.65：URL 触发取到了任务、但面板还停在业务分组首页时，先切到该场景的工作区——
+     * 触发卡就在工作区里，不切过去用户只会看到「什么都没发生」。
+     * 用户已经手动选了别的场景时不抢：只在卡片里提示本页属于哪个场景。 */
+    const pre = UI._triggerTask;
+    if (pre && pre.script_id && !UI._trigSwitching && !UI.activeScene) {
+      UI._trigSwitching = true;
+      try { UI._setActiveScene(pre.script_id, { keepTask: true, render: true }); }
+      finally { UI._trigSwitching = false; }
+      return;
+    }
     const t = UI._triggerTask, err = UI._triggerErr || '', mark = UI._triggerMark;
     if (!t && !err && !mark) { box.innerHTML = ''; return; }
     const bar = 'margin-top:4px;padding:5px 7px;border-radius:6px;';
@@ -7222,6 +7619,9 @@
       from_url: !!task.from_url,
       on_match: task.on_match || '',
     };
+    /* 0.9.65：URL 触发 / 上游交接落到本页时，面板直接切到这个场景的工作区，
+     * 触发卡与参数才有地方显示（否则用户看到的是业务分组首页，以为没接上）。 */
+    if (task.script_id) UI._setActiveScene(task.script_id, { keepTask: true, render: true });
     // 缓存优先：命中本地 spec 就立刻开跑，不等公网；版本校验放后台（见下面 specRefresh）
     const t0 = Date.now();
     const cached = SVC.specCache.get(task.script_id);
@@ -7496,6 +7896,9 @@
         await SVC.scenes();
         const hit = SVC.matchTrigger();
         UI._trigger = hit;
+        /* 0.9.65：一旦命中场景，先把「当前业务」对齐到它，再往下取数/打日志——
+         * 「页面身份入口 / 反查命中」这些日志都属于这个场景，不能落进公共视图。 */
+        if (hit && hit.script_id) UI._setActiveScene(hit.script_id, { keepTask: true, render: false });
         /* 0.9.56：多场景命中但被交接上下文选中时要留痕——否则人只看到「跑了」，
          * 不知道引擎是靠什么在两条业务之间做的选择。 */
         if (hit && SVC._triggerByPend) {
@@ -7949,7 +8352,7 @@
              * 同一页会 mountAll 多次（路由变化/刷新），同一份交接只提示一次，别刷屏。 */
             if (UI._pendLoggedFor !== pend.t.record_id) {
               UI._pendLoggedFor = pend.t.record_id;
-              UI.appendLog({ t: Date.now(), level: 'info', msg: '已接管上游交接的任务上下文（记录 ' +
+              UI.appendLog({ t: Date.now(), level: 'info', sid: pend.t.script_id, msg: '已接管上游交接的任务上下文（记录 ' +
                 pend.t.record_id + ' → 场景 ' + pend.t.script_id + '），由本页场景认领后取数' });
             }
           } else {
@@ -7993,7 +8396,7 @@
       const seen = String(GM_getValue(UPD.SEEN_KEY, '') || '');
       if (seen !== cur) {
         GM_setValue(UPD.SEEN_KEY, cur);
-        if (seen) UI.appendLog({ t: Date.now(), level: 'ok', msg: 'Runner 已从 v' + seen + ' 更新到 v' + cur + '（本页已生效）' });
+        if (seen) UI.appendLog({ t: Date.now(), level: 'ok', scope: 'common', msg: 'Runner 已从 v' + seen + ' 更新到 v' + cur + '（本页已生效）' });
       }
     } catch (e) {}
     // 更新流程收尾：装完回到页面 → 自动重载（不打断正在跑的任务；最多自动重载一次，绝不循环）
@@ -8011,7 +8414,7 @@
       if (sig !== seenSig) {
         try { sessionStorage.setItem('masrPwWarnSig', sig); } catch (e) {}
         UI.appendLog({
-          t: Date.now(), level: 'warn',
+          t: Date.now(), level: 'warn', scope: 'common',
           msg: '有 ' + pw.length + ' 条结果还没写进飞书（已存本地）：' +
             pw.map(function (p) { return p.record_id + '（上报状态=' + p.status + '）'; }).join('、') +
             '——表里此刻还是旧状态，点「重试回写」补写后才算完',
@@ -8040,7 +8443,7 @@
       const freshS = Date.now() - (Number(st.navAt) || 0) < 10 * 60 * 1000;
       const wantS = String((st.navExpect && st.navExpect.url_contains) || '');
       UI.appendLog({
-        t: Date.now(), level: 'info',
+        t: Date.now(), level: 'info', scope: 'common',
         msg: '[运行态] 本页读到：phase=' + (st.phase || '无') +
           (st.navStepId ? '，步骤=' + st.navStepId : '') +
           /* 打毫秒时间戳而不是 toLocaleTimeString：后者每秒都不同，golden 基线没法比。
@@ -8052,7 +8455,7 @@
           '，参数键=' + (Object.keys(st.params || {}).join(',') || '无'),
       });
     } else {
-      UI.appendLog({ t: Date.now(), level: 'info', msg: '[运行态] 本页读到：无（没有待续跑/待回写的状态）' });
+      UI.appendLog({ t: Date.now(), level: 'info', scope: 'common', msg: '[运行态] 本页读到：无（没有待续跑/待回写的状态）' });
     }
     /* 卡在 running 的运行态：页面被 302/关标签打断时，doRun 的 finally 根本没机会跑，
      * 状态会永远停在 running。之前这种状态完全没人提——下一张页面既不复跑也不提示，
@@ -8091,7 +8494,7 @@
         } catch (e) {}
         armNavResumeReady(st);   // 就绪即续：不再盲等固定 2.5s（快页面省 2s，慢链路按 cookie 到位触发）
       } else {
-        UI.appendLog({ t: Date.now(), level: 'warn', msg: '检测到未完成的导航续跑（' + st.navStepId + '）：本页不匹配落地条件或状态过旧，点「执行」手动校验' });
+        UI.appendLog({ t: Date.now(), level: 'warn', scope: 'common', msg: '检测到未完成的导航续跑（' + st.navStepId + '）：本页不匹配落地条件或状态过旧，点「执行」手动校验' });
       }
       console.log('[MASR] await_nav_check:', st.navStepId, 'expect=', st.navExpect, 'auto=', fresh && urlOk);
     }
