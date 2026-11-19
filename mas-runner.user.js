@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.61
+// @version      0.9.62
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,15 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.62：`table_id_query_soft` 新增第三态 "pend_only"。
+//   背景：复制开户 ②C 与新开户 3A 在**不带 tableId** 的中转页（CAS regbyphone / login /
+//   ads 官网首页 / 无 tableId 的邀请页）pattern 完全重合。软模式（true）让两边都参与匹配，
+//   没有交接上下文时引擎按「多命中=谁都不认领」处理 → 线上 3A 的手动入口被一起挡死
+//   （2026-11-19 真机复现，trigger-matrix 26 条失败）。
+//   新语义：tableId 存在→照旧严格比对；tableId 不存在→**只有本机 pend 指向本场景**才放行。
+//   于是一个页面在「没人交接」时只归 3A，「②B 交接过来」时只归 ②C，两边都不再互相打架。
+//   老写法 true / 缺省的行为完全不变。
 //
 // 0.9.61：触发诊断把「判据」全打出来（用户要求：URL 都要有）。
 //   现场：复制开户 ②C 与新开户 3A 同时匹配 regbyphone，日志只说「多命中、已跳过」，
@@ -2383,7 +2392,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.61',
+    RUNNER_VERSION: '0.9.62',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -4048,7 +4057,19 @@
           tidRead = tid || '';
           if (tid) {
             if (!s.table_id || tid !== s.table_id) continue;
-          } else if (tr.table_id_query_soft !== true) {
+          } else if (tr.table_id_query_soft === true) {
+            /* 软模式：地址里没有这个参数 → 放行，交给交接上下文（pend）在末尾决出。 */
+          } else if (tr.table_id_query_soft === 'pend_only') {
+            /* 0.9.62：地址里没有 tableId 时，只有「本机交接上下文指向本场景」才参与认领。
+             * 复制开户 ②C 需要接住 regbyphone / CAS login 这类中转页，但**不能**在没人交接时
+             * 和新开户 3A 抢同一页（两者都命中 = 谁都不跑，2026-11-19 真机已复现）。
+             * 这样：有交接 → ②C 认领；没交接 → 只有 3A 认领，线上行为不被改变。 */
+            let pdOn = null;
+            try { pdOn = SVC.pendGet(); } catch (e) { pdOn = null; }
+            const okOn = !!(pdOn && pdOn.t && String(pdOn.t.script_id) === String(s.script_id)
+              && SVC.pendAccept(pdOn, location.host));
+            if (!okOn) continue;
+          } else {
             continue;
           }
         }
