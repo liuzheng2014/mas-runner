@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.63
+// @version      0.9.64
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,13 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.64：最小交接加 handoff/minimal 两个标记，修「写进去又被自己消费掉」。
+//   真机（2026-11-19 14:28:08）：0.9.63 已在 ads 邀请页写出最小 pend，但落地页 boot 的
+//   mountAll「恢复待办」分支把它当成普通待办 loadTriggeredTask + pendClear 了 —— 参数是空的，
+//   场景还没认领就被清掉，于是 regbyphone 上 ②C 因 pend_only 缺席、3A 又没有 recordId，仍断。
+//   现在：最小 pend 带 handoff=true（mountAll 只提示、不消费）+ minimal=true（本场景真正
+//   拿到任务后由 fire() 清掉，避免 1 小时残留）。上游 ②B 的完整交接不受影响。
 //
 // 0.9.63：认领即写「最小交接上下文」，修「认领后页面秒跳、记录丢失」。
 //   真机（2026-11-19 14:20:45）：复制开户 ②C 在 ads 邀请页认领成功 → 要 /task 取数（2~4s）→
@@ -2400,7 +2407,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.63',
+    RUNNER_VERSION: '0.9.64',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -7581,6 +7588,9 @@
             SVC.pendSet({
               script_id: hit.script_id, record_id: String(hit.record_id),
               params: {}, params_complete: false, display: null, on_match: hit.on_match,
+              /* handoff:true → mountAll 的「恢复待办」分支只提示、不消费（那条分支会把任务清掉）；
+               * minimal:true → 本场景真正开跑时由 fire() 清掉，避免 1 小时内残留。 */
+              handoff: true, minimal: true,
             }, location.host);
             UI.appendLog({ t: Date.now(), level: 'info',
               msg: '认领即写入最小交接上下文（防跳转丢记录）：' + hit.script_id + ' ← ' + hit.record_id });
@@ -7779,6 +7789,16 @@
           task.on_match = hit.on_match;
         }
         task.on_match = hit.on_match;
+        /* 0.9.64：最小交接是一次性的——本场景已经拿到任务，立刻清掉；
+         * 否则它会在 GM 存储里留 1 小时，把后面别的中转页认成这条记录。
+         * 只清 minimal=true 的那条，上游完整交接（②B 带参数）不动。 */
+        try {
+          const pdz = SVC.pendGet();
+          if (pdz && pdz.t && pdz.t.minimal === true && String(pdz.t.script_id) === String(hit.script_id)) {
+            SVC.pendClear();
+            UI.appendLog({ t: Date.now(), level: 'info', msg: '最小交接上下文已消费并清除（本页已拿到任务）' });
+          }
+        } catch (e) {}
         /* 0.9.44：开跑前核对「这条记录 ↔ 页面上登录着的这个账号」（见 identityGuard）。
          * 这一枪必须放在「参数已齐、尚未填表/回写」的位置：它是最后一道能拦住
          * 「把 A 的资料填到 B 的账号上、再把 B 的账户ID 写进 A 的记录」的闸。 */
