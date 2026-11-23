@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.68
+// @version      0.9.69
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,11 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.69：跨页续跑（continueFrom）补上步骤级 when 闸门。
+//   真机 2026-11-23（复制开户 ②A）：S1 是 navigate，落地 CAS 登录页后走续跑分支，
+//   而续跑分支漏了 step.when —— 登录页上仍去执行 S2「有会话才退出」，等满 8s 报
+//   E_UI_TARGET，登录永远走不到 S3。现与 runSpec 对齐：判不出 E_GATE，不命中则跳过。
 //
 // 0.9.68：续跑落地页不再无条件标 helper（补 0.9.67 漏掉的两处）。
 //   真机复现：0.9.67 只改了「导航返回后」那一处，但 boot 续跑（armNavResumeReady 前）
@@ -2419,7 +2424,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.68',
+    RUNNER_VERSION: '0.9.69',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3411,6 +3416,23 @@
       const step = spec.steps[i];
       ensureStepVars(spec, step, vars);
       scope = buildScope(spec, params, extracted, vars); // 懒派生后重建作用域
+      /* 步骤级 when 在续跑里同样必须生效（0.9.69）。
+       * 2026-11-23 真机：②A 的 S1 是 navigate，跨页续跑走的是本函数，而这里原来**没有**这道闸门
+       * ——落在 CAS 登录页后照样去执行 S2（「有会话才退出」），等满 8s 报 E_UI_TARGET，
+       * 流程永远走不到 S3 登录。与 runSpec 的语义保持一致：判不出就 E_GATE，不猜该不该执行。 */
+      if (step.when && typeof step.when === 'object') {
+        const sw = ENGINE.gateWhen(step.when, scope);
+        if (sw.error) {
+          log({ t: Date.now(), level: 'fatal', msg: step.id + ' 执行条件无法判定：' + sw.error + '——已终止（不猜该不该执行）' });
+          throw new RunnerError('E_GATE', step.id + ' 执行条件无法判定：' + sw.error);
+        }
+        if (!sw.hit) {
+          log({ t: Date.now(), level: 'info', msg: step.id + ' 跳过：执行条件未命中（' + sw.detail + '）' });
+          stepLogs.push({ id: step.id, name: step.name, mode: step.mode, ms: 0, skipped: true });
+          continue;
+        }
+        log({ t: Date.now(), level: 'info', msg: step.id + ' 执行条件命中（' + sw.detail + '），开始执行' });
+      }
       if (step.write === true) {
         const wchk = checkWriteAllowed(spec, step, writeCount, false);
         if (!wchk.ok) throw new RunnerError('E_PERM', wchk.msg);
