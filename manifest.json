@@ -1,14 +1,14 @@
 {
   "name": "MAS-Runner (spec interpreter v0.1)",
-  "version": "0.9.67",
+  "version": "0.9.68",
   "file": "mas-runner.user.js",
-  "sha256": "91fa1ace69e61d26bee9daf3fbdf9b2a4e389a9f0c8d1d06bf09f74cbb0db5da",
-  "bytes": 547635,
-  "published_at": "2026-11-23T15:41:55+08:00",
+  "sha256": "40e57d903e17648b9b499a60e7fa4b22e40e1940fc66389b1d81185e7d788342",
+  "bytes": 548955,
+  "published_at": "2026-11-23T15:48:24+08:00",
   "install_url": "https://mas.wankahuanju.top/runner.user.js",
   "mirror_url": "https://raw.githubusercontent.com/liuzheng2014/mas-runner/main/mas-runner.user.js",
   "mirror_url_cdn": "https://cdn.jsdelivr.net/gh/liuzheng2014/mas-runner@main/mas-runner.user.js",
   "source_repo": "liuzheng2014/biz-skill-forge (private) → runner/runner-v0.1.user.js（镜像：GitHub liuzheng2014/mas-runner + Gitee dahan_2014/mas-runner）",
   "description": "声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。",
-  "notes": "runner 0.9.67: 同标签导航不再标 helper（修页面跑完自毁关闭）"
+  "notes": "runner 0.9.68: 续跑落地页不再无条件标 helper（修页面被自毁关闭）"
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.67
+// @version      0.9.68
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.68：续跑落地页不再无条件标 helper（补 0.9.67 漏掉的两处）。
+//   真机复现：0.9.67 只改了「导航返回后」那一处，但 boot 续跑（armNavResumeReady 前）
+//   和 doResume() 里仍然无条件 sessionStorage.masrRole='helper'；流程 final 后辅助页
+//   自毁照样把用户这一页 window.close()。现在三步都只在 run state 的 openedTab===true
+//   （上一步真的新开了标签页）时才标记；同标签导航的落地页保持 origin，不关。
 //
 // 0.9.67：修「同标签导航的页面被当成辅助页、跑完自毁关闭」。
 //   真机（2026-11-23 15:38~15:39）：复制开户 ②A 的 S1 是同标签导航（location.href），
@@ -2413,7 +2419,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.67',
+    RUNNER_VERSION: '0.9.68',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -3252,6 +3258,10 @@
     const st = RunState.get() || {};
     st.phase = 'await_nav_check';
     st.navStepId = step.id;
+    /* 0.9.68：记住这一步到底是「新开标签页」还是「同标签跳转」——
+     * 续跑时只有前者才是可丢弃的辅助页；同标签的落地页就是用户正在看的那一页，
+     * 标成 helper 会让它在流程结束时被 window.close() 掉（真机：页面闪一下就消失）。 */
+    st.openedTab = newTab;
     st.navExpect = step.expect || {};
     st.navAt = Date.now();
     st.extracted = extracted;   // 产物随行：落地页续跑时恢复变量表
@@ -7502,8 +7512,12 @@
       if (!stillLive()) { cleanup(); return; }
       fired = true; cleanup();
       try {
-        sessionStorage.setItem('masrRole', 'helper');
-        if (st0.runId) sessionStorage.setItem('masrRunId', st0.runId);
+        /* 0.9.68：只有「上一步是新开标签页」时，落地页才是可自毁的辅助页。
+         * 同标签跳转的落地页就是用户的这一页，标记 helper 会在流程结束时把它 window.close()。 */
+        if (st0.openedTab === true) {
+          sessionStorage.setItem('masrRole', 'helper');
+          if (st0.runId) sessionStorage.setItem('masrRunId', st0.runId);
+        }
       } catch (e) {}
       UI.appendLog({ t: Date.now(), level: 'info', msg: '⏩ ' + st0.navStepId + ' 落地就绪（' + ((Date.now() - started) / 1000).toFixed(1) + 's' + (src ? '·' + src : '') + '），续跑' });
       UI.doRun();
@@ -8529,8 +8543,11 @@
                     location.href.indexOf(st.navExpect.url_contains) >= 0;
       if (fresh && urlOk) {
         try {
-          sessionStorage.setItem('masrRole', 'helper');
-          if (st.runId) sessionStorage.setItem('masrRunId', st.runId);
+          /* 0.9.68：同标签导航的落地页不标 helper（否则流程结束会被关掉）。 */
+          if (st.openedTab === true) {
+            sessionStorage.setItem('masrRole', 'helper');
+            if (st.runId) sessionStorage.setItem('masrRunId', st.runId);
+          }
         } catch (e) {}
         armNavResumeReady(st);   // 就绪即续：不再盲等固定 2.5s（快页面省 2s，慢链路按 cookie 到位触发）
       } else {
