@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.69
+// @version      0.9.70
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,13 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.70：新增步骤级「提前回写」（spec: writeback:true）。
+//   真机 2026-11-23（复制开户 ②C）：S6 改密成功、S7 点完协议后 OAuth 立刻整页跳走，
+//   S8「信任浏览器」的 800ms 等待还没结束 JS 就没了 —— 收尾回写永远跑不到，
+//   表里「密码修改结果」一直是空（密码其实已经改了，重跑还会拿旧初始密码去登）。
+//   现在 spec 可在「业务事实已成立」的那一步声明 writeback:true：本步成功后立即入队回写，
+//   写成功记 wbDone，收尾不再重复写，后续步骤失败也不会用 fail 覆盖。
 //
 // 0.9.69：跨页续跑（continueFrom）补上步骤级 when 闸门。
 //   真机 2026-11-23（复制开户 ②A）：S1 是 navigate，落地 CAS 登录页后走续跑分支，
@@ -2424,7 +2431,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.69',
+    RUNNER_VERSION: '0.9.70',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -2844,6 +2851,11 @@
            * 交给落地页从下一步续跑（与 mode:navigate 的 navInitiated 同一条出口）。 */
           if (uiRes && uiRes.navInitiated) return uiRes;
           scope = buildScope(spec, params, extracted, vars);
+          /* 提前回写（0.9.70）：业务事实已成立、但后面的步骤可能被页面自动跳转带走时，
+           * 由 spec 在「事实成立的那一步」声明 writeback:true。典型：②C 改密成功（S6）后，
+           * 点完协议 OAuth 立刻整页跳走，S8「信任浏览器」的等待还没结束 JS 就没了 ——
+           * 收尾回写永远跑不到，表里「密码修改结果」一直是空。 */
+          if (step.writeback === true) await writeBackAfterStep(spec, step, scope, log);
           continue;
         }
         if (step.mode !== 'api') {
@@ -3438,7 +3450,12 @@
         if (!wchk.ok) throw new RunnerError('E_PERM', wchk.msg);
         writeCount++;
       }
-      if (step.mode === 'ui') { await execUi(spec, step, scope, stepLogs, log, () => {}, i, extracted, params); continue; }
+      if (step.mode === 'ui') {
+        await execUi(spec, step, scope, stepLogs, log, () => {}, i, extracted, params);
+        scope = buildScope(spec, params, extracted, vars);
+        if (step.writeback === true) await writeBackAfterStep(spec, step, scope, log);
+        continue;
+      }
       if (step.mode === 'navigate') {
         const nav = await execNavigate(spec, step, scope, extracted, stepLogs, log, () => {}, i, params);
         /* 同标签交接＝本流程终点，继续往下走把 outputs 算出来正常收尾（不回 navInitiated）。 */
@@ -6187,6 +6204,32 @@
       msg: '⚠️ ' + (tag || '回写') + '只写进 ' + written.length + ' 个字段，这几个**没写**：' + miss.join('、') +
         '——多半是回写模板里的占位符取不到值（业务值要写 {{outputs.xxx}}，裸写会被当成空）或值本身为空。' +
         '表里这几列仍是旧值，别当成已经写好',
+    });
+  }
+
+  // 步骤级「提前回写」（0.9.70，spec 用 writeback:true 声明）。
+  // 用在「业务事实已成立，但后面的步骤随时会被页面自己跳走」的位置：收尾回写依赖 JS 还活着，
+  // 而 OAuth/SPA 的整页跳转不会给我们留收尾机会。写成功记 wbDone，doRun 收尾看到它就不再
+  // 重复写；后面步骤失败也不会用 fail 覆盖（失败分支本来就把 wbDone 当「已写过」）。
+  async function writeBackAfterStep(spec, step, scope, log) {
+    const st = RunState.get() || {};
+    if (!st.task || !st.task.record_id) return;
+    if (wbModeOf(spec) !== 'auto' || st.wbDone) return;
+    const outs = {};
+    Object.keys(spec.outputs || {}).forEach(function (k) {
+      try { outs[k] = ENGINE.resolvePlaceholders(spec.outputs[k], scope); } catch (e) { outs[k] = ''; }
+    });
+    log({ t: Date.now(), level: 'info',
+      msg: step.id + ' 提前回写：本步已完成，先把结果落进业务表（不等流程收尾——后面的整页跳转会把收尾一起带走）…' });
+    const wr = await pushTaskResult(st, true, outs, null, { background: true });
+    st.wbDone = {
+      ok: true, outputs: outs, at: Date.now(), specId: spec.spec_id,
+      written: !!(wr && wr.written), queued: !!(wr && wr.queued), background: !!(wr && wr.background),
+    };
+    RunState.set(st);
+    log({
+      t: Date.now(), level: wr && (wr.written || wr.queued) ? 'ok' : 'warn',
+      msg: step.id + ' 提前回写' + (wr && wr.written ? '成功' : (wr && wr.queued ? '已入本机队列（后台补写，跳转也不丢）' : '未成功（已存待写队列，跑完点「重试回写」）')),
     });
   }
 
