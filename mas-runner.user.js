@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MAS-Runner (spec interpreter v0.1)
 // @namespace    mas-runner
-// @version      0.9.66
+// @version      0.9.67
 // @description  声明式 spec 解释器：读 spec.json → 按步骤执行 api/navigate 步骤 → 断言 → 抽取 → dry_run 报告。业务逻辑全部来自 spec（数据），本脚本不含任何业务。
 // @author       MAS
 // @homepageURL  https://github.com/liuzheng2014/mas-runner
@@ -12,6 +12,12 @@
 // @match        https://*.ads.huawei.com/*
 // 华为账号 CAS 登录域 / EAM 管理台域（P2 开户：业务页 302 到这里，脚本要跟过去才能续跑）。
 // 不认领所有登录页：是否接管由 spec 的 cross_domain 白名单 + URL 里的 service/redirect_uri 判定。
+//
+// 0.9.67：修「同标签导航的页面被当成辅助页、跑完自毁关闭」。
+//   真机（2026-11-23 15:38~15:39）：复制开户 ②A 的 S1 是同标签导航（location.href），
+//   引擎却无条件把本页标成 masrRole=helper；流程 final 后辅助页自毁把用户正在看的标签页关掉，
+//   表现就是「页面闪一下就关闭」。现在只有 result.openedTab===true（脚本真的开了新标签页）
+//   才标 helper；同标签导航、或导航被拦截留在原页，都不再标记。
 //
 // 0.9.64：最小交接加 handoff/minimal 两个标记，修「写进去又被自己消费掉」。
 //   真机（2026-11-19 14:28:08）：0.9.63 已在 ads 邀请页写出最小 pend，但落地页 boot 的
@@ -2407,7 +2413,7 @@
     LAST_PARAMS_KEY: 'masr_last_params_v1', // 按 spec_id 记住的参数值
     LOG_SECRET_KEY: 'masr_log_secret_v1',   // 日志里是否显示凭据明文（默认 true=显示）
     SCHEMA_SUPPORTED: '0.1',
-    RUNNER_VERSION: '0.9.66',
+    RUNNER_VERSION: '0.9.67',
     // 自更新通道：油猴按 @updateURL 静默更新，指向**自建分发路由**
     //   https://mas.wankahuanju.top/runner.user.js
     // （Worker 内部回源 GitHub，边缘缓存 60s —— 发布即生效）。
@@ -7301,14 +7307,19 @@
       else result = await runSpec(spec, params, hooks);
       UI.lastResult = result;
       if (result.navInitiated) {
-        // 这一页接下来只是"等落地"的中间页（脚本打开的）：标记成辅助页，链条跑完它也要一起关掉
-        try {
-          if ((sessionStorage.getItem('masrRole') || '') !== 'origin') {
-            sessionStorage.setItem('masrRole', 'helper');
-            const stn = RunState.get() || {};
-            if (stn.runId) sessionStorage.setItem('masrRunId', stn.runId);
-          }
-        } catch (e) {}
+        /* 只有「脚本自己开了新标签页」时，本页才是可丢弃的中间页。
+         * 2026-11-23 真机：②A 的 S1 是**同标签**导航（location.href），这里却无条件标 helper，
+         * 于是流程跑完（final）后辅助页自毁逻辑把用户正在看的标签页 window.close() 掉了——
+         * 「页面闪一下就关闭」。同标签导航时本页会被卸载/或留在原地等人看，绝不能标记成 helper。 */
+        if (result.openedTab === true) {
+          try {
+            if ((sessionStorage.getItem('masrRole') || '') !== 'origin') {
+              sessionStorage.setItem('masrRole', 'helper');
+              const stn = RunState.get() || {};
+              if (stn.runId) sessionStorage.setItem('masrRunId', stn.runId);
+            }
+          } catch (e) {}
+        }
         const tip = result.openedTab
           ? '=== ' + result.stepId + ' 已在新标签页打开。落地页就绪会自动续跑（通常 1 秒内，慢链路按 cookie 到位触发），若没续上再切过去点「执行」 ==='
           : '=== ' + result.stepId + ' 导航已发起。落地页就绪会自动续跑（通常 1 秒内），本页无需操作 ===';
